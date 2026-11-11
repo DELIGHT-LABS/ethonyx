@@ -3,7 +3,7 @@
 [![CI](https://github.com/DELIGHT-LABS/ethryx/actions/workflows/ci.yml/badge.svg)](https://github.com/DELIGHT-LABS/ethryx/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/DELIGHT-LABS/ethryx?include_prereleases&sort=semver)](https://github.com/DELIGHT-LABS/ethryx/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-yellow.svg)](LICENSE)
-[![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-blue.svg)](rust-toolchain.toml)
+[![Rust 1.99+](https://img.shields.io/badge/rust-1.99%2B-blue.svg)](rust-toolchain.toml)
 
 Lightweight Rust reverse proxy and health-check sidecar for Ethereum **Execution Layer** (EL)
 and **Consensus Layer** (CL) node pairs.
@@ -449,7 +449,7 @@ Notice generation or archive verification failures stop the release upload.
 To regenerate notices locally with Python 3.9+:
 
 ```sh
-cargo install cargo-about --version 0.9.2 --locked --features cli
+cargo install cargo-about --version 0.9.3 --locked --features cli
 python3 scripts/generate-licenses.py --target x86_64-unknown-linux-musl
 # For a custom build, use the same --features / --all-features /
 # --no-default-features flags as cargo build.

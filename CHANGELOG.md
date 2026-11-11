@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Changed
+
+- Upgrade the Rust toolchain and MSRV to `1.99`, bump `cargo-about` to `0.9.3`, and update direct and transitive Cargo dependencies (`tokio` `1.54.1`, `aws-lc-rs` `1.19.0`, `rustls-webpki` `0.103.16`, `webpki-roots` `1.0.12`, `webpki-root-certs` `1.0.12`, etc.).
+
 ## [0.2.5] - 2026-10-19
 
 ### Added

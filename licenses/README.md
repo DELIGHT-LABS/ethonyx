@@ -4,9 +4,9 @@
 
 https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5
 
-Rust 1.95 builds its musl standard libraries against musl 1.2.5:
+Rust 1.99 builds its musl standard libraries against musl 1.2.5:
 
-https://github.com/rust-lang/rust/blob/1.95.0/src/ci/docker/scripts/musl.sh
+https://github.com/rust-lang/rust/blob/1.99.1/src/ci/docker/scripts/musl.sh
 
 The generator appends this notice only for Linux musl targets. Recheck this
 file when upgrading Rust or changing the native linker/libc used for releases.
