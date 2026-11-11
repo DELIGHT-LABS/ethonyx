@@ -1,4 +1,4 @@
-//! Ethryx — Ethereum EL/CL sidecar library entry.
+//! Ethonyx — Ethereum EL/CL sidecar library entry.
 //!
 //! The binary in `src/main.rs` is a thin wrapper around [`run`]. Tests can call
 //! [`run`] directly with a custom shutdown future to drive the full stack
@@ -124,9 +124,9 @@ where
 
     info!(
         version = concat!("v", env!("CARGO_PKG_VERSION")),
-        git = env!("ETHRYX_GIT_DESCRIBE"),
+        git = env!("ETHONYX_GIT_DESCRIBE"),
         ?cfg,
-        "starting ethryx"
+        "starting ethonyx"
     );
 
     let client = proxy::build_client(false);

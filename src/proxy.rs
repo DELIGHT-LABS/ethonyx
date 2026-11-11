@@ -121,14 +121,14 @@ impl Connection {
             );
         }
         ::metrics::counter!(
-            "ethryx_proxy_requests_total",
+            "ethonyx_proxy_requests_total",
             "upstream" => upstream_type,
             "method" => method_label,
             "status" => crate::status_to_static_str(status)
         )
         .increment(1);
         ::metrics::histogram!(
-            "ethryx_proxy_request_duration_seconds", "upstream" => upstream_type
+            "ethonyx_proxy_request_duration_seconds", "upstream" => upstream_type
         )
         .record(elapsed.as_secs_f64());
         Ok(response)

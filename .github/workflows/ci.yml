@@ -59,7 +59,7 @@ jobs:
 
       - name: WebSocket connection churn
         env:
-          ETHRYX_STRESS_SECONDS: "5"
+          ETHONYX_STRESS_SECONDS: "5"
         run: >-
           cargo test --locked --test integration
           websocket_sustained_churn_preserves_replies_and_releases_upstreams
@@ -139,10 +139,10 @@ jobs:
         id: default-build
         uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: ethryx
+          bin: ethonyx
           target: ${{ matrix.target }}
           locked: true
-          archive: ethryx-ci-$target-default
+          archive: ethonyx-ci-$target-default
           include: >-
             LICENSE,LICENSE-MIT,LICENSE-APACHE,
             target/release-licenses/THIRD_PARTY_LICENSES.txt,
@@ -165,11 +165,11 @@ jobs:
         id: all-build
         uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: ethryx
+          bin: ethonyx
           target: ${{ matrix.target }}
           locked: true
           all-features: true
-          archive: ethryx-ci-$target-all
+          archive: ethonyx-ci-$target-all
           include: >-
             LICENSE,LICENSE-MIT,LICENSE-APACHE,
             target/all-feature-licenses/THIRD_PARTY_LICENSES.txt,

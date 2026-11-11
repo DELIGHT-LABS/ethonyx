@@ -34,7 +34,7 @@ def main():
         command += ["--no-default-features"]
     # cargo-about rejects redirected stdout under PowerShell. Its explicit
     # output file also avoids shell-dependent encoding on Windows runners.
-    with tempfile.TemporaryDirectory(prefix="ethryx-licenses-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="ethonyx-licenses-") as temporary:
         report_path = Path(temporary) / "licenses.json"
         subprocess.run(command + ["--output-file", str(report_path)], cwd=ROOT, check=True)
         report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -51,8 +51,8 @@ def main():
         raise RuntimeError("Rust library copyright notice is empty")
 
     sections = [
-        "ETHRYX THIRD-PARTY LICENSES\n==========================",
-        "Ethryx is licensed under MIT OR Apache-2.0, at your option. See LICENSE,\n"
+        "ETHONYX THIRD-PARTY LICENSES\n============================",
+        "Ethonyx is licensed under MIT OR Apache-2.0, at your option. See LICENSE,\n"
         "LICENSE-MIT and LICENSE-APACHE. Dependencies retain their own licenses.\n"
         "This report includes the target's enabled dependencies and build dependencies;\n"
         "development-only dependencies are excluded. Upstream license bundles may\n"

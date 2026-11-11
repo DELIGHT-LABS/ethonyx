@@ -358,7 +358,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ethryx"
+name = "ethonyx"
 version = "0.2.5"
 dependencies = [
  "bytes",

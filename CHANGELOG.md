@@ -10,7 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Upgrade the Rust toolchain and MSRV to `1.99`, bump `cargo-about` to `0.9.3`, and update direct and transitive Cargo dependencies (`tokio` `1.54.1`, `aws-lc-rs` `1.19.0`, `rustls-webpki` `0.103.16`, `webpki-roots` `1.0.12`, `webpki-root-certs` `1.0.12`, etc.).
+- **BREAKING**: Rename the project, crate, binary, and observability surface from `ethryx` to **`ethonyx`**:
+  - Binary & library crate: `ethryx` → `ethonyx` (repository: `https://github.com/DELIGHT-LABS/ethonyx`)
+  - Environment variable prefix: `ETHRYX_*` → `ETHONYX_*` (including `ETHONYX_STRESS_SECONDS` and build-time `ETHONYX_GIT_DESCRIBE`)
+  - Tracing log filter target (`RUST_LOG`): `ethryx` (`ethryx::*`) → `ethonyx` (`ethonyx::*`)
+  - Prometheus metrics prefix: `ethryx_*` → `ethonyx_*`
+  - OpenTelemetry default service name, tracer scope, and meter scope: `"ethryx"` → `"ethonyx"`
+  - Release archive naming: `ethonyx-<tag>-<target>.{tar.gz,zip}`
+- Upgrade the Rust toolchain and MSRV to `1.99`, bump `cargo-about` to `0.9.3`, replace legacy `cross` release builds with `taiki-e/setup-cross-toolchain-action`, and update direct and transitive Cargo dependencies (`tokio` `1.54.1`, `aws-lc-rs` `1.19.0`, `rustls-webpki` `0.103.16`, `webpki-roots` `1.0.12`, `webpki-root-certs` `1.0.12`, etc.).
 
 ## [0.2.5] - 2026-10-19
 

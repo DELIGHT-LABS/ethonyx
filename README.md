@@ -1,7 +1,7 @@
-# ethryx
+# ethonyx
 
-[![CI](https://github.com/DELIGHT-LABS/ethryx/actions/workflows/ci.yml/badge.svg)](https://github.com/DELIGHT-LABS/ethryx/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/DELIGHT-LABS/ethryx?include_prereleases&sort=semver)](https://github.com/DELIGHT-LABS/ethryx/releases)
+[![CI](https://github.com/DELIGHT-LABS/ethonyx/actions/workflows/ci.yml/badge.svg)](https://github.com/DELIGHT-LABS/ethonyx/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/DELIGHT-LABS/ethonyx?include_prereleases&sort=semver)](https://github.com/DELIGHT-LABS/ethonyx/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-yellow.svg)](LICENSE)
 [![Rust 1.99+](https://img.shields.io/badge/rust-1.99%2B-blue.svg)](rust-toolchain.toml)
 
@@ -16,7 +16,7 @@ and **Consensus Layer** (CL) node pairs.
 | `GET/HEAD /readyz`                   | EL + CL readiness gate (200 / 503) |
 | `GET/HEAD /healthz`                  | EL + CL state snapshot (always 200) |
 | `GET/HEAD /metrics`                  | Prometheus metrics scrape endpoint |
-| `GET/HEAD /eth/v1/node/health`       | ethryx node health (200 / 206 / 503) if `--mock-cl-node-health` set, else `--cl-beacon-url` |
+| `GET/HEAD /eth/v1/node/health`       | ethonyx node health (200 / 206 / 503) if `--mock-cl-node-health` set, else `--cl-beacon-url` |
 | `POST /eth/v1/validator/register_validator` | `--cl-mev-relay-url` (rewritten to `/eth/v1/builder/validators`) if set, else `--cl-beacon-url` |
 | `POST /eth/v1/validator/{prepare_beacon_proposer, beacon_committee_subscriptions, sync_committee_subscriptions}` | `200 OK` if `--mock-cl-subscriptions` set, else `--cl-beacon-url` |
 | `/eth/...`, `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...` | `--cl-beacon-url`   |
@@ -68,7 +68,7 @@ that layer's `errors` array.
 
 | Field                                              | Source                                |
 |----------------------------------------------------|---------------------------------------|
-| `el.transport` / `cl.transport` (`h2c`/`h2`/`http/1.1`) | upstream HTTP version ethryx uses |
+| `el.transport` / `cl.transport` (`h2c`/`h2`/`http/1.1`) | upstream HTTP version ethonyx uses |
 | `el.syncing` (`false` = synced)                    | EL `eth_syncing`                      |
 | `el.sync_distance` (while syncing)                 | EL `eth_syncing` highest − current    |
 | `el.peers`                                         | EL `net_peerCount`                    |
@@ -118,7 +118,7 @@ sidecar refuses to start if either is missing under `custom`.
 
 ## HTTP/2
 
-ethryx serves HTTP/1.1 and HTTP/2 on the same `--listen` port — the protocol is
+ethonyx serves HTTP/1.1 and HTTP/2 on the same `--listen` port — the protocol is
 auto-detected per connection. Cleartext HTTP/2 (**h2c**, prior-knowledge) is
 supported, covering the common "TLS-terminating LB / mesh forwards h2c to the
 backend" shape (Envoy, Istio, HAProxy `proto h2`); plain HTTP/1.1 and the
@@ -158,20 +158,20 @@ running upstream is switching away from h2c the data-plane can briefly return
 stays HTTP/1.1. (The gain is mainly under high request concurrency; for a
 localhost sidecar hop it's modest.)
 
-ethryx does **not** terminate TLS — it serves plaintext and leaves TLS to the
+ethonyx does **not** terminate TLS — it serves plaintext and leaves TLS to the
 LB / service mesh in front.
 
 ## Usage
 
 ```sh
-ethryx \
+ethonyx \
   --listen 0.0.0.0:8547 \
   --el-http-url   http://127.0.0.1:8545 \
   --el-ws-url     ws://127.0.0.1:8546 \
   --cl-beacon-url http://127.0.0.1:5052
 ```
 
-Every flag also accepts an `ETHRYX_*` env var (see `ethryx --help`).
+Every flag also accepts an `ETHONYX_*` env var (see `ethonyx --help`).
 
 ### Multi-port listen
 
@@ -180,12 +180,12 @@ routes — useful when some traffic hits the box via LB on one port while
 operators / scrapers reach it directly on another:
 
 ```sh
-ethryx \
+ethonyx \
   --listen 0.0.0.0:8547 \
   --listen 127.0.0.1:9547 \
   ...
 # or
-ETHRYX_LISTEN=0.0.0.0:8547,127.0.0.1:9547 ethryx ...
+ETHONYX_LISTEN=0.0.0.0:8547,127.0.0.1:9547 ethonyx ...
 ```
 
 Each listener runs an independent accept loop on the tokio runtime, so cores
@@ -220,50 +220,50 @@ Set the level with `--log-level <trace|debug|info|warn|error>` (default `info`).
 `RUST_LOG` overrides it and allows per-target directives:
 
 ```sh
-ethryx --log-level debug ...
-RUST_LOG=ethryx=debug,hyper=warn ethryx ...
+ethonyx --log-level debug ...
+RUST_LOG=ethonyx=debug,hyper=warn ethonyx ...
 ```
 
 ### Access log
 
-For a per-request trail — peer, HTTP version, method, path, upstream destination (`EL`/`CL`), upstream protocol (`HTTP`/`WS`), HTTP status code, and latency in milliseconds — enable `--access-log` (`ETHRYX_ACCESS_LOG`). It
+For a per-request trail — peer, HTTP version, method, path, upstream destination (`EL`/`CL`), upstream protocol (`HTTP`/`WS`), HTTP status code, and latency in milliseconds — enable `--access-log` (`ETHONYX_ACCESS_LOG`). It
 emits one line per request on a dedicated `access_log` target, kept separate
 from the application log (the nginx / Envoy / Caddy split) so the `info` stream
 stays quiet by default. Health-probe paths (`/livez`, `/readyz`, `/healthz`, `/metrics`) are
 **excluded** even when it's on, so frequent k8s / LB checks don't bury real
 traffic.
 
-The `access_log` target is deliberately *not* under `ethryx`, so raising the app
-log (`--log-level debug`, or `RUST_LOG=ethryx=debug`) does **not** turn it on —
+The `access_log` target is deliberately *not* under `ethonyx`, so raising the app
+log (`--log-level debug`, or `RUST_LOG=ethonyx=debug`) does **not** turn it on —
 the access log is controlled only by `--access-log` or by naming its target
 directly. When `RUST_LOG` is set it takes over the whole filter (the
 `--access-log` flag is then ignored), so name the target there if you want it:
 
 ```sh
-ethryx --access-log ...
-RUST_LOG=ethryx=debug,access_log=info ethryx ...
+ethonyx --access-log ...
+RUST_LOG=ethonyx=debug,access_log=info ethonyx ...
 ```
 
 ## Metrics
 
-ethryx exports core application and proxy metrics on `GET /metrics`.
+ethonyx exports core application and proxy metrics on `GET /metrics`.
 
 The following metrics are exposed:
-- `ethryx_active_connections`: Number of currently active client connections (labeled by `protocol` as `tcp` or `ws`).
-- `ethryx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`).
-- `ethryx_proxy_request_duration_seconds`: Latency histogram of upstream proxied requests (labeled by `upstream`).
-- `ethryx_upstream_peers`: Number of peers reported by upstream nodes (labeled by `layer` as `el` or `cl`).
-- `ethryx_upstream_sync_distance`: Remaining sync distance in blocks or slots (labeled by `layer` as `el` or `cl`).
-- `ethryx_upstream_block_number`: Latest execution layer block number.
-- `ethryx_upstream_slot_number`: Latest consensus layer head slot number.
-- `ethryx_upstream_health_status`: Upstream health status (1 = healthy/synced, 0 = degraded/down, labeled by `layer`).
+- `ethonyx_active_connections`: Number of currently active client connections (labeled by `protocol` as `tcp` or `ws`).
+- `ethonyx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`).
+- `ethonyx_proxy_request_duration_seconds`: Latency histogram of upstream proxied requests (labeled by `upstream`).
+- `ethonyx_upstream_peers`: Number of peers reported by upstream nodes (labeled by `layer` as `el` or `cl`).
+- `ethonyx_upstream_sync_distance`: Remaining sync distance in blocks or slots (labeled by `layer` as `el` or `cl`).
+- `ethonyx_upstream_block_number`: Latest execution layer block number.
+- `ethonyx_upstream_slot_number`: Latest consensus layer head slot number.
+- `ethonyx_upstream_health_status`: Upstream health status (1 = healthy/synced, 0 = degraded/down, labeled by `layer`).
 
 ## OpenTelemetry
 
-If built with the `otel` feature, ethryx supports exporting traces and metrics to an OTLP endpoint (HTTP protocol).
+If built with the `otel` feature, ethonyx supports exporting traces and metrics to an OTLP endpoint (HTTP protocol).
 
 Pass an HTTP(S) **base URL**, optionally with a path prefix and without a query or fragment.
-Ethryx appends `/v1/traces` and `/v1/metrics` for the respective signals. The
+Ethonyx appends `/v1/traces` and `/v1/metrics` for the respective signals. The
 exporters use Rustls and run their blocking work outside Tokio workers. Both
 providers flush on orderly shutdown (Ctrl-C, or SIGTERM on Unix).
 
@@ -272,7 +272,7 @@ providers flush on orderly shutdown (Ctrl-C, or SIGTERM on Unix).
 cargo build --features otel
 
 # Run with OTLP endpoint
-ethryx --otel-endpoint http://localhost:4318 ...
+ethonyx --otel-endpoint http://localhost:4318 ...
 ```
 
 When enabled:
@@ -283,12 +283,12 @@ When enabled:
 
 ```ini
 [Unit]
-Description=Ethryx EL/CL sidecar
+Description=Ethonyx EL/CL sidecar
 After=network-online.target geth.service lighthouse.service
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/ethryx \
+ExecStart=/usr/local/bin/ethonyx \
   --network mainnet \
   --listen 0.0.0.0:8547 \
   --el-http-url   http://127.0.0.1:8545 \
@@ -296,7 +296,7 @@ ExecStart=/usr/local/bin/ethryx \
   --cl-beacon-url http://127.0.0.1:5052
 Restart=on-failure
 RestartSec=2
-User=ethryx
+User=ethonyx
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -328,7 +328,7 @@ monitoring stack to threshold.
 
 ### Trusted / Commercial Endpoint & Data-Plane Mocking Tuning
 
-When running `ethryx` against a fallback/secondary node or a commercial paid RPC provider (e.g., Alchemy, Infura, QuickNode):
+When running `ethonyx` against a fallback/secondary node or a commercial paid RPC provider (e.g., Alchemy, Infura, QuickNode):
 
 | Flag                                     | Default | Description                                                                 |
 |------------------------------------------|---------|-----------------------------------------------------------------------------|
@@ -336,13 +336,13 @@ When running `ethryx` against a fallback/secondary node or a commercial paid RPC
 | `--mock-cl-subscriptions`                | `false` | Intercept `prepare_beacon_proposer`, `beacon_committee_subscriptions`, and `sync_committee_subscriptions` with `200 OK`. |
 | `--mock-eth-syncing`                     | `false` | Statically mock `eth_syncing` JSON-RPC (HTTP & WebSocket) with `result: false`. |
 | `--mock-cl-node-health`                  | `false` | Intercept `GET /eth/v1/node/health` locally with `200 OK`.                  |
-| `--cl-mev-relay-url`                     | `none`  | Optional upstream MEV Relay URL (`ETHRYX_CL_MEV_RELAY_URL`).                |
+| `--cl-mev-relay-url`                     | `none`  | Optional upstream MEV Relay URL (`ETHONYX_CL_MEV_RELAY_URL`).                |
 
-- **`--trust-upstream`**: When enabled, `ethryx` trusts the upstream node and skips background EL/CL health polling (consuming zero Compute Units / API credits on commercial providers).
+- **`--trust-upstream`**: When enabled, `ethonyx` trusts the upstream node and skips background EL/CL health polling (consuming zero Compute Units / API credits on commercial providers).
 - **`--mock-cl-subscriptions`**: Intercepts `POST /eth/v1/validator/prepare_beacon_proposer`, `POST /eth/v1/validator/beacon_committee_subscriptions`, and `POST /eth/v1/validator/sync_committee_subscriptions` requests (sent periodically by SSV Node / Validator Clients) and returns `HTTP 200 OK` (`{"code":200,"message":"success"}`) locally, shielding against 400 errors from commercial providers that block write-only validator APIs.
 - **`--mock-eth-syncing`**: Intercepts `eth_syncing` JSON-RPC calls over HTTP POST and WebSocket frames locally (`result: false`), shielding commercial providers from downstream client sync polls.
 - **`--mock-cl-node-health`**: Intercepts `GET/HEAD /eth/v1/node/health` requests locally and returns `HTTP 200 OK` (Beacon API standard node health), shielding commercial providers from beacon node health probes.
-- **`--cl-mev-relay-url`**: When configured (e.g., `https://boost-relay-hoodi.flashbots.net`), `ethryx` intercepts `POST /eth/v1/validator/register_validator` requests from validator clients (such as SSV Node), rewrites the request path to `/eth/v1/builder/validators`, and forwards them directly to the specified MEV Relay.
+- **`--cl-mev-relay-url`**: When configured (e.g., `https://boost-relay-hoodi.flashbots.net`), `ethonyx` intercepts `POST /eth/v1/validator/register_validator` requests from validator clients (such as SSV Node), rewrites the request path to `/eth/v1/builder/validators`, and forwards them directly to the specified MEV Relay.
 
 With `--trust-upstream`, cleartext HTTP uses HTTP/1.1 because health-based h2c
 detection is disabled; HTTPS still negotiates via ALPN. Data-plane requests are
@@ -397,7 +397,7 @@ Run the longer correctness checks explicitly:
 ```sh
 cargo test --release --locked --lib rpc::tests::prefilter_seeded_stress_matches_full_parser \
   -- --ignored --exact
-ETHRYX_STRESS_SECONDS=60 cargo test --release --locked --test integration \
+ETHONYX_STRESS_SECONDS=60 cargo test --release --locked --test integration \
   websocket_sustained_churn_preserves_replies_and_releases_upstreams \
   -- --ignored --exact --nocapture
 ```
@@ -434,12 +434,12 @@ push triggers `.github/workflows/release.yml`, which:
 3. Generates license notices from `Cargo.lock` for each release target
 4. Builds binaries with `--locked`, verifies the archive contents, and attaches
    them with `.sha256` checksums and build provenance attestations:
-   - `ethryx-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`
-   - `ethryx-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`
-   - `ethryx-vX.Y.Z-aarch64-apple-darwin.tar.gz`
-   - `ethryx-vX.Y.Z-x86_64-pc-windows-msvc.zip`
+   - `ethonyx-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`
+   - `ethonyx-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`
+   - `ethonyx-vX.Y.Z-aarch64-apple-darwin.tar.gz`
+   - `ethonyx-vX.Y.Z-x86_64-pc-windows-msvc.zip`
 
-Every binary archive includes `LICENSE` (Ethryx's dual-license notice),
+Every binary archive includes `LICENSE` (Ethonyx's dual-license notice),
 `LICENSE-MIT` and `LICENSE-APACHE` (the full license texts),
 `THIRD_PARTY_LICENSES.txt` (dependency inventory, license texts and upstream
 copyright/notice files, plus musl's copyright notice on Linux musl targets),
@@ -470,12 +470,12 @@ Rust or the native toolchain, also review [the musl notice](licenses/README.md).
 
 ## License
 
-Ethryx is available under either the [MIT license](LICENSE-MIT) or the
+Ethonyx is available under either the [MIT license](LICENSE-MIT) or the
 [Apache License, Version 2.0](LICENSE-APACHE), at your option
 (`MIT OR Apache-2.0`). Third-party dependencies retain their own licenses.
 
 ## Contributions
 
-By submitting a contribution for inclusion in Ethryx, you agree to license it
+By submitting a contribution for inclusion in Ethonyx, you agree to license it
 under both MIT and Apache-2.0, unless you explicitly state otherwise.
 Contributions carry no additional terms or conditions unless separately agreed.

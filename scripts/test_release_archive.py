@@ -49,7 +49,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             path.unlink()
 
     def archives(self):
-        for suffix, binary in ((".tar.gz", "ethryx"), (".zip", "ethryx.exe")):
+        for suffix, binary in ((".tar.gz", "ethonyx"), (".zip", "ethonyx.exe")):
             yield suffix, {**self.files, binary: b"nonempty test binary"}
 
     def test_complete_archives_pass(self):
@@ -77,7 +77,7 @@ class ReleaseArchiveTests(unittest.TestCase):
 
     def test_empty_binary_fails(self):
         for suffix, files in self.archives():
-            binary = "ethryx.exe" if suffix == ".zip" else "ethryx"
+            binary = "ethonyx.exe" if suffix == ".zip" else "ethonyx"
             with self.subTest(suffix=suffix):
                 result = self.check_archive(suffix, {**files, binary: b""})
                 self.assertNotEqual(result.returncode, 0)

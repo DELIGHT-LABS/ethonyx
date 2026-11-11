@@ -1,11 +1,11 @@
 [package]
-name = "ethryx"
+name = "ethonyx"
 version = "0.2.5"
 edition = "2024"
 rust-version = "1.99"
 description = "Lightweight Rust reverse proxy and health-check sidecar for Ethereum EL/CL nodes."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/DELIGHT-LABS/ethryx"
+repository = "https://github.com/DELIGHT-LABS/ethonyx"
 readme = "README.md"
 keywords = ["ethereum", "sidecar", "proxy", "reverse-proxy", "json-rpc", "beacon-api"]
 categories = ["network-programming"]
