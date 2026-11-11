@@ -1,12 +1,12 @@
 use clap::Parser;
-use ethryx::{BoxError, Config};
+use ethonyx::{BoxError, Config};
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let cfg = Config::parse();
 
     #[cfg(feature = "otel")]
-    let telemetry = ethryx::otel::start(cfg.otel_endpoint.as_deref()).await?;
+    let telemetry = ethonyx::otel::start(cfg.otel_endpoint.as_deref()).await?;
 
     use tracing_subscriber::prelude::*;
 
@@ -54,8 +54,8 @@ async fn main() -> Result<(), BoxError> {
         }
     };
     #[cfg(feature = "otel")]
-    ethryx::run_with_telemetry(cfg, shutdown, telemetry).await?;
+    ethonyx::run_with_telemetry(cfg, shutdown, telemetry).await?;
     #[cfg(not(feature = "otel"))]
-    ethryx::run(cfg, shutdown).await?;
+    ethonyx::run(cfg, shutdown).await?;
     Ok(())
 }

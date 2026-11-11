@@ -23,7 +23,7 @@ def main():
         "THIRD_PARTY_LICENSES.txt": (args.licenses_dir / "THIRD_PARTY_LICENSES.txt").read_bytes(),
         "RUST_LIBRARY_LICENSES.html": (args.licenses_dir / "RUST_LIBRARY_LICENSES.html").read_bytes(),
     }
-    binary = "ethryx.exe" if "-windows-" in args.target else "ethryx"
+    binary = "ethonyx.exe" if "-windows-" in args.target else "ethonyx"
     archives = [Path(str(args.archive) + suffix) for suffix in (".tar.gz", ".zip")]
     archives = [path for path in archives if path.is_file()]
     if not archives:

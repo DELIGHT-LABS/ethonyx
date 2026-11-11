@@ -1,4 +1,4 @@
-//! Integration tests: spawn ethryx in-process against a hyper-based mock
+//! Integration tests: spawn ethonyx in-process against a hyper-based mock
 //! upstream, driving the full proxy / readiness / health flow with the same
 //! hyper-util Client used in production code. Zero extra dev-dependencies.
 
@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{accept_async, connect_async};
 
-use ethryx::{Config, run};
+use ethonyx::{Config, run};
 
 type TestBody = Full<Bytes>;
 type TestClient = Client<HttpConnector, TestBody>;
@@ -45,7 +45,7 @@ async fn pick_port() -> u16 {
 /// data-plane request to an h2c upstream may establish a fresh HTTP/2 connection,
 /// which can momentarily exceed the test's short `--proxy-timeout` on a heavily
 /// loaded (cold-start) CI runner; a steady-state sidecar keeps the pool warm. This
-/// mirrors ethryx's documented behaviour that a transport in flux can briefly
+/// mirrors ethonyx's documented behaviour that a transport in flux can briefly
 /// surface a `502` until it settles, so it doesn't mask a real failure (a
 /// persistent `502` still fails the test).
 async fn post_json_settled(c: &TestClient, url: &str, body: Value) -> (StatusCode, Bytes) {
@@ -277,15 +277,15 @@ impl MockServer {
     }
 }
 
-// ---------- ethryx handle ----------
+// ---------- ethonyx handle ----------
 
-struct EthryxHandle {
+struct EthonyxHandle {
     port: u16,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), BoxError>>>,
 }
 
-impl EthryxHandle {
+impl EthonyxHandle {
     async fn start(args: &[&str]) -> Self {
         Self::start_with_grace(args, Duration::ZERO).await
     }
@@ -295,7 +295,7 @@ impl EthryxHandle {
         let addr_str = format!("127.0.0.1:{port}");
         let grace_str = grace.as_secs().to_string();
         let mut argv: Vec<&str> = vec![
-            "ethryx",
+            "ethonyx",
             "--listen",
             &addr_str,
             "--shutdown-grace",
@@ -313,7 +313,7 @@ impl EthryxHandle {
             let _ = rx.await;
         }));
         wait_for_port(port).await;
-        EthryxHandle {
+        EthonyxHandle {
             port,
             shutdown: Some(tx),
             task: Some(task),
@@ -351,14 +351,15 @@ fn now_unix() -> u64 {
 async fn livez_returns_200_ok() {
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/livez")).await;
+    let (status, body) = get(&c, &ethonyx.url("/livez")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(&body[..], b"ok");
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -373,12 +374,13 @@ async fn jsonrpc_post_is_forwarded_to_el_http_upstream() {
     }))
     .await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = client();
     let (status, body) = post_json(
         &c,
-        &ethryx.url("/"),
+        &ethonyx.url("/"),
         json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 7}),
     )
     .await;
@@ -400,7 +402,7 @@ async fn jsonrpc_post_is_forwarded_to_el_http_upstream() {
         "expected one forwarded eth_blockNumber, saw {methods:?}"
     );
 
-    // The EL mock is HTTP/1.1-only, so ethryx (which prefers h2c) detects that the
+    // The EL mock is HTTP/1.1-only, so ethonyx (which prefers h2c) detects that the
     // h2c probe fails and falls back to HTTP/1.1 for the upstream hop.
     let fwd = el
         .received()
@@ -409,7 +411,7 @@ async fn jsonrpc_post_is_forwarded_to_el_http_upstream() {
         .expect("forwarded request recorded");
     assert_eq!(fwd.version, Version::HTTP_11);
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -426,13 +428,14 @@ async fn el_upstream_h2c_is_auto_detected() {
     }))
     .await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     // Downstream client version is irrelevant — it's the upstream hop we assert.
     let c = client();
     let (status, body) = post_json_settled(
         &c,
-        &ethryx.url("/"),
+        &ethonyx.url("/"),
         json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 7}),
     )
     .await;
@@ -457,19 +460,19 @@ async fn el_upstream_h2c_is_auto_detected() {
     assert_eq!(cl_req.version, Version::HTTP_11);
 
     // /healthz surfaces the detected upstream transport per layer.
-    let (_, hz) = get(&c, &ethryx.url("/healthz")).await;
+    let (_, hz) = get(&c, &ethonyx.url("/healthz")).await;
     let hv: Value = serde_json::from_slice(&hz).unwrap();
     assert_eq!(hv["el"]["transport"], "h2c");
     assert_eq!(hv["cl"]["transport"], "http/1.1");
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 // HTTP/2 downstream coverage: h1→h1 is `jsonrpc_post_is_forwarded` above; h2c→h1
 // (the LB→backend h2c shape) is below. Upstream h2 (h1→h2, h2→h2) can't be tested
 // hermetically — the production client trusts only webpki public roots, so a
 // self-signed h2 mock is rejected. Verified manually against a public h2 server:
-//   ethryx --el-http-url https://www.cloudflare.com --listen 127.0.0.1:18548 &
+//   ethonyx --el-http-url https://www.cloudflare.com --listen 127.0.0.1:18548 &
 //   curl -s http://127.0.0.1:18548/cdn-cgi/trace | grep http=        # h1→h2 ⇒ http/2
 //   curl -s --http2-prior-knowledge .../cdn-cgi/trace | grep http=   # h2→h2 ⇒ http/2
 #[tokio::test]
@@ -486,12 +489,13 @@ async fn http2_h2c_jsonrpc_is_served_and_forwarded() {
     }))
     .await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = h2c_client();
     let (status, body) = post_json(
         &c,
-        &ethryx.url("/"),
+        &ethonyx.url("/"),
         json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 7}),
     )
     .await;
@@ -500,7 +504,7 @@ async fn http2_h2c_jsonrpc_is_served_and_forwarded() {
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["result"], "0xcafe");
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -509,19 +513,20 @@ async fn http2_h2c_negotiates_to_http2() {
     // spoke h2c (not a silent downgrade to h1).
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = h2c_client();
     let req = Request::builder()
         .method(Method::GET)
-        .uri(ethryx.url("/livez"))
+        .uri(ethonyx.url("/livez"))
         .body(Full::new(Bytes::new()))
         .unwrap();
     let resp = c.request(req).await.unwrap();
     assert_eq!(resp.version(), Version::HTTP_2, "expected h2, got {resp:?}");
     assert_eq!(resp.status(), StatusCode::OK);
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -546,15 +551,16 @@ async fn beacon_path_is_routed_to_cl_upstream() {
         )
     }))
     .await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/eth/v1/beacon/genesis")).await;
+    let (status, body) = get(&c, &ethonyx.url("/eth/v1/beacon/genesis")).await;
     assert_eq!(status, StatusCode::OK);
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["data"]["genesis_time"], "1606824023");
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -580,7 +586,8 @@ async fn client_specific_beacon_paths_are_routed_to_cl_upstream() {
         (StatusCode::OK, resp.into_bytes())
     }))
     .await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = client();
     let paths = vec![
@@ -597,13 +604,13 @@ async fn client_specific_beacon_paths_are_routed_to_cl_upstream() {
     ];
 
     for path in paths {
-        let (status, body) = get(&c, &ethryx.url(path)).await;
+        let (status, body) = get(&c, &ethonyx.url(path)).await;
         assert_eq!(status, StatusCode::OK, "Failed for path: {path}");
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["path"], path, "Failed for path: {path}");
     }
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -611,11 +618,11 @@ async fn hop_by_hop_headers_are_stripped_on_forward() {
     for upstream_h2 in [false, true] {
         let el = MockServer::serve(ok_handler(), upstream_h2, false).await;
         let cl = MockServer::start(ok_handler()).await;
-        let ethryx =
-            EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+        let ethonyx =
+            EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
         let req = Request::builder()
             .method(Method::POST)
-            .uri(ethryx.url("/"))
+            .uri(ethonyx.url("/"))
             .header("content-type", "application/json")
             .header("connection", "keep-alive, X-One")
             .header("connection", "x-two")
@@ -644,7 +651,7 @@ async fn hop_by_hop_headers_are_stripped_on_forward() {
         assert_eq!(forwarded.headers["authorization"], "Bearer retained");
         assert_eq!(forwarded.headers["content-type"], "application/json");
         assert_eq!(forwarded.body, "{}");
-        ethryx.shutdown().await;
+        ethonyx.shutdown().await;
     }
 }
 
@@ -676,10 +683,10 @@ async fn response_connection_options_are_stripped_for_h1_and_h2_clients() {
             });
         }
     });
-    let ethryx = EthryxHandle::start(&["--trust-upstream", "--cl-beacon-url", &upstream]).await;
+    let ethonyx = EthonyxHandle::start(&["--trust-upstream", "--cl-beacon-url", &upstream]).await;
     for c in [client(), h2c_client()] {
         let req = Request::builder()
-            .uri(ethryx.url("/eth/header-test"))
+            .uri(ethonyx.url("/eth/header-test"))
             .body(Full::new(Bytes::new()))
             .unwrap();
         let resp = c.request(req).await.unwrap();
@@ -693,7 +700,7 @@ async fn response_connection_options_are_stripped_for_h1_and_h2_clients() {
             "response body"
         );
     }
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
     server.abort();
 }
 
@@ -741,7 +748,7 @@ async fn health_probes_run_together_and_preserve_partial_failures() {
             });
         }
     });
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &upstream,
         "--cl-beacon-url",
@@ -750,7 +757,7 @@ async fn health_probes_run_together_and_preserve_partial_failures() {
         "60",
     ])
     .await;
-    let (_, body) = get(&client(), &ethryx.url("/healthz")).await;
+    let (_, body) = get(&client(), &ethonyx.url("/healthz")).await;
     let health: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(health["el"]["syncing"], false, "{health}");
     assert_eq!(health["el"]["peers"], 64, "{health}");
@@ -766,9 +773,9 @@ async fn health_probes_run_together_and_preserve_partial_failures() {
         health["cl"]["errors"][0].as_str().unwrap().contains("503"),
         "{health}"
     );
-    let (status, _) = get(&client(), &ethryx.url("/readyz")).await;
+    let (status, _) = get(&client(), &ethonyx.url("/readyz")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
     server.abort();
 }
 
@@ -779,10 +786,11 @@ async fn healthz_is_200_even_when_upstreams_fail() {
     let bad: MockHandler = Arc::new(|_| (StatusCode::NOT_FOUND, b"{}".to_vec()));
     let el = MockServer::start(bad.clone()).await;
     let cl = MockServer::start(bad).await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/healthz")).await;
+    let (status, body) = get(&c, &ethonyx.url("/healthz")).await;
     assert_eq!(status, StatusCode::OK);
     let v: Value = serde_json::from_slice(&body).unwrap();
     // No verdict field; each failed upstream is recorded under its layer's errors.
@@ -809,7 +817,7 @@ async fn healthz_is_200_even_when_upstreams_fail() {
     assert_eq!(v["el"]["transport"], "http/1.1");
     assert_eq!(v["cl"]["transport"], "http/1.1");
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -820,7 +828,7 @@ async fn el_down_keeps_default_h2c_verdict_and_502s() {
     // reports the unconfirmed default transport; the data-plane returns 502.
     let dead = pick_port().await; // bound then released -> nothing listening
     let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &format!("http://127.0.0.1:{dead}"),
         "--cl-beacon-url",
@@ -829,7 +837,7 @@ async fn el_down_keeps_default_h2c_verdict_and_502s() {
     .await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/healthz")).await;
+    let (status, body) = get(&c, &ethonyx.url("/healthz")).await;
     assert_eq!(status, StatusCode::OK);
     let v: Value = serde_json::from_slice(&body).unwrap();
     let el_errors = v["el"]["errors"].as_array().expect("el.errors array");
@@ -842,13 +850,13 @@ async fn el_down_keeps_default_h2c_verdict_and_502s() {
     // The data-plane forwards to the (dead) EL and surfaces a 502.
     let (status, _) = post_json(
         &c,
-        &ethryx.url("/"),
+        &ethonyx.url("/"),
         json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -857,7 +865,7 @@ async fn healthz_is_served_from_cache_not_per_request() {
     // /healthz requests must read the cached snapshot and add no upstream calls.
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -869,7 +877,7 @@ async fn healthz_is_served_from_cache_not_per_request() {
 
     let c = client();
     for _ in 0..5 {
-        let (status, _) = get(&c, &ethryx.url("/healthz")).await;
+        let (status, _) = get(&c, &ethonyx.url("/healthz")).await;
         assert_eq!(status, StatusCode::OK);
     }
     // One startup poll = 3 EL calls (eth_syncing, net_peerCount,
@@ -877,7 +885,7 @@ async fn healthz_is_served_from_cache_not_per_request() {
     assert_eq!(el.received().len(), 3, "EL calls: {:?}", el.received());
     assert_eq!(cl.received().len(), 2, "CL calls: {:?}", cl.received());
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -906,7 +914,7 @@ async fn healthz_cache_refreshes_in_background() {
     }))
     .await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -917,7 +925,7 @@ async fn healthz_cache_refreshes_in_background() {
     .await;
 
     let c = client();
-    let (_, b1) = get(&c, &ethryx.url("/healthz")).await;
+    let (_, b1) = get(&c, &ethonyx.url("/healthz")).await;
     let v1: Value = serde_json::from_slice(&b1).unwrap();
     assert_eq!(
         v1["el"]["peers"], 16,
@@ -926,20 +934,20 @@ async fn healthz_cache_refreshes_in_background() {
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let (_, b2) = get(&c, &ethryx.url("/healthz")).await;
+    let (_, b2) = get(&c, &ethonyx.url("/healthz")).await;
     let v2: Value = serde_json::from_slice(&b2).unwrap();
     assert_eq!(
         v2["el"]["peers"], 32,
         "background poll should have refreshed the cache: {v2}"
     );
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
 async fn run_rejects_zero_poll_interval() {
     let cfg = Config::try_parse_from([
-        "ethryx",
+        "ethonyx",
         "--listen",
         "127.0.0.1:0",
         "--health-poll-interval",
@@ -1008,7 +1016,7 @@ async fn healthz_reports_numeric_state() {
     }))
     .await;
 
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1019,7 +1027,7 @@ async fn healthz_reports_numeric_state() {
     .await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/healthz")).await;
+    let (status, body) = get(&c, &ethonyx.url("/healthz")).await;
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         status,
@@ -1040,7 +1048,7 @@ async fn healthz_reports_numeric_state() {
     assert!(v["cl"]["head_slot"].is_number(), "got {v}");
     assert!(v["cl"]["slot_age_secs"].is_number(), "got {v}");
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -1076,10 +1084,11 @@ async fn readyz_ready_when_synced_even_if_degraded() {
         _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
     }))
     .await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/readyz")).await;
+    let (status, body) = get(&c, &ethonyx.url("/readyz")).await;
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status, StatusCode::OK, "expected ready, got {status}: {v}");
     assert_eq!(v["status"], "ready");
@@ -1091,13 +1100,13 @@ async fn readyz_ready_when_synced_even_if_degraded() {
     assert!(v.get("el_peers").is_none(), "got {v}");
 
     // /healthz reflects the degraded state without affecting readiness.
-    let (hstatus, hbody) = get(&c, &ethryx.url("/healthz")).await;
+    let (hstatus, hbody) = get(&c, &ethonyx.url("/healthz")).await;
     let hv: Value = serde_json::from_slice(&hbody).unwrap();
     assert_eq!(hstatus, StatusCode::OK);
     assert_eq!(hv["el"]["peers"], 0);
     assert_eq!(hv["cl"]["peers"], 0);
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -1124,17 +1133,18 @@ async fn readyz_not_ready_when_el_syncing() {
         _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
     }))
     .await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/readyz")).await;
+    let (status, body) = get(&c, &ethonyx.url("/readyz")).await;
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "got {v}");
     assert_eq!(v["status"], "not_ready");
     assert_eq!(v["el_syncing"]["ok"], false);
     assert_eq!(v["el_syncing"]["detail"], "syncing (block 16, distance 16)");
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -1164,7 +1174,7 @@ async fn readyz_strict_gates_on_freshness() {
         _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
     }))
     .await;
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1174,7 +1184,7 @@ async fn readyz_strict_gates_on_freshness() {
     .await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/readyz")).await;
+    let (status, body) = get(&c, &ethonyx.url("/readyz")).await;
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "got {v}");
     assert_eq!(v["status"], "not_ready");
@@ -1182,7 +1192,7 @@ async fn readyz_strict_gates_on_freshness() {
     assert_eq!(v["el_syncing"]["ok"], true);
     assert_eq!(v["el_block_fresh"]["ok"], false);
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -1193,7 +1203,7 @@ async fn multi_port_listen_serves_same_routes() {
     let p1 = pick_port().await;
     let p2 = pick_port().await;
     let cfg = Config::try_parse_from([
-        "ethryx",
+        "ethonyx",
         "--listen",
         &format!("127.0.0.1:{p1}"),
         "--listen",
@@ -1252,13 +1262,13 @@ async fn ws_echo_upstream() -> String {
 
 #[tokio::test]
 async fn ws_handshake_fails_with_502_when_upstream_down() {
-    // Nothing listens on the WS upstream. ethryx dials upstream *before*
+    // Nothing listens on the WS upstream. ethonyx dials upstream *before*
     // completing the client handshake, so the client gets a 502 on the handshake
     // rather than a 101 followed by an immediate abnormal close.
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
     let dead = pick_port().await; // bound then released -> nothing listening
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1268,13 +1278,13 @@ async fn ws_handshake_fails_with_502_when_upstream_down() {
     ])
     .await;
 
-    let url = format!("ws://127.0.0.1:{}/", ethryx.port);
+    let url = format!("ws://127.0.0.1:{}/", ethonyx.port);
     match connect_async(&url).await {
         Err(WsError::Http(resp)) => assert_eq!(resp.status(), StatusCode::BAD_GATEWAY),
         other => panic!("expected a 502 handshake error, got {other:?}"),
     }
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -1284,7 +1294,7 @@ async fn ws_bridge_echoes_through_upstream() {
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
     let ws_upstream = ws_echo_upstream().await;
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1294,7 +1304,7 @@ async fn ws_bridge_echoes_through_upstream() {
     ])
     .await;
 
-    let url = format!("ws://127.0.0.1:{}/", ethryx.port);
+    let url = format!("ws://127.0.0.1:{}/", ethonyx.port);
     let (mut ws, _resp) = connect_async(&url).await.expect("handshake should succeed");
     ws.send(Message::Text("ping".into())).await.unwrap();
     let echoed = loop {
@@ -1305,7 +1315,7 @@ async fn ws_bridge_echoes_through_upstream() {
     };
     assert_eq!(echoed.as_str(), "ping");
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -1315,7 +1325,7 @@ async fn http2_extended_connect_ws_502_when_upstream_down() {
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
     let dead = pick_port().await;
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1325,7 +1335,7 @@ async fn http2_extended_connect_ws_502_when_upstream_down() {
     ])
     .await;
 
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ethryx.port))
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ethonyx.port))
         .await
         .unwrap();
     let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
@@ -1339,7 +1349,7 @@ async fn http2_extended_connect_ws_502_when_upstream_down() {
     let mut req = Request::builder()
         .method(Method::CONNECT)
         .header("sec-websocket-version", "13")
-        .uri(format!("http://127.0.0.1:{}/", ethryx.port))
+        .uri(format!("http://127.0.0.1:{}/", ethonyx.port))
         .body(Full::<Bytes>::new(Bytes::new()))
         .unwrap();
     req.extensions_mut()
@@ -1352,19 +1362,19 @@ async fn http2_extended_connect_ws_502_when_upstream_down() {
         "dead upstream → 502"
     );
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
 async fn http2_extended_connect_ws_bridges_to_upstream() {
     // RFC 8441 Extended CONNECT: an h2 client opens a WebSocket via
-    // `:method=CONNECT, :protocol=websocket`. ethryx terminates the h2 stream and
+    // `:method=CONNECT, :protocol=websocket`. ethonyx terminates the h2 stream and
     // bridges the RFC 6455 frames to the upstream h1 WebSocket (h2 ws → h1 ws).
     // Driven by a hand-rolled h2 client because tokio/hyper-tungstenite are h1-only.
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
     let ws_upstream = ws_echo_upstream().await;
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1374,8 +1384,8 @@ async fn http2_extended_connect_ws_bridges_to_upstream() {
     ])
     .await;
 
-    // Cleartext h2 (prior-knowledge) connection to ethryx.
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ethryx.port))
+    // Cleartext h2 (prior-knowledge) connection to ethonyx.
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ethonyx.port))
         .await
         .unwrap();
     let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
@@ -1391,7 +1401,7 @@ async fn http2_extended_connect_ws_bridges_to_upstream() {
         let mut req = Request::builder()
             .method(Method::CONNECT)
             .header("sec-websocket-version", "13")
-            .uri(format!("http://127.0.0.1:{}{path}", ethryx.port))
+            .uri(format!("http://127.0.0.1:{}{path}", ethonyx.port))
             .body(Full::<Bytes>::new(Bytes::new()))
             .unwrap();
         req.extensions_mut()
@@ -1424,7 +1434,7 @@ async fn http2_extended_connect_ws_bridges_to_upstream() {
         sockets.push(ws);
     }
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
     for mut ws in sockets {
         let closed = tokio::time::timeout(Duration::from_secs(1), ws.next())
             .await
@@ -1439,7 +1449,7 @@ async fn http2_extended_connect_ws_bridges_to_upstream() {
 #[tokio::test]
 async fn el_upstream_h2c_timeout_falls_back_to_h1() {
     // If the EL upstream hangs on h2c connection preface (causing a timeout)
-    // rather than closing it, ethryx should fallback to HTTP/1.1 if HTTP/1.1 works.
+    // rather than closing it, ethonyx should fallback to HTTP/1.1 if HTTP/1.1 works.
     let el = MockServer::start_hanging_h2c(Arc::new(|req| {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         let method = body.get("method").and_then(Value::as_str).unwrap_or("");
@@ -1470,22 +1480,23 @@ async fn el_upstream_h2c_timeout_falls_back_to_h1() {
     }))
     .await;
 
-    // Start ethryx. By default, it warms up cache on start.
+    // Start ethonyx. By default, it warms up cache on start.
     // If fallback works, starting will succeed because the warm-up succeeds.
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = client();
-    let (status, body) = get(&c, &ethryx.url("/readyz")).await;
+    let (status, body) = get(&c, &ethonyx.url("/readyz")).await;
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status, StatusCode::OK, "expected ready, got {status}: {v}");
     assert_eq!(v["status"], "ready");
 
     // Let's also check /healthz report
-    let (_, hz) = get(&c, &ethryx.url("/healthz")).await;
+    let (_, hz) = get(&c, &ethonyx.url("/healthz")).await;
     let hv: Value = serde_json::from_slice(&hz).unwrap();
     assert_eq!(hv["el"]["transport"], "http/1.1"); // verified fallback to HTTP/1.1!
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 /// WebSocket upstream that verifies specific request properties (path, query, headers)
@@ -1559,7 +1570,7 @@ async fn ws_forwarding_preserves_path_query_and_headers() {
     )
     .await;
 
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1570,7 +1581,7 @@ async fn ws_forwarding_preserves_path_query_and_headers() {
     .await;
 
     // Connect using tungstenite Request with custom path/query and headers.
-    let target_url = format!("ws://127.0.0.1:{}/foo/bar?baz=qux", ethryx.port);
+    let target_url = format!("ws://127.0.0.1:{}/foo/bar?baz=qux", ethonyx.port);
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut req = target_url.into_client_request().unwrap();
     req.headers_mut().insert(
@@ -1601,50 +1612,51 @@ async fn ws_forwarding_preserves_path_query_and_headers() {
         "Upstream did not receive the expected path, query, or headers"
     );
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
 async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx =
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = client();
 
     // Fire a quick request to record some request count metrics
     let (status, _) = post_json(
         &c,
-        &ethryx.url("/"),
+        &ethonyx.url("/"),
         json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
     // Fetch metrics
-    let (status, body) = get(&c, &ethryx.url("/metrics")).await;
+    let (status, body) = get(&c, &ethonyx.url("/metrics")).await;
     assert_eq!(status, StatusCode::OK);
 
     let metrics_str = String::from_utf8_lossy(&body);
     // Assert some of the metrics exist in the response
-    assert!(metrics_str.contains("ethryx_proxy_requests_total"));
-    assert!(metrics_str.contains("ethryx_proxy_request_duration_seconds"));
-    assert!(metrics_str.contains("ethryx_active_connections"));
-    assert!(metrics_str.contains("ethryx_upstream_health_status"));
-    assert!(metrics_str.contains("ethryx_upstream_peers"));
+    assert!(metrics_str.contains("ethonyx_proxy_requests_total"));
+    assert!(metrics_str.contains("ethonyx_proxy_request_duration_seconds"));
+    assert!(metrics_str.contains("ethonyx_active_connections"));
+    assert!(metrics_str.contains("ethonyx_upstream_health_status"));
+    assert!(metrics_str.contains("ethonyx_upstream_peers"));
 
     let request_count = |text: &str| -> f64 {
         text.lines()
-            .filter(|line| line.starts_with("ethryx_proxy_requests_total{"))
+            .filter(|line| line.starts_with("ethonyx_proxy_requests_total{"))
             .filter(|line| line.contains("method=\"POST\""))
             .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
             .sum()
     };
     let before = request_count(&metrics_str);
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 
     // A second run in the same runtime reuses the process-global recorder.
-    let second = EthryxHandle::start(&["--trust-upstream", "--mock-eth-syncing"]).await;
+    let second = EthonyxHandle::start(&["--trust-upstream", "--mock-eth-syncing"]).await;
     let (status, _) = post_json(
         &c,
         &second.url("/"),
@@ -1687,7 +1699,7 @@ async fn test_cl_node_health_intercept_and_passthrough() {
     .await;
 
     // 1. Default (mock_cl_node_health = false): GET /eth/v1/node/health is proxied (bypassed) to CL upstream
-    let ethryx_default = EthryxHandle::start(&[
+    let ethonyx_default = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1696,14 +1708,14 @@ async fn test_cl_node_health_intercept_and_passthrough() {
     .await;
 
     let c = client();
-    let (status_def, body_def) = get(&c, &ethryx_default.url("/eth/v1/node/health")).await;
+    let (status_def, body_def) = get(&c, &ethonyx_default.url("/eth/v1/node/health")).await;
     assert_eq!(status_def, StatusCode::BAD_REQUEST);
     assert_eq!(body_def.as_ref(), b"{\"error\": \"Unsupported method\"}");
 
-    ethryx_default.shutdown().await;
+    ethonyx_default.shutdown().await;
 
     // 2. Intercept enabled (--mock-cl-node-health): GET /eth/v1/node/health is intercepted locally
-    let ethryx_mock = EthryxHandle::start(&[
+    let ethonyx_mock = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1712,14 +1724,14 @@ async fn test_cl_node_health_intercept_and_passthrough() {
     ])
     .await;
 
-    let (status_mock, body_mock) = get(&c, &ethryx_mock.url("/eth/v1/node/health")).await;
+    let (status_mock, body_mock) = get(&c, &ethonyx_mock.url("/eth/v1/node/health")).await;
     assert_eq!(status_mock, StatusCode::OK);
     assert!(body_mock.is_empty());
 
-    ethryx_mock.shutdown().await;
+    ethonyx_mock.shutdown().await;
 
     // 3. Trusted upstream (--trust-upstream without --mock-cl-node-health): /readyz is 200, node/health is bypassed
-    let ethryx_trust = EthryxHandle::start(&[
+    let ethonyx_trust = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1728,16 +1740,16 @@ async fn test_cl_node_health_intercept_and_passthrough() {
     ])
     .await;
 
-    let (status_tr, body_tr) = get(&c, &ethryx_trust.url("/readyz")).await;
+    let (status_tr, body_tr) = get(&c, &ethonyx_trust.url("/readyz")).await;
     assert_eq!(status_tr, StatusCode::OK);
     let ready_val: Value = serde_json::from_slice(&body_tr).unwrap();
     assert_eq!(ready_val["status"], "ready");
 
-    let (status_tr_nh, body_tr_nh) = get(&c, &ethryx_trust.url("/eth/v1/node/health")).await;
+    let (status_tr_nh, body_tr_nh) = get(&c, &ethonyx_trust.url("/eth/v1/node/health")).await;
     assert_eq!(status_tr_nh, StatusCode::BAD_REQUEST);
     assert_eq!(body_tr_nh.as_ref(), b"{\"error\": \"Unsupported method\"}");
 
-    ethryx_trust.shutdown().await;
+    ethonyx_trust.shutdown().await;
 }
 
 #[cfg(feature = "otel")]
@@ -1745,7 +1757,7 @@ async fn test_cl_node_health_intercept_and_passthrough() {
 async fn trace_context_is_propagated_to_upstream() {
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1760,7 +1772,7 @@ async fn trace_context_is_propagated_to_upstream() {
     let traceparent_val = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     let req = Request::builder()
         .method(Method::POST)
-        .uri(ethryx.url("/"))
+        .uri(ethonyx.url("/"))
         .header("traceparent", traceparent_val)
         .body(Full::new(Bytes::from(
             json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1})
@@ -1787,7 +1799,7 @@ async fn trace_context_is_propagated_to_upstream() {
         received_traceparent_str
     );
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -1823,7 +1835,7 @@ async fn trust_upstream_decoupled_from_mock_eth_syncing() {
     let cl = MockServer::start(ok_handler()).await;
 
     // 1. --trust-upstream alone (without --mock-eth-syncing): eth_syncing is proxied (bypassed) to EL upstream
-    let ethryx_trust = EthryxHandle::start(&[
+    let ethonyx_trust = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1837,7 +1849,7 @@ async fn trust_upstream_decoupled_from_mock_eth_syncing() {
     let c = client();
     let (status, body) = post_json_settled(
         &c,
-        &ethryx_trust.url("/"),
+        &ethonyx_trust.url("/"),
         json!({"jsonrpc": "2.0", "method": "eth_syncing", "params": [], "id": 55}),
     )
     .await;
@@ -1845,10 +1857,10 @@ async fn trust_upstream_decoupled_from_mock_eth_syncing() {
     let val: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(val["result"], "upstream_result");
 
-    ethryx_trust.shutdown().await;
+    ethonyx_trust.shutdown().await;
 
     // 2. --mock-eth-syncing enabled: eth_syncing is intercepted locally
-    let ethryx_mock = EthryxHandle::start(&[
+    let ethonyx_mock = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1861,7 +1873,7 @@ async fn trust_upstream_decoupled_from_mock_eth_syncing() {
 
     let (status_m, body_m) = post_json_settled(
         &c,
-        &ethryx_mock.url("/"),
+        &ethonyx_mock.url("/"),
         json!({"jsonrpc": "2.0", "method": "eth_syncing", "params": [], "id": 55}),
     )
     .await;
@@ -1869,7 +1881,7 @@ async fn trust_upstream_decoupled_from_mock_eth_syncing() {
     let val_m: Value = serde_json::from_slice(&body_m).unwrap();
     assert_eq!(val_m["result"], false);
 
-    ethryx_mock.shutdown().await;
+    ethonyx_mock.shutdown().await;
 }
 
 #[tokio::test]
@@ -1891,7 +1903,7 @@ async fn test_cl_mev_relay_routing() {
     }))
     .await;
 
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1904,14 +1916,14 @@ async fn test_cl_mev_relay_routing() {
     let c = client();
     let (status, body) = post_json(
         &c,
-        &ethryx.url("/eth/v1/validator/register_validator"),
+        &ethonyx.url("/eth/v1/validator/register_validator"),
         json!([]),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.as_ref(), b"[]");
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -1931,7 +1943,7 @@ async fn test_mock_cl_subscriptions() {
     }))
     .await;
 
-    let ethryx = EthryxHandle::start(&[
+    let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1947,7 +1959,7 @@ async fn test_mock_cl_subscriptions() {
         "/eth/v1/validator/beacon_committee_subscriptions",
         "/eth/v1/validator/sync_committee_subscriptions",
     ] {
-        let (status, body) = post_json(&c, &ethryx.url(path), json!([])).await;
+        let (status, body) = post_json(&c, &ethonyx.url(path), json!([])).await;
         assert_eq!(status, StatusCode::OK, "Failed for path: {path}");
         assert_eq!(
             body.as_ref(),
@@ -1956,7 +1968,7 @@ async fn test_mock_cl_subscriptions() {
         );
     }
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -1969,12 +1981,12 @@ async fn test_mock_eth_syncing_flag() {
     }))
     .await;
 
-    let ethryx = EthryxHandle::start(&["--el-http-url", &el.url, "--mock-eth-syncing"]).await;
+    let ethonyx = EthonyxHandle::start(&["--el-http-url", &el.url, "--mock-eth-syncing"]).await;
 
     let c = client();
     let (status, body) = post_json(
         &c,
-        &ethryx.url("/"),
+        &ethonyx.url("/"),
         json!({"jsonrpc": "2.0", "id": 1, "method": "eth_syncing", "params": []}),
     )
     .await;
@@ -1982,7 +1994,7 @@ async fn test_mock_eth_syncing_flag() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["result"], false);
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
@@ -2019,9 +2031,9 @@ async fn test_ws_handshake_preserves_upstream_path_without_trailing_slash() {
     });
 
     let upstream_url = format!("ws://127.0.0.1:{port}/v2/testkey");
-    let ethryx = EthryxHandle::start(&["--el-ws-url", &upstream_url, "--trust-upstream"]).await;
+    let ethonyx = EthonyxHandle::start(&["--el-ws-url", &upstream_url, "--trust-upstream"]).await;
 
-    let ws_url = ethryx.url("/").replace("http://", "ws://");
+    let ws_url = ethonyx.url("/").replace("http://", "ws://");
     let (ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
 
     let _ = ws;
@@ -2030,13 +2042,13 @@ async fn test_ws_handshake_preserves_upstream_path_without_trailing_slash() {
     let final_uri = captured_uri.lock().unwrap().clone();
     assert_eq!(final_uri, "/v2/testkey");
 
-    ethryx.shutdown().await;
+    ethonyx.shutdown().await;
 }
 
 #[tokio::test]
 async fn trusted_h1_upstream_and_http_notifications() {
     let el = MockServer::start(ok_handler()).await;
-    let proxy = EthryxHandle::start(&[
+    let proxy = EthonyxHandle::start(&[
         "--trust-upstream",
         "--mock-eth-syncing",
         "--el-http-url",
@@ -2079,7 +2091,7 @@ async fn trusted_h1_upstream_and_http_notifications() {
 #[tokio::test]
 async fn mock_body_stall_has_a_deadline() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let proxy = EthryxHandle::start(&["--trust-upstream", "--mock-eth-syncing"]).await;
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--mock-eth-syncing"]).await;
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -2121,7 +2133,7 @@ async fn websocket_subprotocol_is_negotiated_end_to_end() {
         }
     });
     let proxy =
-        EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &format!("ws://{addr}")]).await;
+        EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &format!("ws://{addr}")]).await;
     let mut req = format!("ws://127.0.0.1:{}/", proxy.port)
         .into_client_request()
         .unwrap();
@@ -2147,7 +2159,7 @@ async fn websocket_fragmented_utf8_ping_close_and_mock_batch() {
     let upstream = ws_echo_upstream().await;
     for mocking in [false, true] {
         let mock_arg = if mocking { "true" } else { "false" };
-        let proxy = EthryxHandle::start(&[
+        let proxy = EthonyxHandle::start(&[
             "--trust-upstream",
             "--mock-eth-syncing",
             mock_arg,
@@ -2231,7 +2243,7 @@ async fn websocket_fragmented_utf8_ping_close_and_mock_batch() {
 async fn websocket_rejects_invalid_and_oversized_frames() {
     use tokio::io::AsyncWriteExt;
     let upstream = ws_echo_upstream().await;
-    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &upstream]).await;
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &upstream]).await;
     let mut oversized_pong = vec![0x8a, 0xfe, 0, 126, 0, 0, 0, 0];
     oversized_pong.extend_from_slice(&[0; 126]);
     let mut oversized_frame = vec![0x82, 0xff];
@@ -2283,7 +2295,7 @@ async fn health_timeout_includes_a_stalled_response_body() {
     let el = MockServer::start_h2c(ok_handler()).await;
     let proxy = tokio::time::timeout(
         Duration::from_secs(4),
-        EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &stalled_url]),
+        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &stalled_url]),
     )
     .await
     .expect("body timeout must let startup finish");
@@ -2310,7 +2322,7 @@ async fn health_timeout_includes_a_stalled_response_body() {
 async fn websocket_rejects_invalid_handshakes_on_both_hops() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dead = format!("ws://127.0.0.1:{}", pick_port().await);
-    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &dead]).await;
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &dead]).await;
     for headers in [
         "Sec-WebSocket-Version: 12\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
         "Sec-WebSocket-Version: 13\r\n", // missing key
@@ -2343,7 +2355,7 @@ async fn websocket_rejects_invalid_handshakes_on_both_hops() {
         }
         socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: invalid-signature\r\n\r\n").await.unwrap();
     });
-    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
     let err = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
         .await
         .unwrap_err();
@@ -2367,7 +2379,7 @@ async fn binary_exports_traces_and_metrics_and_flushes_on_sigterm() {
     let upstream = MockServer::start(ok_handler()).await;
     let port = pick_port().await;
     let mut child = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_ethryx"))
+        Command::new(env!("CARGO_BIN_EXE_ethonyx"))
             .args([
                 "--listen",
                 &format!("127.0.0.1:{port}"),
@@ -2435,7 +2447,7 @@ async fn binary_exports_traces_and_metrics_and_flushes_on_sigterm() {
 async fn shutdown_releases_upgraded_websocket_connections() {
     let upstream = ws_echo_upstream().await;
     for mocking in ["false", "true"] {
-        let proxy = EthryxHandle::start(&[
+        let proxy = EthonyxHandle::start(&[
             "--trust-upstream",
             "--mock-eth-syncing",
             mocking,
@@ -2465,7 +2477,7 @@ async fn shutdown_releases_upgraded_websocket_connections() {
 #[tokio::test]
 async fn shutdown_waits_for_websocket_peer_close() {
     let upstream = ws_echo_upstream().await;
-    let mut proxy = EthryxHandle::start_with_grace(
+    let mut proxy = EthonyxHandle::start_with_grace(
         &["--trust-upstream", "--el-ws-url", &upstream],
         Duration::from_secs(3),
     )
@@ -2493,7 +2505,7 @@ async fn shutdown_waits_for_websocket_peer_close() {
 #[tokio::test]
 async fn shutdown_bounds_an_unresponsive_websocket_peer() {
     let upstream = ws_echo_upstream().await;
-    let proxy = EthryxHandle::start_with_grace(
+    let proxy = EthonyxHandle::start_with_grace(
         &["--trust-upstream", "--el-ws-url", &upstream],
         Duration::from_secs(1),
     )
@@ -2543,7 +2555,7 @@ async fn shutdown_releases_a_stalled_http_response_body() {
         assert!(matches!(end, Ok(0) | Err(_)), "{end:?}");
         let _ = closed_tx.send(());
     });
-    let proxy = EthryxHandle::start(&["--trust-upstream", "--cl-beacon-url", &upstream]).await;
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--cl-beacon-url", &upstream]).await;
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -2574,7 +2586,7 @@ async fn shutdown_releases_a_stalled_http_response_body() {
 }
 
 #[tokio::test]
-#[ignore = "sustained connection churn; set ETHRYX_STRESS_SECONDS and run explicitly"]
+#[ignore = "sustained connection churn; set ETHONYX_STRESS_SECONDS and run explicitly"]
 async fn websocket_sustained_churn_preserves_replies_and_releases_upstreams() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Active(Arc<AtomicUsize>);
@@ -2583,7 +2595,7 @@ async fn websocket_sustained_churn_preserves_replies_and_releases_upstreams() {
             self.0.fetch_sub(1, Ordering::Relaxed);
         }
     }
-    let seconds = std::env::var("ETHRYX_STRESS_SECONDS")
+    let seconds = std::env::var("ETHONYX_STRESS_SECONDS")
         .map(|value| value.parse::<u64>().expect("integer stress duration"))
         .unwrap_or(30);
     assert!((1..=600).contains(&seconds));
@@ -2611,7 +2623,7 @@ async fn websocket_sustained_churn_preserves_replies_and_releases_upstreams() {
                 });
             }
         });
-        let proxy = EthryxHandle::start(&[
+        let proxy = EthonyxHandle::start(&[
             "--trust-upstream",
             "--mock-eth-syncing",
             if mocking { "true" } else { "false" },
@@ -2724,7 +2736,7 @@ async fn http_forwarding_preserves_configured_uri_and_unmodified_body() {
             if mock_enabled {
                 args.push("--mock-eth-syncing");
             }
-            let proxy = EthryxHandle::start(&args).await;
+            let proxy = EthonyxHandle::start(&args).await;
             for c in [client(), h2c_client()] {
                 for (path, expected_pq) in paths.into_iter().zip(expected_pqs) {
                     for &payload in payloads {
@@ -2778,7 +2790,7 @@ async fn websocket_header_lists_and_http1_connect_are_validated_before_dialing()
     let key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
     let canonical = "Connection: Upgrade\r\nUpgrade: websocket\r\n";
     for mocking in [false, true] {
-        let proxy = EthryxHandle::start(&[
+        let proxy = EthonyxHandle::start(&[
             "--trust-upstream",
             "--el-ws-url",
             &upstream,
@@ -2907,7 +2919,7 @@ async fn websocket_header_lists_and_http1_connect_are_validated_before_dialing()
 async fn http2_websocket_rejects_missing_invalid_and_duplicate_versions_without_dialing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("ws://{}", listener.local_addr().unwrap());
-    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &upstream]).await;
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &upstream]).await;
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -2970,7 +2982,7 @@ async fn invalid_jsonrpc_batches_are_forwarded_intact_over_http_and_websocket() 
         }
     });
     let ws_upstream = ws_echo_upstream().await;
-    let proxy = EthryxHandle::start(&[
+    let proxy = EthonyxHandle::start(&[
         "--trust-upstream",
         "--mock-eth-syncing",
         "--el-http-url",
@@ -3026,7 +3038,7 @@ async fn invalid_jsonrpc_batches_are_forwarded_intact_over_http_and_websocket() 
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_already_ready_does_not_wait_for_a_new_watch_event() {
     let cfg = Config::parse_from([
-        "ethryx",
+        "ethonyx",
         "--listen",
         "127.0.0.1:0",
         "--trust-upstream",
@@ -3069,7 +3081,7 @@ async fn shutdown_during_h2_ws_handshake(complete_handshake: bool, grace: Durati
         let _ = closed_tx.send(());
     });
     let mut proxy =
-        EthryxHandle::start_with_grace(&["--trust-upstream", "--el-ws-url", &url], grace).await;
+        EthonyxHandle::start_with_grace(&["--trust-upstream", "--el-ws-url", &url], grace).await;
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -3183,7 +3195,7 @@ async fn health_rejects_array_envelopes_and_data_without_losing_partial_results(
         }))
         .await;
         let proxy =
-            EthryxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+            EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
         let c = client();
         let (status, _) = get(&c, &proxy.url("/readyz")).await;
         assert_eq!(
@@ -3212,7 +3224,7 @@ async fn health_rejects_array_envelopes_and_data_without_losing_partial_results(
 }
 
 async fn ws_handshake_response(
-    proxy: &EthryxHandle,
+    proxy: &EthonyxHandle,
     h2: bool,
     headers: &[(&str, &str)],
 ) -> (Response<Incoming>, JoinHandle<()>) {
@@ -3311,7 +3323,7 @@ async fn websocket_negotiates_split_protocols_without_forwarding_extensions() {
             ws.send(message).await.unwrap();
             let _ = ws.next().await;
         });
-        let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+        let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
         let (response, driver) = ws_handshake_response(
             &proxy,
             h2,
@@ -3362,7 +3374,7 @@ async fn websocket_negotiates_split_protocols_without_forwarding_extensions() {
 async fn websocket_rejects_split_protocol_duplicates_before_dialing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
-    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
     for h2 in [false, true] {
         let count = if h2 { 1024 } else { 32_768 };
         let large = (0..count)
@@ -3443,7 +3455,7 @@ async fn websocket_rejects_unsolicited_extensions_and_invalid_protocol_selection
                 .unwrap();
                 let _ = ws.next().await;
             });
-            let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+            let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
             let (response, driver) = ws_handshake_response(
                 &proxy,
                 h2,
@@ -3507,7 +3519,7 @@ async fn websocket_strips_hop_by_hop_and_connection_nominated_headers_on_upstrea
         .unwrap();
         let _ = ws.next().await;
     });
-    let proxy = EthryxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
     let socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -3565,7 +3577,7 @@ async fn websocket_mock_mode_bounds_post_close_drain_when_upstream_keeps_tcp_ope
             }
             let _ = released_tx.send(());
         });
-        let proxy = EthryxHandle::start(&[
+        let proxy = EthonyxHandle::start(&[
             "--trust-upstream",
             "--mock-eth-syncing",
             mocking,
@@ -3619,7 +3631,7 @@ async fn readyz_strict_rejects_malformed_hex_quantities_in_el_probes() {
             _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
         }))
         .await;
-        let proxy = EthryxHandle::start(&[
+        let proxy = EthonyxHandle::start(&[
             "--el-http-url",
             &el.url,
             "--cl-beacon-url",
@@ -3649,7 +3661,7 @@ async fn readyz_strict_rejects_malformed_hex_quantities_in_el_probes() {
 async fn mock_eth_syncing_forwards_non_empty_params_over_http_and_websocket() {
     let el = MockServer::start(Arc::new(|req| (StatusCode::OK, req.body.to_vec()))).await;
     let ws_upstream = ws_echo_upstream().await;
-    let proxy = EthryxHandle::start(&[
+    let proxy = EthonyxHandle::start(&[
         "--trust-upstream",
         "--mock-eth-syncing",
         "--el-http-url",

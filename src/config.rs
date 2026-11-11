@@ -33,16 +33,16 @@ impl Network {
 
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "ethryx",
+    name = "ethonyx",
     version,
-    about = "Ethryx — Ethereum EL/CL reverse proxy & health-check sidecar"
+    about = "Ethonyx — Ethereum EL/CL reverse proxy & health-check sidecar"
 )]
 pub struct Config {
     /// Listen address (host:port). Repeat the flag or comma-separate for multi-port.
     /// All ports serve the same routes; intended for direct IP:port access plus LB.
     #[arg(
         long,
-        env = "ETHRYX_LISTEN",
+        env = "ETHONYX_LISTEN",
         value_delimiter = ',',
         default_value = "0.0.0.0:8547"
     )]
@@ -51,19 +51,19 @@ pub struct Config {
     /// Execution-layer JSON-RPC over HTTP upstream URL.
     #[arg(
         long,
-        env = "ETHRYX_EL_HTTP_URL",
+        env = "ETHONYX_EL_HTTP_URL",
         default_value = "http://127.0.0.1:8545"
     )]
     pub el_http_url: String,
 
     /// Execution-layer JSON-RPC over WebSocket upstream URL.
-    #[arg(long, env = "ETHRYX_EL_WS_URL", default_value = "ws://127.0.0.1:8546")]
+    #[arg(long, env = "ETHONYX_EL_WS_URL", default_value = "ws://127.0.0.1:8546")]
     pub el_ws_url: String,
 
     /// Consensus-layer Beacon API upstream URL (REST, /eth/v1/...).
     #[arg(
         long,
-        env = "ETHRYX_CL_BEACON_URL",
+        env = "ETHONYX_CL_BEACON_URL",
         default_value = "http://127.0.0.1:5052"
     )]
     pub cl_beacon_url: String,
@@ -71,22 +71,22 @@ pub struct Config {
     /// Optional Consensus-layer MEV Relay / MEV-Boost upstream URL (REST, /eth/v1/builder/validators).
     /// When specified, POST /eth/v1/validator/register_validator requests are rewritten to
     /// /eth/v1/builder/validators and routed to this URL.
-    #[arg(long, env = "ETHRYX_CL_MEV_RELAY_URL")]
+    #[arg(long, env = "ETHONYX_CL_MEV_RELAY_URL")]
     pub cl_mev_relay_url: Option<String>,
 
     /// Beacon network. Selects defaults for cl-genesis-time / cl-seconds-per-slot.
     /// Use `custom` for private chains and pass both values explicitly.
-    #[arg(long, env = "ETHRYX_NETWORK", value_enum, default_value_t = Network::Mainnet)]
+    #[arg(long, env = "ETHONYX_NETWORK", value_enum, default_value_t = Network::Mainnet)]
     pub network: Network,
 
     /// Maximum EL block age (seconds) used to gate `/readyz` under
     /// `--readyz-strict`. `/healthz` always reports the raw age regardless.
-    #[arg(long, env = "ETHRYX_EL_MAX_BLOCK_AGE_SECS", default_value_t = 60)]
+    #[arg(long, env = "ETHONYX_EL_MAX_BLOCK_AGE_SECS", default_value_t = 60)]
     pub el_max_block_age_secs: u64,
 
     /// Maximum CL head_slot age (seconds, wall-clock) used to gate `/readyz`
     /// under `--readyz-strict`. `/healthz` always reports the raw age regardless.
-    #[arg(long, env = "ETHRYX_CL_MAX_SLOT_AGE_SECS", default_value_t = 60)]
+    #[arg(long, env = "ETHONYX_CL_MAX_SLOT_AGE_SECS", default_value_t = 60)]
     pub cl_max_slot_age_secs: u64,
 
     /// Also gate `/readyz` on EL block / CL slot freshness, not just sync status.
@@ -94,7 +94,7 @@ pub struct Config {
     /// whole fleet from the load balancer at once.
     #[arg(
         long,
-        env = "ETHRYX_READYZ_STRICT",
+        env = "ETHONYX_READYZ_STRICT",
         default_value_t = false,
         action = clap::ArgAction::Set,
         num_args = 0..=1,
@@ -103,28 +103,28 @@ pub struct Config {
     pub readyz_strict: bool,
 
     /// Beacon-chain genesis Unix timestamp. Overrides --network preset. Set 0 to disable slot-age check.
-    #[arg(long, env = "ETHRYX_CL_GENESIS_TIME")]
+    #[arg(long, env = "ETHONYX_CL_GENESIS_TIME")]
     pub cl_genesis_time: Option<u64>,
 
     /// Seconds per slot. Overrides --network preset.
-    #[arg(long, env = "ETHRYX_CL_SECONDS_PER_SLOT")]
+    #[arg(long, env = "ETHONYX_CL_SECONDS_PER_SLOT")]
     pub cl_seconds_per_slot: Option<u64>,
 
     /// Upstream timeout for each background health-poll RPC (seconds).
-    #[arg(long, env = "ETHRYX_HEALTH_TIMEOUT", default_value = "2", value_parser = parse_secs)]
+    #[arg(long, env = "ETHONYX_HEALTH_TIMEOUT", default_value = "2", value_parser = parse_secs)]
     pub health_timeout: Duration,
 
     /// Interval between background health polls (seconds). `/healthz` and
     /// `/readyz` serve the latest poll, so upstream load stays constant
     /// regardless of probe rate. Must be at least 1 second.
-    #[arg(long, env = "ETHRYX_HEALTH_POLL_INTERVAL", default_value = "1", value_parser = parse_secs)]
+    #[arg(long, env = "ETHONYX_HEALTH_POLL_INTERVAL", default_value = "1", value_parser = parse_secs)]
     pub health_poll_interval: Duration,
 
     /// Log level used when `RUST_LOG` is unset. `RUST_LOG` overrides this and
-    /// additionally allows per-target directives (e.g. `ethryx=debug,hyper=warn`).
+    /// additionally allows per-target directives (e.g. `ethonyx=debug,hyper=warn`).
     #[arg(
         long,
-        env = "ETHRYX_LOG_LEVEL",
+        env = "ETHONYX_LOG_LEVEL",
         default_value = "info",
         value_parser = ["trace", "debug", "info", "warn", "error"]
     )]
@@ -137,7 +137,7 @@ pub struct Config {
     /// `RUST_LOG` can target it directly, e.g. `RUST_LOG=access_log=info`.
     #[arg(
         long,
-        env = "ETHRYX_ACCESS_LOG",
+        env = "ETHONYX_ACCESS_LOG",
         default_value_t = false,
         action = clap::ArgAction::Set,
         num_args = 0..=1,
@@ -148,7 +148,7 @@ pub struct Config {
     /// Trust the upstream node: disable background health polling (0 RPC cost for paid endpoints) and always report healthy/ready.
     #[arg(
         long,
-        env = "ETHRYX_TRUST_UPSTREAM",
+        env = "ETHONYX_TRUST_UPSTREAM",
         default_value_t = false,
         action = clap::ArgAction::Set,
         num_args = 0..=1,
@@ -159,7 +159,7 @@ pub struct Config {
     /// Statically mock eth_syncing JSON-RPC requests (HTTP & WebSocket) locally with result: false.
     #[arg(
         long,
-        env = "ETHRYX_MOCK_ETH_SYNCING",
+        env = "ETHONYX_MOCK_ETH_SYNCING",
         default_value_t = false,
         action = clap::ArgAction::Set,
         num_args = 0..=1,
@@ -170,7 +170,7 @@ pub struct Config {
     /// Statically mock CL validator subscription & prepare proposer requests locally with 200 OK.
     #[arg(
         long,
-        env = "ETHRYX_MOCK_CL_SUBSCRIPTIONS",
+        env = "ETHONYX_MOCK_CL_SUBSCRIPTIONS",
         default_value_t = false,
         action = clap::ArgAction::Set,
         num_args = 0..=1,
@@ -181,7 +181,7 @@ pub struct Config {
     /// Statically mock GET /eth/v1/node/health requests locally with 200 OK.
     #[arg(
         long,
-        env = "ETHRYX_MOCK_CL_NODE_HEALTH",
+        env = "ETHONYX_MOCK_CL_NODE_HEALTH",
         default_value_t = false,
         action = clap::ArgAction::Set,
         num_args = 0..=1,
@@ -190,16 +190,16 @@ pub struct Config {
     pub mock_cl_node_health: bool,
 
     /// Upstream timeout for proxied requests (seconds).
-    #[arg(long, env = "ETHRYX_PROXY_TIMEOUT", default_value = "60", value_parser = parse_secs)]
+    #[arg(long, env = "ETHONYX_PROXY_TIMEOUT", default_value = "60", value_parser = parse_secs)]
     pub proxy_timeout: Duration,
 
     /// Shutdown grace period (seconds) for draining in-flight connections.
-    #[arg(long, env = "ETHRYX_SHUTDOWN_GRACE", default_value = "10", value_parser = parse_secs)]
+    #[arg(long, env = "ETHONYX_SHUTDOWN_GRACE", default_value = "10", value_parser = parse_secs)]
     pub shutdown_grace: Duration,
 
     /// OpenTelemetry collector endpoint (HTTP) for exporting traces/metrics.
     #[cfg(feature = "otel")]
-    #[arg(long, env = "ETHRYX_OTEL_ENDPOINT")]
+    #[arg(long, env = "ETHONYX_OTEL_ENDPOINT")]
     pub otel_endpoint: Option<String>,
 }
 
@@ -261,7 +261,7 @@ mod tests {
     }
 
     fn parse(extra: &[&str]) -> Config {
-        let mut argv = vec!["ethryx"];
+        let mut argv = vec!["ethonyx"];
         argv.extend_from_slice(extra);
         Config::try_parse_from(argv).expect("clap parse")
     }
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn log_level_rejects_unknown_value() {
-        assert!(Config::try_parse_from(["ethryx", "--log-level", "bogus"]).is_err());
+        assert!(Config::try_parse_from(["ethonyx", "--log-level", "bogus"]).is_err());
     }
 
     #[test]

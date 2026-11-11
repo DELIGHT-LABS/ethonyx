@@ -95,10 +95,10 @@ jobs:
         id: build
         uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: ethryx
+          bin: ethonyx
           target: ${{ matrix.target }}
           locked: true
-          archive: ethryx-$tag-$target
+          archive: ethonyx-$tag-$target
           include: >-
             LICENSE,LICENSE-MIT,LICENSE-APACHE,
             target/release-licenses/THIRD_PARTY_LICENSES.txt,

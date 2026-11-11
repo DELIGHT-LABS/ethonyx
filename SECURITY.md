@@ -10,7 +10,7 @@ tagged releases are not patched in place; upgrade to the latest release.
 Please report security issues **privately** via GitHub's security advisory
 flow:
 
-  https://github.com/DELIGHT-LABS/ethryx/security/advisories/new
+  https://github.com/DELIGHT-LABS/ethonyx/security/advisories/new
 
 We aim to acknowledge reports within **72 hours** and triage within one week.
 

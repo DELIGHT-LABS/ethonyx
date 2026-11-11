@@ -20,7 +20,7 @@ labels: bug
 
 ## Environment
 
-- ethryx version: <!-- `ethryx --version` -->
+- ethonyx version: <!-- `ethonyx --version` -->
 - OS / arch:
 - EL client + version:
 - CL client + version:

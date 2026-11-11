@@ -15,7 +15,7 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=ETHRYX_GIT_DESCRIBE={describe}");
+    println!("cargo:rustc-env=ETHONYX_GIT_DESCRIBE={describe}");
 
     // Rebuild when HEAD moves or the index changes, so the value stays current.
     println!("cargo:rerun-if-changed=.git/HEAD");

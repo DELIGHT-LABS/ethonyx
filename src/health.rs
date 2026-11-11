@@ -35,7 +35,7 @@ pub struct HealthSnapshot {
 
 #[derive(Serialize, Default)]
 pub struct ElHealth {
-    /// HTTP version ethryx uses for this upstream hop: `h2c` / `h2` / `http/1.1`.
+    /// HTTP version ethonyx uses for this upstream hop: `h2c` / `h2` / `http/1.1`.
     /// Reflects the poller's auto-detected EL transport verdict.
     pub transport: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,7 +54,7 @@ pub struct ElHealth {
 
 #[derive(Serialize, Default)]
 pub struct ClHealth {
-    /// HTTP version ethryx uses for the Beacon hop. The CL hop never uses h2c
+    /// HTTP version ethonyx uses for the Beacon hop. The CL hop never uses h2c
     /// prior-knowledge, so a cleartext upstream is always `http/1.1`; an `https`
     /// upstream may negotiate `h2` via ALPN, which is not separately tracked and
     /// is reported conservatively as `http/1.1`.
@@ -205,7 +205,7 @@ pub fn report(state: &AppState, head: bool) -> Response<ResBody> {
     json_response(StatusCode::OK, &snapshot)
 }
 
-/// HTTP-version label for an upstream hop from whether ethryx selected HTTP/2 and
+/// HTTP-version label for an upstream hop from whether ethonyx selected HTTP/2 and
 /// whether the upstream is TLS. Cleartext h2 is `h2c`; h2 over TLS is `h2`.
 fn transport_label(uses_h2: bool, scheme: Option<&str>) -> &'static str {
     match (uses_h2, scheme == Some("https")) {
@@ -459,23 +459,23 @@ fn is_transport(e: &HealthError) -> bool {
 
 pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
     // 1. Upstream Health Status (1 = healthy/synced, 0 = degraded/down)
-    ::metrics::gauge!("ethryx_upstream_health_status", "layer" => "el")
+    ::metrics::gauge!("ethonyx_upstream_health_status", "layer" => "el")
         .set(if report.el_syncing.ok { 1.0 } else { 0.0 });
-    ::metrics::gauge!("ethryx_upstream_health_status", "layer" => "cl")
+    ::metrics::gauge!("ethonyx_upstream_health_status", "layer" => "cl")
         .set(if report.cl_syncing.ok { 1.0 } else { 0.0 });
 
     // 2. EL peers
     if let Ok(peers) = probe.el_peers {
-        ::metrics::gauge!("ethryx_upstream_peers", "layer" => "el").set(peers as f64);
+        ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "el").set(peers as f64);
     } else {
-        ::metrics::gauge!("ethryx_upstream_peers", "layer" => "el").set(0.0);
+        ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "el").set(0.0);
     }
 
     // 3. CL peers
     if let Ok(peers) = probe.cl_peers {
-        ::metrics::gauge!("ethryx_upstream_peers", "layer" => "cl").set(peers as f64);
+        ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "cl").set(peers as f64);
     } else {
-        ::metrics::gauge!("ethryx_upstream_peers", "layer" => "cl").set(0.0);
+        ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "cl").set(0.0);
     }
 
     // 4. EL sync distance
@@ -484,26 +484,26 @@ pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
             current_block,
             highest_block,
         }) => {
-            ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "el")
+            ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "el")
                 .set(highest_block.saturating_sub(*current_block) as f64);
         }
         _ => {
-            ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "el").set(0.0);
+            ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "el").set(0.0);
         }
     }
 
     // 5. CL sync distance
     if let Ok(status) = &probe.cl_status {
-        ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "cl")
+        ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "cl")
             .set(status.sync_distance as f64);
-        ::metrics::gauge!("ethryx_upstream_slot_number").set(status.head_slot as f64);
+        ::metrics::gauge!("ethonyx_upstream_slot_number").set(status.head_slot as f64);
     } else {
-        ::metrics::gauge!("ethryx_upstream_sync_distance", "layer" => "cl").set(0.0);
+        ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "cl").set(0.0);
     }
 
     // 6. EL block number
     if let Ok(block) = &probe.el_block {
-        ::metrics::gauge!("ethryx_upstream_block_number").set(block.number as f64);
+        ::metrics::gauge!("ethonyx_upstream_block_number").set(block.number as f64);
     }
 }
 
@@ -1043,7 +1043,7 @@ mod tests {
                     });
                 }
             });
-            let mut cfg = crate::Config::parse_from(["ethryx", "--el-http-url", &url]);
+            let mut cfg = crate::Config::parse_from(["ethonyx", "--el-http-url", &url]);
             cfg.health_timeout = Duration::from_secs(1);
             let (_, probe) = watch::channel(Arc::new(Probe::pending()));
             let state = AppState {

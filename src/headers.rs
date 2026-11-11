@@ -88,7 +88,7 @@ mod tests {
         let mut m = h(&[
             ("authorization", "Bearer x"),
             ("x-custom", "1"),
-            ("user-agent", "ethryx"),
+            ("user-agent", "ethonyx"),
         ]);
         strip_hop_by_hop(&mut m);
         assert_eq!(m.len(), 3);

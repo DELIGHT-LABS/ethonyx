@@ -53,7 +53,7 @@ pub struct Telemetry {
 impl Telemetry {
     pub fn tracer(&self) -> opentelemetry_sdk::trace::SdkTracer {
         use opentelemetry::trace::TracerProvider;
-        self.traces.tracer("ethryx")
+        self.traces.tracer("ethonyx")
     }
 
     pub async fn shutdown(self) {
@@ -92,7 +92,7 @@ fn init_otel(endpoint: &str) -> Result<Telemetry, crate::BoxError> {
     // Set global propagator to W3C TraceContext
     global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
 
-    let resource = Resource::builder().with_service_name("ethryx").build();
+    let resource = Resource::builder().with_service_name("ethonyx").build();
 
     // Build the OTLP Tracer Provider
     let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -153,7 +153,7 @@ impl Default for OtelRecorder {
 impl OtelRecorder {
     pub fn new() -> Self {
         Self {
-            meter: global::meter("ethryx"),
+            meter: global::meter("ethonyx"),
             counters: RwLock::new(HashMap::new()),
             gauges: RwLock::new(HashMap::new()),
             histograms: RwLock::new(HashMap::new()),
@@ -204,7 +204,7 @@ impl Recorder for OtelRecorder {
         }
         let name = key.name().to_string();
         let labels = convert_labels(key);
-        let backend = if name == "ethryx_active_connections" {
+        let backend = if name == "ethonyx_active_connections" {
             OtelGaugeBackend::UpDown(self.meter.f64_up_down_counter(name).build())
         } else {
             OtelGaugeBackend::Gauge(self.meter.f64_gauge(name).build())
