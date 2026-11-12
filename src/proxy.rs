@@ -1,17 +1,22 @@
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode, Version};
+use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::Sleep;
 use tracing::{Instrument, debug, info, trace};
 
-use crate::headers::strip_hop_by_hop;
+use crate::headers::{sanitize_response_headers, strip_hop_by_hop};
 use crate::health;
 use crate::state::AppState;
 use crate::upstream::HttpUpstream;
@@ -22,6 +27,8 @@ pub type ResBody = UnsyncBoxBody<Bytes, BoxError>;
 
 type Https = hyper_rustls::HttpsConnector<HttpConnector>;
 pub type ProxyClient = Client<Https, ResBody>;
+
+const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn build_client(force_h2: bool) -> ProxyClient {
     let mut http = HttpConnector::new();
@@ -36,7 +43,13 @@ pub fn build_client(force_h2: bool) -> ProxyClient {
         .enable_all_versions()
         .wrap_connector(http);
     let mut builder = Client::builder(TokioExecutor::new());
-    builder.pool_idle_timeout(Duration::from_secs(60));
+    builder
+        .pool_timer(TokioTimer::new())
+        .pool_idle_timeout(Duration::from_secs(60))
+        .timer(TokioTimer::new())
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(false);
     // Cleartext h2 can't be auto-negotiated, so an opt-in h2c upstream forces
     // HTTP/2 (prior-knowledge); an https upstream then uses h2 directly.
     if force_h2 {
@@ -46,23 +59,26 @@ pub fn build_client(force_h2: bool) -> ProxyClient {
 }
 
 /// Connection-owned state. Requests clone one Arc; detached WebSocket relays
-/// and HTTP/2 request tasks also retain the shared lifecycle.
+/// and HTTP/2 request tasks also retain the shared lifecycle and connection permit.
 pub(crate) struct Connection {
     state: Arc<AppState>,
     lifecycle: crate::lifecycle::Lifecycle,
     peer: SocketAddr,
+    permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 impl Connection {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         state: Arc<AppState>,
         lifecycle: crate::lifecycle::Lifecycle,
         peer: SocketAddr,
+        permit: Option<Arc<OwnedSemaphorePermit>>,
     ) -> Self {
         Self {
             state,
             lifecycle,
             peer,
+            permit,
         }
     }
 
@@ -103,7 +119,7 @@ impl Connection {
         };
         let response = res.unwrap_or_else(|e| {
             debug!(error = %e, "proxy error");
-            text_response(StatusCode::BAD_GATEWAY, e.to_string())
+            text_response(StatusCode::BAD_GATEWAY, Bytes::from_static(b"bad gateway"))
         });
         let elapsed = start.elapsed();
         let status = response.status().as_u16();
@@ -127,10 +143,17 @@ impl Connection {
             "status" => crate::status_to_static_str(status)
         )
         .increment(1);
-        ::metrics::histogram!(
-            "ethonyx_proxy_request_duration_seconds", "upstream" => upstream_type
-        )
-        .record(elapsed.as_secs_f64());
+        let secs = elapsed.as_secs_f64();
+        match target {
+            Target::Cl => {
+                ::metrics::histogram!("ethonyx_proxy_request_duration_seconds", "upstream" => "CL")
+                    .record(secs);
+            }
+            Target::El | Target::WebSocket(_) => {
+                ::metrics::histogram!("ethonyx_proxy_request_duration_seconds", "upstream" => "EL")
+                    .record(secs);
+            }
+        }
         Ok(response)
     }
 }
@@ -149,7 +172,7 @@ enum Target {
 }
 
 impl Target {
-    fn labels(self) -> (&'static str, &'static str) {
+    const fn labels(self) -> (&'static str, &'static str) {
         match self {
             Self::Cl => ("CL", "HTTP"),
             Self::El => ("EL", "HTTP"),
@@ -248,6 +271,14 @@ pub(crate) fn is_cl_path(path: &str) -> bool {
     }
 }
 
+#[derive(Clone, Copy)]
+struct UpstreamPlan<'a> {
+    upstream: &'a HttpUpstream,
+    override_path: Option<&'static str>,
+    client: &'a ProxyClient,
+    tls_observer: Option<&'a health::ObservedHttpVersion>,
+}
+
 async fn route(
     req: Request<Incoming>,
     connection: &Connection,
@@ -256,7 +287,7 @@ async fn route(
     let state = &connection.state;
     trace!(method = %req.method(), path = req.uri().path(), "routing request");
     match target {
-        Target::Cl => cl_proxy(req, state).await,
+        Target::Cl => proxy_cl(req, state).await,
         Target::WebSocket(mode) => {
             crate::websocket::upgrade(
                 req,
@@ -265,14 +296,15 @@ async fn route(
                 state.cfg.proxy_timeout,
                 state.cfg.mock_eth_syncing,
                 connection.lifecycle.clone(),
+                connection.permit.clone(),
             )
             .await
         }
-        Target::El => el_proxy(req, state).await,
+        Target::El => proxy_el(req, state).await,
     }
 }
 
-async fn cl_proxy(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
+async fn proxy_cl(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
     if (req.method() == Method::GET || req.method() == Method::HEAD)
         && req.uri().path() == "/eth/v1/node/health"
         && state.cfg.mock_cl_node_health
@@ -288,126 +320,268 @@ async fn cl_proxy(req: Request<Incoming>, state: &AppState) -> Result<Response<R
                 | "/eth/v1/validator/sync_committee_subscriptions"
         )
     {
-        let res = Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .body(box_full(Full::new(Bytes::from_static(
-                b"{\"code\":200,\"message\":\"success\"}",
-            ))))
-            .unwrap();
-        return Ok(res);
+        if let Err(err) = collect_limited(req.into_body(), state.cfg.proxy_timeout).await {
+            return Ok(err.into_response());
+        }
+        return Ok(json_response(
+            StatusCode::OK,
+            Bytes::from_static(b"{\"code\":200,\"message\":\"success\"}"),
+        ));
     }
-    let (upstream, override_path) = if req.method() == Method::POST
+    let plan = if req.method() == Method::POST
         && req.uri().path() == "/eth/v1/validator/register_validator"
         && let Some(ref mev) = state.cl_mev_relay
     {
-        (mev, Some("/eth/v1/builder/validators"))
+        UpstreamPlan {
+            upstream: mev,
+            override_path: Some("/eth/v1/builder/validators"),
+            client: &state.client,
+            tls_observer: None,
+        }
     } else {
-        (&state.cl_beacon, None)
+        UpstreamPlan {
+            upstream: &state.cl_beacon,
+            override_path: None,
+            client: &state.client,
+            tls_observer: state.cl_tls_version.as_ref(),
+        }
     };
-    send_http(req, state, upstream, override_path, &state.client).await
+    let (parts, body) = req.into_parts();
+    execute_upstream(parts, box_incoming(body), state, plan).await
 }
 
-async fn el_proxy(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
-    if req.method() == Method::POST && state.cfg.mock_eth_syncing {
+async fn proxy_el(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
+    let (parts, body) = if req.method() == Method::POST && state.cfg.mock_eth_syncing {
         let (parts, body) = req.into_parts();
-        let collected = tokio::time::timeout(
-            state.cfg.proxy_timeout,
-            http_body_util::Limited::new(body, 64 * 1024 * 1024).collect(),
-        )
-        .await;
-        match collected {
-            Ok(Ok(collected)) => {
-                let bytes = collected.to_bytes();
-                if let Some(mock_res) = try_mock_eth_syncing(&bytes) {
-                    return Ok(mock_res);
-                }
-                let req = Request::from_parts(parts, Full::new(bytes));
-                return el_http_proxy(req, state).await;
-            }
-            Ok(Err(e)) => {
-                return Ok(text_response(
-                    if e.is::<http_body_util::LengthLimitError>() {
-                        StatusCode::PAYLOAD_TOO_LARGE
-                    } else {
-                        StatusCode::BAD_REQUEST
-                    },
-                    format!("failed to read request body: {e}"),
-                ));
-            }
-            Err(_) => {
-                return Ok(text_response(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "request body timed out",
-                ));
-            }
+        let bytes = match collect_limited(body, state.cfg.proxy_timeout).await {
+            Ok(bytes) => bytes,
+            Err(err) => return Ok(err.into_response()),
+        };
+        if let Some(mock_res) = try_mock_eth_syncing(&bytes) {
+            return Ok(mock_res);
         }
-    }
+        (parts, box_full(Full::new(bytes)))
+    } else {
+        let (parts, body) = req.into_parts();
+        (parts, box_incoming(body))
+    };
+    // Select at dispatch, after any mock body inspection: local replies need
+    // no transport lookup, and forwarded requests follow the latest verdict.
+    let plan = UpstreamPlan {
+        upstream: &state.el_http,
+        override_path: None,
+        client: state.el_client(),
+        tls_observer: state.el_transport.tls_observer(),
+    };
+    execute_upstream(parts, body, state, plan).await
+}
 
-    el_http_proxy(req, state).await
+#[derive(Clone, Copy)]
+struct BodyReadError {
+    status: StatusCode,
+    message: &'static [u8],
+}
+
+impl BodyReadError {
+    fn into_response(self) -> Response<ResBody> {
+        text_response(self.status, Bytes::from_static(self.message))
+    }
+}
+
+async fn collect_limited(body: Incoming, timeout: Duration) -> Result<Bytes, BodyReadError> {
+    match tokio::time::timeout(
+        timeout,
+        http_body_util::Limited::new(body, MAX_BUFFERED_REQUEST_BYTES).collect(),
+    )
+    .await
+    {
+        Ok(Ok(collected)) => Ok(collected.to_bytes()),
+        Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => Err(BodyReadError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: b"request body exceeds limit",
+        }),
+        Ok(Err(e)) => {
+            debug!(error = %e, "failed to read request body");
+            Err(BodyReadError {
+                status: StatusCode::BAD_REQUEST,
+                message: b"failed to read request body",
+            })
+        }
+        Err(_) => Err(BodyReadError {
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: b"request body timed out",
+        }),
+    }
 }
 
 fn try_mock_eth_syncing(bytes: &[u8]) -> Option<Response<ResBody>> {
     match crate::rpc::mock_syncing(bytes) {
         crate::rpc::MockResult::Forward => None,
         crate::rpc::MockResult::Silent => Some(text_response(StatusCode::NO_CONTENT, Bytes::new())),
-        crate::rpc::MockResult::Reply(body) => Some(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(box_full(Full::new(Bytes::from(body))))
-                .unwrap(),
-        ),
+        crate::rpc::MockResult::Reply(body) => {
+            Some(json_response(StatusCode::OK, Bytes::from(body)))
+        }
     }
 }
 
-async fn el_http_proxy<B>(req: Request<B>, state: &AppState) -> Result<Response<ResBody>, BoxError>
-where
-    B: hyper::body::Body<Data = Bytes> + Send + 'static,
-    B::Error: Into<BoxError>,
-{
-    // Select at dispatch, after any mock body inspection. Local replies need
-    // no transport lookup, and forwarded requests follow the latest verdict.
-    send_http(req, state, &state.el_http, None, state.el_client()).await
-}
-
-async fn send_http<B>(
-    req: Request<B>,
+async fn execute_upstream(
+    mut parts: http::request::Parts,
+    body: ResBody,
     state: &AppState,
-    upstream: &HttpUpstream,
-    override_path: Option<&'static str>,
-    client: &ProxyClient,
-) -> Result<Response<ResBody>, BoxError>
-where
-    B: hyper::body::Body<Data = Bytes> + Send + 'static,
-    B::Error: Into<BoxError>,
-{
-    let (mut parts, body) = req.into_parts();
+    plan: UpstreamPlan<'_>,
+) -> Result<Response<ResBody>, BoxError> {
+    parts.uri = plan.upstream.rewrite_uri(parts.uri, plan.override_path)?;
+    // Strip hop-by-hop and Connection-nominated headers BEFORE injecting OTel
+    // trace context so `Connection: traceparent` cannot strip outgoing spans.
+    strip_hop_by_hop(&mut parts.headers);
     #[cfg(feature = "otel")]
     if state.otel_enabled {
         crate::otel::propagate_context(&mut parts.headers);
     }
-    parts.uri = upstream.rewrite_uri(parts.uri, override_path)?;
-    strip_hop_by_hop(&mut parts.headers);
     parts.extensions.clear();
     // The inbound version (e.g. HTTP/2) must not be forced onto the upstream
     // connection — normalize so the client uses whatever the upstream negotiates
     // (h1 for cleartext, h2 via ALPN for an https upstream).
     parts.version = Version::HTTP_11;
-    let upstream_req = Request::from_parts(parts, box_incoming(body));
+    let upstream_req = Request::from_parts(parts, body);
 
-    let resp = tokio::time::timeout(state.cfg.proxy_timeout, client.request(upstream_req))
+    let resp = tokio::time::timeout(state.cfg.proxy_timeout, plan.client.request(upstream_req))
         .await
         .map_err(|_| -> BoxError { "upstream timeout".into() })??;
 
+    if let Some(observer) = plan.tls_observer {
+        observer.record(resp.version());
+    }
+
     let (mut resp_parts, resp_body) = resp.into_parts();
-    strip_hop_by_hop(&mut resp_parts.headers);
-    Ok(Response::from_parts(resp_parts, box_incoming(resp_body)))
+    let idle_timeout = response_idle_timeout(
+        &resp_parts.headers,
+        state.cfg.proxy_timeout,
+        state.cfg.sse_idle_timeout,
+    );
+    sanitize_response_headers(resp_parts.status, &mut resp_parts.headers);
+    let body = IdleTimeoutBody::new(resp_body, idle_timeout).boxed_unsync();
+    Ok(Response::from_parts(resp_parts, body))
+}
+
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|ct| ct.split(';').next())
+        .is_some_and(|media| media.trim_ascii().eq_ignore_ascii_case("text/event-stream"))
+}
+
+fn response_idle_timeout(
+    headers: &HeaderMap,
+    proxy_timeout: Duration,
+    sse_idle_timeout: Duration,
+) -> Option<Duration> {
+    if is_event_stream(headers) {
+        (!sse_idle_timeout.is_zero()).then_some(sse_idle_timeout)
+    } else {
+        Some(proxy_timeout)
+    }
+}
+
+/// Streaming response body wrapper that enforces a per-frame idle timeout while
+/// preserving `Body::size_hint` and `Body::is_end_stream` (keeping `Content-Length`
+/// intact on HTTP/1.1 responses) and allocating `Sleep` lazily only if `Pending`.
+struct IdleTimeoutBody<B> {
+    inner: B,
+    timeout: Option<Duration>,
+    sleep: Option<Pin<Box<Sleep>>>,
+    armed: bool,
+    done: bool,
+}
+
+impl<B> IdleTimeoutBody<B> {
+    const fn new(inner: B, timeout: Option<Duration>) -> Self {
+        Self {
+            inner,
+            timeout,
+            sleep: None,
+            armed: false,
+            done: false,
+        }
+    }
+}
+
+impl<B> Body for IdleTimeoutBody<B>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        if this.done {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                this.armed = false;
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(err))) => {
+                this.armed = false;
+                this.done = true;
+                Poll::Ready(Some(Err(err.into())))
+            }
+            Poll::Ready(None) => {
+                this.armed = false;
+                this.done = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                let Some(duration) = this.timeout else {
+                    return Poll::Pending;
+                };
+                if !this.armed {
+                    let deadline = tokio::time::Instant::now() + duration;
+                    match this.sleep.as_mut() {
+                        Some(sleep) => sleep.as_mut().reset(deadline),
+                        None => {
+                            this.sleep = Some(Box::pin(tokio::time::sleep_until(deadline)));
+                        }
+                    }
+                    this.armed = true;
+                }
+                if this
+                    .sleep
+                    .as_mut()
+                    .expect("sleep initialized when armed")
+                    .as_mut()
+                    .poll(cx)
+                    .is_ready()
+                {
+                    this.armed = false;
+                    this.done = true;
+                    Poll::Ready(Some(Err("response body idle timeout".into())))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 pub fn box_incoming<B>(body: B) -> ResBody
 where
-    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError>,
 {
     body.map_err(Into::into).boxed_unsync()
@@ -415,6 +589,14 @@ where
 
 pub fn box_full(body: Full<Bytes>) -> ResBody {
     body.map_err(|e: Infallible| match e {}).boxed_unsync()
+}
+
+fn json_response(code: StatusCode, body: Bytes) -> Response<ResBody> {
+    Response::builder()
+        .status(code)
+        .header("content-type", "application/json")
+        .body(box_full(Full::new(body)))
+        .unwrap()
 }
 
 pub fn text_response(code: StatusCode, msg: impl Into<Bytes>) -> Response<ResBody> {
@@ -598,5 +780,110 @@ mod tests {
             .unwrap()
             .to_bytes();
         assert_eq!(body, r#"[{"jsonrpc":"2.0","id":1,"result":false}]"#);
+    }
+
+    #[test]
+    fn response_idle_timeout_distinguishes_event_streams_and_zero_disable() {
+        let proxy_timeout = Duration::from_secs(60);
+        let sse_timeout = Duration::from_secs(900);
+
+        let mut plain = HeaderMap::new();
+        assert_eq!(
+            response_idle_timeout(&plain, proxy_timeout, sse_timeout),
+            Some(proxy_timeout)
+        );
+        plain.insert("content-type", "application/json".parse().unwrap());
+        assert_eq!(
+            response_idle_timeout(&plain, proxy_timeout, sse_timeout),
+            Some(proxy_timeout)
+        );
+
+        for ct in [
+            "text/event-stream",
+            "text/event-stream; charset=utf-8",
+            "Text/Event-Stream ;charset=UTF-8",
+        ] {
+            let mut sse = HeaderMap::new();
+            sse.insert("content-type", ct.parse().unwrap());
+            assert_eq!(
+                response_idle_timeout(&sse, proxy_timeout, sse_timeout),
+                Some(sse_timeout),
+                "ct={ct}"
+            );
+            assert_eq!(
+                response_idle_timeout(&sse, proxy_timeout, Duration::ZERO),
+                None,
+                "ct={ct} disabled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_body_preserves_size_hint_and_avoids_timer_when_immediately_ready() {
+        let payload = Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x1\"}");
+        let mut body =
+            IdleTimeoutBody::new(Full::new(payload.clone()), Some(Duration::from_secs(5)));
+        assert!(!body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(payload.len() as u64));
+
+        let collected = (&mut body).collect().await.unwrap().to_bytes();
+        assert_eq!(collected, payload);
+        assert!(
+            body.sleep.is_none(),
+            "immediate bodies must not allocate Sleep"
+        );
+        assert!(body.is_end_stream());
+
+        let empty = IdleTimeoutBody::new(Full::new(Bytes::new()), Some(Duration::from_secs(5)));
+        assert!(empty.is_end_stream());
+        assert_eq!(empty.size_hint().exact(), Some(0));
+    }
+
+    struct ChannelBody(tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, Infallible>>);
+
+    impl Body for ChannelBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.0.poll_recv(cx)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_body_resets_between_chunks_and_aborts_when_stalled() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut body = IdleTimeoutBody::new(ChannelBody(rx), Some(Duration::from_secs(10)));
+
+        let reader = tokio::spawn(async move {
+            let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(first, Bytes::from_static(b"chunk-1"));
+            let second = body.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(second, Bytes::from_static(b"chunk-2"));
+            let err = body.frame().await.unwrap().unwrap_err();
+            assert_eq!(err.to_string(), "response body idle timeout");
+            assert!(body.frame().await.is_none(), "body must fuse after timeout");
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(7)).await;
+        tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-1"))))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        // Another 7s (14s total > 10s, but < 10s since chunk-1) must succeed.
+        tokio::time::advance(Duration::from_secs(7)).await;
+        tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-2"))))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        // Stalling > 10s with tx still open triggers the idle timeout.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        reader.await.unwrap();
     }
 }

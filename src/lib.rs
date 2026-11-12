@@ -27,10 +27,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, info, trace, warn};
 
 use crate::state::AppState;
@@ -204,6 +204,8 @@ where
 
     let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<()>(1);
     let lifecycle = lifecycle::Lifecycle::new(shutdown_tx.subscribe(), conn_tx);
+    let conn_limit = (state.cfg.max_connections > 0)
+        .then(|| Arc::new(Semaphore::new(state.cfg.max_connections)));
 
     let mut accept_handles = Vec::with_capacity(listeners.len());
     for listener in listeners {
@@ -211,6 +213,7 @@ where
             listener,
             state.clone(),
             lifecycle.clone(),
+            conn_limit.clone(),
         )));
     }
 
@@ -249,8 +252,21 @@ async fn accept_loop(
     listener: TcpListener,
     state: Arc<AppState>,
     mut lifecycle: lifecycle::Lifecycle,
+    conn_limit: Option<Arc<Semaphore>>,
 ) {
     loop {
+        let permit = if let Some(ref sem) = conn_limit {
+            tokio::select! {
+                biased;
+                _ = lifecycle.deadline() => return,
+                res = sem.clone().acquire_owned() => match res {
+                    Ok(permit) => Some(Arc::new(permit)),
+                    Err(_) => return,
+                },
+            }
+        } else {
+            None
+        };
         tokio::select! {
             biased;
             _ = lifecycle.deadline() => return,
@@ -290,6 +306,7 @@ async fn accept_loop(
                         state,
                         conn_lifecycle.clone(),
                         peer,
+                        permit,
                     ));
                     let svc = service_fn(move |req| connection.clone().dispatch(req));
                     // Auto-detect HTTP/1 vs HTTP/2 (incl. cleartext h2c preface);
@@ -297,7 +314,17 @@ async fn accept_loop(
                     // `enable_connect_protocol` advertises RFC 8441 Extended CONNECT
                     // (HTTP/2 WebSocket).
                     let mut builder = auto::Builder::new(conn_lifecycle.clone());
-                    builder.http2().enable_connect_protocol();
+                    builder
+                        .http1()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(Duration::from_secs(15));
+                    builder
+                        .http2()
+                        .timer(TokioTimer::new())
+                        .enable_connect_protocol()
+                        .max_concurrent_streams(256)
+                        .keep_alive_interval(Duration::from_secs(30))
+                        .keep_alive_timeout(Duration::from_secs(10));
                     let conn = builder.serve_connection_with_upgrades(io, svc);
                     tokio::pin!(conn);
                     tokio::select! {
@@ -354,7 +381,9 @@ fn status_to_static_str(status: u16) -> &'static str {
         403 => "403",
         404 => "404",
         405 => "405",
+        408 => "408",
         409 => "409",
+        413 => "413",
         415 => "415",
         429 => "429",
         500 => "500",
@@ -390,6 +419,8 @@ mod tests {
     fn test_status_to_static_str() {
         assert_eq!(status_to_static_str(200), "200");
         assert_eq!(status_to_static_str(404), "404");
+        assert_eq!(status_to_static_str(408), "408");
+        assert_eq!(status_to_static_str(413), "413");
         assert_eq!(status_to_static_str(502), "502");
         // Edge case: Custom/unmapped status falls back to OTHER
         assert_eq!(status_to_static_str(418), "OTHER");

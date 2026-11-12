@@ -19,7 +19,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 http = "1.5"
 http-body-util = "0.1.5"
 bytes = "1.12"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink", "async-await"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
@@ -37,6 +37,9 @@ tracing-opentelemetry = { version = "0.34", optional = true, default-features = 
 
 [features]
 otel = ["dep:metrics-util", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

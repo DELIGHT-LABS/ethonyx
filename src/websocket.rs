@@ -177,6 +177,7 @@ pub(crate) async fn upgrade(
     connect_timeout: Duration,
     mock_enabled: bool,
     lifecycle: Lifecycle,
+    permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
 ) -> Result<Response<ResBody>, BoxError> {
     let (parts, _body) = req.into_parts();
     let mut req = Request::from_parts(parts, ());
@@ -238,6 +239,7 @@ pub(crate) async fn upgrade(
             .insert(http::header::SEC_WEBSOCKET_PROTOCOL, protocol.clone());
     }
     tokio::spawn(lifecycle.run(async move {
+        let _permit = permit;
         match on_upgrade.await {
             Ok(upgraded) => {
                 let client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
