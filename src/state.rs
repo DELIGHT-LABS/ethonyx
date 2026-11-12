@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use crate::config::Config;
 use crate::health::Probe;
 use crate::proxy::ProxyClient;
+use crate::upstream::{HttpUpstream, WsUpstream};
 
 pub struct AppState {
     pub cfg: Config,
@@ -20,10 +21,10 @@ pub struct AppState {
     /// this: it prefers h2c and falls back to HTTP/1.1 when the upstream does not
     /// speak it, so an h2c↔h1 change self-heals within one poll.
     pub el_use_h2: AtomicBool,
-    pub el_http_uri: Uri,
-    pub el_ws_uri: Uri,
-    pub cl_beacon_uri: Uri,
-    pub cl_mev_relay_uri: Option<Uri>,
+    pub(crate) el_http: HttpUpstream,
+    pub(crate) el_ws: WsUpstream,
+    pub(crate) cl_beacon: HttpUpstream,
+    pub(crate) cl_mev_relay: Option<HttpUpstream>,
     pub cl_syncing_uri: Uri,
     pub cl_peer_count_uri: Uri,
     pub cl_genesis_time: u64,
@@ -35,7 +36,7 @@ pub struct AppState {
 
 impl AppState {
     /// Resolve one transport snapshot, shared by probing and forwarding.
-    pub fn el_client(&self, use_h2: bool) -> &ProxyClient {
+    pub const fn el_client(&self, use_h2: bool) -> &ProxyClient {
         if use_h2 {
             &self.el_h2_client
         } else {

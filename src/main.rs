@@ -4,6 +4,7 @@ use ethonyx::{BoxError, Config};
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let cfg = Config::parse();
+    cfg.validate()?;
 
     #[cfg(feature = "otel")]
     let telemetry = ethonyx::otel::start(cfg.otel_endpoint.as_deref()).await?;

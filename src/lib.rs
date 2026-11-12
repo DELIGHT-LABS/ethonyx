@@ -16,9 +16,11 @@ pub mod otel;
 mod proxy;
 mod rpc;
 mod state;
+mod upstream;
 mod websocket;
 
 pub use config::Config;
+pub use upstream::RedactedUrl;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -46,6 +48,7 @@ pub async fn run<F>(cfg: Config, shutdown: F) -> Result<(), BoxError>
 where
     F: Future<Output = ()> + Send,
 {
+    cfg.validate()?;
     #[cfg(feature = "otel")]
     let telemetry = crate::otel::start(cfg.otel_endpoint.as_deref()).await?;
     run_inner(
@@ -78,6 +81,15 @@ async fn run_inner<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    let config::ValidatedConfig {
+        el_http,
+        el_ws,
+        cl_beacon,
+        cl_mev_relay,
+        cl_genesis_time,
+        cl_seconds_per_slot,
+    } = cfg.parse_validated()?;
+
     // Install default rustls cryptoprovider to prevent panics during parallel tests
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -115,13 +127,6 @@ where
         });
     }
 
-    if cfg.listen.is_empty() {
-        return Err("no listen addresses configured".into());
-    }
-    if cfg.health_poll_interval.is_zero() {
-        return Err("health-poll-interval must be at least 1 second".into());
-    }
-
     info!(
         version = concat!("v", env!("CARGO_PKG_VERSION")),
         git = env!("ETHONYX_GIT_DESCRIBE"),
@@ -134,37 +139,26 @@ where
     // runtime (`el_use_h2`) whether to use it — preferring h2c and falling back
     // to HTTP/1.1 when the upstream doesn't speak it.
     let el_h2_client = proxy::build_client(true);
-    let el_http_uri: http::Uri = cfg.el_http_url.parse()?;
-    let el_ws_uri: http::Uri = cfg.el_ws_url.parse()?;
-    let cl_beacon_uri: http::Uri = cfg.cl_beacon_url.parse()?;
-    let cl_mev_relay_uri = cfg
-        .cl_mev_relay_url
-        .as_deref()
-        .map(str::parse::<http::Uri>)
-        .transpose()?;
-    let root = http::Uri::from_static("/");
-    let cl_syncing_uri = proxy::upstream_uri(&cl_beacon_uri, &root, Some("/eth/v1/node/syncing"))?;
+    let cl_syncing_uri =
+        cl_beacon.rewrite_uri(http::Uri::from_static("/"), Some("/eth/v1/node/syncing"))?;
     let cl_peer_count_uri =
-        proxy::upstream_uri(&cl_beacon_uri, &root, Some("/eth/v1/node/peer_count"))?;
-    let cl_genesis_time = cfg.resolve_cl_genesis_time()?;
-    let cl_seconds_per_slot = cfg.resolve_cl_seconds_per_slot()?;
+        cl_beacon.rewrite_uri(http::Uri::from_static("/"), Some("/eth/v1/node/peer_count"))?;
     let poll_interval = cfg.health_poll_interval;
     let shutdown_grace = cfg.shutdown_grace;
-    let listen_addrs = cfg.listen.clone();
 
     let (probe_tx, probe_rx) = watch::channel(Arc::new(health::Probe::pending()));
     let (shutdown_tx, _) = watch::channel(None);
 
-    let prefer_h2 = !cfg.trust_upstream && el_http_uri.scheme_str() != Some("https");
+    let prefer_h2 = !cfg.trust_upstream && !el_http.is_tls();
     let state = Arc::new(AppState {
         cfg,
         client,
         el_h2_client,
         el_use_h2: AtomicBool::new(prefer_h2),
-        el_http_uri,
-        el_ws_uri,
-        cl_beacon_uri,
-        cl_mev_relay_uri,
+        el_http,
+        el_ws,
+        cl_beacon,
+        cl_mev_relay,
         cl_syncing_uri,
         cl_peer_count_uri,
         cl_genesis_time,
@@ -184,13 +178,12 @@ where
     } else {
         "HTTP/1.1"
     };
-    let mev_relay_log = state.cfg.cl_mev_relay_url.as_deref().unwrap_or("none");
     info!(
-        el_http = %state.cfg.el_http_url,
+        el_http = %RedactedUrl(&state.cfg.el_http_url),
         el_http_proto = %el_proto,
-        el_ws = %state.cfg.el_ws_url,
-        cl_beacon = %state.cfg.cl_beacon_url,
-        cl_mev_relay = %mev_relay_log,
+        el_ws = %RedactedUrl(&state.cfg.el_ws_url),
+        cl_beacon = %RedactedUrl(&state.cfg.cl_beacon_url),
+        cl_mev_relay = %upstream::RedactedOptUrl(state.cfg.cl_mev_relay_url.as_deref()),
         cl_proto = "HTTP/1.1",
         "upstreams connected"
     );
@@ -204,8 +197,8 @@ where
         ))
     });
 
-    let mut listeners = Vec::with_capacity(listen_addrs.len());
-    for addr in &listen_addrs {
+    let mut listeners = Vec::with_capacity(state.cfg.listen.len());
+    for addr in &state.cfg.listen {
         let listener = TcpListener::bind(addr).await?;
         info!(listen = %addr, "listening");
         listeners.push(listener);

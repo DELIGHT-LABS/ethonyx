@@ -137,16 +137,13 @@ fn normalize_subprotocols(headers: &mut http::HeaderMap) -> Result<(), BoxError>
 
 fn build_ws_request(
     mut req: Request<()>,
-    upstream_uri: &http::Uri,
+    upstream: &crate::upstream::WsUpstream,
     mode: WsMode,
 ) -> Result<Request<()>, BoxError> {
-    let uri = crate::proxy::upstream_uri(upstream_uri, req.uri(), None)?;
-    if let Some(auth) = uri.authority() {
-        req.headers_mut().insert(
-            http::header::HOST,
-            http::HeaderValue::from_str(auth.as_str())?,
-        );
-    }
+    let inbound_uri = std::mem::take(req.uri_mut());
+    let uri = upstream.rewrite_uri(inbound_uri)?;
+    req.headers_mut()
+        .insert(http::header::HOST, upstream.host_header().clone());
     // RFC 8441 replaces the client's key/accept exchange with :protocol.
     // Generate a fresh key only for the separate HTTP/1 upstream handshake.
     if mode == WsMode::ExtendedConnect {
@@ -176,7 +173,7 @@ fn get_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig 
 pub(crate) async fn upgrade(
     req: Request<Incoming>,
     mode: WsMode,
-    upstream_uri: &http::Uri,
+    upstream: &crate::upstream::WsUpstream,
     connect_timeout: Duration,
     mock_enabled: bool,
     lifecycle: Lifecycle,
@@ -193,7 +190,7 @@ pub(crate) async fn upgrade(
         }
     };
     let on_upgrade = hyper::upgrade::on(&mut req);
-    let ws_req = build_ws_request(req, upstream_uri, mode)?;
+    let ws_req = build_ws_request(req, upstream, mode)?;
     let (upstream_ws, upstream_response) = match tokio::time::timeout(
         connect_timeout,
         tokio_tungstenite::connect_async_with_config(ws_req, Some(get_ws_config()), true),
@@ -512,7 +509,11 @@ mod tests {
 
     #[test]
     fn handshake_strips_hop_by_hop_and_restores_canonical_ws_headers() {
-        let upstream: http::Uri = "ws://127.0.0.1:8546/ws?api_key=secret".parse().unwrap();
+        let upstream = crate::upstream::WsUpstream::parse(
+            "--el-ws-url",
+            "ws://127.0.0.1:8546/ws?api_key=secret",
+        )
+        .unwrap();
         for mode in [WsMode::Upgrade, WsMode::ExtendedConnect] {
             let mut req = Request::builder()
                 .version(if mode == WsMode::Upgrade {

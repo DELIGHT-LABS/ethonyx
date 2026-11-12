@@ -198,17 +198,17 @@ pub fn report(state: &AppState, head: bool) -> Response<ResBody> {
     );
     snapshot.el.transport = transport_label(
         state.el_use_h2.load(Ordering::Relaxed),
-        state.el_http_uri.scheme_str(),
+        state.el_http.is_tls(),
     );
     // The CL hop always uses the default client (never h2c prior-knowledge).
-    snapshot.cl.transport = transport_label(false, state.cl_syncing_uri.scheme_str());
+    snapshot.cl.transport = transport_label(false, state.cl_beacon.is_tls());
     json_response(StatusCode::OK, &snapshot)
 }
 
 /// HTTP-version label for an upstream hop from whether ethonyx selected HTTP/2 and
 /// whether the upstream is TLS. Cleartext h2 is `h2c`; h2 over TLS is `h2`.
-fn transport_label(uses_h2: bool, scheme: Option<&str>) -> &'static str {
-    match (uses_h2, scheme == Some("https")) {
+const fn transport_label(uses_h2: bool, is_tls: bool) -> &'static str {
+    match (uses_h2, is_tls) {
         (true, true) => "h2",
         (true, false) => "h2c",
         (false, _) => "http/1.1",
@@ -417,7 +417,7 @@ impl ElBatchResult {
 /// Query all three EL JSON-RPC methods in a batch request, maintaining the transport verdict.
 async fn el_batch_detect(state: &AppState) -> ElBatchResult {
     let payload = Bytes::from_static(EL_BATCH_REQ);
-    if state.el_http_uri.scheme_str() == Some("https") {
+    if state.el_http.is_tls() {
         // TLS upstreams negotiate h2 vs http/1.1 via ALPN on the default client.
         return el_batch_rpc(state, payload, &state.client)
             .await
@@ -795,7 +795,7 @@ async fn el_batch_rpc(
 ) -> Result<ElBatchResult, HealthError> {
     let req = Request::builder()
         .method(Method::POST)
-        .uri(state.el_http_uri.clone())
+        .uri(state.el_http.uri().clone())
         .header("content-type", "application/json")
         .body(box_full(Full::new(payload)))
         .map_err(|e| HealthError::Transport(format!("build: {e}")))?;
@@ -1047,10 +1047,11 @@ mod tests {
             cfg.health_timeout = Duration::from_secs(1);
             let (_, probe) = watch::channel(Arc::new(Probe::pending()));
             let state = AppState {
-                el_http_uri: url.parse().unwrap(),
-                el_ws_uri: "ws://127.0.0.1:8546".parse().unwrap(),
-                cl_beacon_uri: url.parse().unwrap(),
-                cl_mev_relay_uri: None,
+                el_http: crate::upstream::HttpUpstream::parse("--el-http-url", &url).unwrap(),
+                el_ws: crate::upstream::WsUpstream::parse("--el-ws-url", "ws://127.0.0.1:8546")
+                    .unwrap(),
+                cl_beacon: crate::upstream::HttpUpstream::parse("--cl-beacon-url", &url).unwrap(),
+                cl_mev_relay: None,
                 cl_syncing_uri: url.parse().unwrap(),
                 cl_peer_count_uri: url.parse().unwrap(),
                 cfg,

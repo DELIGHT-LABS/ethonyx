@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode, Uri, Version};
+use http::{Method, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
@@ -15,6 +15,7 @@ use tracing::{Instrument, debug, info, trace};
 use crate::headers::strip_hop_by_hop;
 use crate::health;
 use crate::state::AppState;
+use crate::upstream::HttpUpstream;
 use crate::websocket::WsMode;
 
 pub use crate::BoxError;
@@ -261,7 +262,7 @@ async fn route(
             crate::websocket::upgrade(
                 req,
                 mode,
-                &state.el_ws_uri,
+                &state.el_ws,
                 state.cfg.proxy_timeout,
                 state.cfg.mock_eth_syncing,
                 connection.lifecycle.clone(),
@@ -297,16 +298,15 @@ async fn cl_proxy(req: Request<Incoming>, state: &AppState) -> Result<Response<R
             .unwrap();
         return Ok(res);
     }
-    let (base, override_path) = if req.method() == Method::POST
+    let (upstream, override_path) = if req.method() == Method::POST
         && req.uri().path() == "/eth/v1/validator/register_validator"
-        && let Some(ref mev_uri) = state.cl_mev_relay_uri
+        && let Some(ref mev) = state.cl_mev_relay
     {
-        (mev_uri, Some("/eth/v1/builder/validators"))
+        (mev, Some("/eth/v1/builder/validators"))
     } else {
-        (&state.cl_beacon_uri, None)
+        (&state.cl_beacon, None)
     };
-    let uri = upstream_uri(base, req.uri(), override_path)?;
-    send_http(req, state, uri, &state.client).await
+    send_http(req, state, upstream, override_path, &state.client).await
 }
 
 async fn el_proxy(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
@@ -362,68 +362,22 @@ fn try_mock_eth_syncing(bytes: &[u8]) -> Option<Response<ResBody>> {
     }
 }
 
-/// Compose the upstream URI once, joining path segments and merging base/request
-/// queries independently so a configured base query is never corrupted by paths.
-pub(crate) fn upstream_uri(
-    base: &Uri,
-    inbound: &Uri,
-    override_path: Option<&str>,
-) -> Result<Uri, http::Error> {
-    let inbound_path = override_path.unwrap_or_else(|| inbound.path());
-    let inbound_query = inbound.query();
-    if override_path.is_none() && inbound_path == "/" && inbound_query.is_none() {
-        return Ok(base.clone());
-    }
-    let base_path = base.path();
-    let base_query = base.query();
-    if override_path.is_none()
-        && base_path == "/"
-        && base_query.is_none()
-        && inbound_path.starts_with('/')
-    {
-        let mut parts = base.clone().into_parts();
-        parts.path_and_query = inbound.path_and_query().cloned();
-        return Ok(Uri::from_parts(parts)?);
-    }
-    let joined_path;
-    let path = if override_path.is_none() && inbound_path == "/" {
-        base_path
-    } else if base_path == "/" {
-        inbound_path
-    } else {
-        joined_path = format!("{}{inbound_path}", base_path.trim_end_matches('/'));
-        &joined_path
-    };
-    let pq = match (base_query, inbound_query) {
-        (Some(bq), Some(iq)) if !bq.is_empty() && !iq.is_empty() => {
-            format!("{path}?{bq}&{iq}").parse()?
-        }
-        (Some(bq), Some(iq)) => format!("{path}?{bq}{iq}").parse()?,
-        (Some(bq), None) => format!("{path}?{bq}").parse()?,
-        (None, Some(iq)) => format!("{path}?{iq}").parse()?,
-        (None, None) => path.parse()?,
-    };
-    let mut parts = base.clone().into_parts();
-    parts.path_and_query = Some(pq);
-    Ok(Uri::from_parts(parts)?)
-}
-
 async fn el_http_proxy<B>(req: Request<B>, state: &AppState) -> Result<Response<ResBody>, BoxError>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError>,
 {
-    let uri = upstream_uri(&state.el_http_uri, req.uri(), None)?;
     // Select at dispatch, after any mock body inspection. Local replies need
     // no transport lookup, and forwarded requests follow the latest verdict.
     let client = state.el_client(state.el_use_h2.load(Ordering::Relaxed));
-    send_http(req, state, uri, client).await
+    send_http(req, state, &state.el_http, None, client).await
 }
 
 async fn send_http<B>(
     req: Request<B>,
     state: &AppState,
-    upstream_uri: Uri,
+    upstream: &HttpUpstream,
+    override_path: Option<&'static str>,
     client: &ProxyClient,
 ) -> Result<Response<ResBody>, BoxError>
 where
@@ -435,7 +389,7 @@ where
     if state.otel_enabled {
         crate::otel::propagate_context(&mut parts.headers);
     }
-    parts.uri = upstream_uri;
+    parts.uri = upstream.rewrite_uri(parts.uri, override_path)?;
     strip_hop_by_hop(&mut parts.headers);
     parts.extensions.clear();
     // The inbound version (e.g. HTTP/2) must not be forced onto the upstream
@@ -646,72 +600,5 @@ mod tests {
             .unwrap()
             .to_bytes();
         assert_eq!(body, r#"[{"jsonrpc":"2.0","id":1,"result":false}]"#);
-    }
-
-    #[test]
-    fn upstream_uri_separates_path_joining_from_query_merging() {
-        for (base, inbound, override_path, expected) in [
-            ("http://127.0.0.1:8545", "/", None, "/"),
-            ("http://127.0.0.1:8545/", "/", None, "/"),
-            (
-                "http://127.0.0.1:5052",
-                "/eth/v1/node/syncing",
-                None,
-                "/eth/v1/node/syncing",
-            ),
-            (
-                "http://127.0.0.1:5052/",
-                "/eth/v1/node/syncing?tag=1",
-                None,
-                "/eth/v1/node/syncing?tag=1",
-            ),
-            (
-                "http://127.0.0.1:5052",
-                "/eth/v1/validator/register_validator?tag=1",
-                Some("/eth/v1/builder/validators"),
-                "/eth/v1/builder/validators?tag=1",
-            ),
-            ("http://127.0.0.1:8545/rpc/", "/", None, "/rpc/"),
-            ("http://127.0.0.1:8545/rpc/", "/?tag=1", None, "/rpc/?tag=1"),
-            (
-                "http://127.0.0.1:8545/rpc?api_key=secret",
-                "/",
-                None,
-                "/rpc?api_key=secret",
-            ),
-            (
-                "http://127.0.0.1:8545/rpc?api_key=secret",
-                "/?tag=1",
-                None,
-                "/rpc?api_key=secret&tag=1",
-            ),
-            (
-                "http://127.0.0.1:8545/rpc?api_key=secret",
-                "/extra",
-                None,
-                "/rpc/extra?api_key=secret",
-            ),
-            (
-                "http://127.0.0.1:8545/rpc?api_key=secret",
-                "/extra?tag=1",
-                None,
-                "/rpc/extra?api_key=secret&tag=1",
-            ),
-            (
-                "https://relay.example/prefix?api_key=secret",
-                "/eth/v1/validator/register_validator?tag=1",
-                Some("/eth/v1/builder/validators"),
-                "/prefix/eth/v1/builder/validators?api_key=secret&tag=1",
-            ),
-        ] {
-            let base_uri: Uri = base.parse().unwrap();
-            let inbound_uri: Uri = inbound.parse().unwrap();
-            let uri = upstream_uri(&base_uri, &inbound_uri, override_path).unwrap();
-            assert_eq!(
-                uri.path_and_query().unwrap().as_str(),
-                expected,
-                "base={base}, inbound={inbound}, override={override_path:?}"
-            );
-        }
     }
 }
