@@ -543,16 +543,15 @@ impl ElBatchResult {
 
 /// Query all three EL JSON-RPC methods in a batch request, maintaining the transport verdict.
 async fn el_batch_detect(state: &AppState) -> ElBatchResult {
-    let payload = Bytes::from_static(EL_BATCH_REQ);
     let result = match &state.el_transport {
         ElTransport::TrustedH1 | ElTransport::TlsAuto(_) => {
-            el_batch_rpc(state, payload, &state.client).await
+            el_batch_rpc(state, &state.client).await
         }
         ElTransport::AdaptiveH2c(mode) => match mode.load(Ordering::Relaxed) {
             cur @ (ElTransport::H2C_INITIAL | ElTransport::H2C_CONFIRMED) => {
-                match el_batch_rpc(state, payload.clone(), &state.el_h2_client).await {
+                match el_batch_rpc(state, &state.el_h2_client).await {
                     Err(primary_err) if is_transport(&primary_err) => {
-                        let alt = el_batch_rpc(state, payload, &state.client).await;
+                        let alt = el_batch_rpc(state, &state.client).await;
                         if matches!(&alt, Err(e) if is_transport(e)) {
                             Err(primary_err)
                         } else {
@@ -574,22 +573,22 @@ async fn el_batch_detect(state: &AppState) -> ElBatchResult {
             ElTransport::H1_VERIFY_ONCE => {
                 // Verify h2c one more time to self-heal if an h2c upstream was
                 // probed mid-bind during startup or restart.
-                let h2_try = el_batch_rpc(state, payload.clone(), &state.el_h2_client).await;
+                let h2_try = el_batch_rpc(state, &state.el_h2_client).await;
                 if !matches!(&h2_try, Err(e) if is_transport(e)) {
                     mode.store(ElTransport::H2C_CONFIRMED, Ordering::Relaxed);
                     info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
                     h2_try
                 } else {
-                    let h1_try = el_batch_rpc(state, payload, &state.client).await;
+                    let h1_try = el_batch_rpc(state, &state.client).await;
                     if !matches!(&h1_try, Err(e) if is_transport(e)) {
                         mode.store(ElTransport::H1_CONFIRMED, Ordering::Relaxed);
                     }
                     h1_try
                 }
             }
-            _ => match el_batch_rpc(state, payload.clone(), &state.client).await {
+            _ => match el_batch_rpc(state, &state.client).await {
                 Err(primary_err) if is_transport(&primary_err) => {
-                    let alt = el_batch_rpc(state, payload, &state.el_h2_client).await;
+                    let alt = el_batch_rpc(state, &state.el_h2_client).await;
                     if matches!(&alt, Err(e) if is_transport(e)) {
                         Err(primary_err)
                     } else {
@@ -719,11 +718,12 @@ fn empty_json_response(code: StatusCode) -> Response<ResBody> {
 }
 
 fn json_response<T: Serialize>(code: StatusCode, body: &T) -> Response<ResBody> {
-    let body_bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
+    let body_bytes =
+        serde_json::to_vec(body).map_or_else(|_| Bytes::from_static(b"{}"), Bytes::from);
     Response::builder()
         .status(code)
         .header("content-type", "application/json")
-        .body(box_full(Full::new(Bytes::from(body_bytes))))
+        .body(box_full(Full::new(body_bytes)))
         .expect("response builder")
 }
 
@@ -939,14 +939,13 @@ async fn fetch_bytes(
 
 async fn el_batch_rpc(
     state: &AppState,
-    payload: Bytes,
     client: &ProxyClient,
 ) -> Result<ElBatchResult, HealthError> {
     let req = Request::builder()
         .method(Method::POST)
         .uri(state.el_http.uri().clone())
         .header("content-type", "application/json")
-        .body(box_full(Full::new(payload)))
+        .body(box_full(Full::new(Bytes::from_static(EL_BATCH_REQ))))
         .map_err(|e| HealthError::Transport(format!("build: {e}")))?;
     let body = fetch_bytes(state, req, client, state.el_transport.tls_observer()).await?;
     parse_el_batch(&body)

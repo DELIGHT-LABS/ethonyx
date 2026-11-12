@@ -104,18 +104,21 @@ impl Connection {
             (None, String::new())
         };
         let start = std::time::Instant::now();
-        let fut = route(req, &self, target);
         let res = if span_enabled {
             let method = method.as_ref().expect("method captured when span enabled");
-            fut.instrument(tracing::info_span!(
+            let span = tracing::info_span!(
                 "request",
                 %method,
                 path = %path,
                 upstream = upstream_type,
-            ))
-            .await
+            );
+            #[cfg(feature = "otel")]
+            if otel_enabled {
+                crate::otel::attach_parent_context(&span, req.headers());
+            }
+            route(req, &self, target).instrument(span).await
         } else {
-            fut.await
+            route(req, &self, target).await
         };
         let response = res.unwrap_or_else(|e| {
             debug!(error = %e, "proxy error");
@@ -295,6 +298,7 @@ async fn route(
                 &state.el_ws,
                 state.cfg.proxy_timeout,
                 state.cfg.mock_eth_syncing,
+                state.otel_enabled,
                 connection.lifecycle.clone(),
                 connection.permit.clone(),
             )

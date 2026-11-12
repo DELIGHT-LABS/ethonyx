@@ -21,7 +21,11 @@ struct HeaderMapCarrierRef<'a>(&'a http::HeaderMap);
 
 impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrierRef<'a> {
     fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|v| v.to_str().ok())
+        let name = http::HeaderName::from_bytes(key.as_bytes()).ok()?;
+        if crate::headers::is_connection_nominated(self.0, &name) {
+            return None;
+        }
+        self.0.get(name).and_then(|v| v.to_str().ok())
     }
 
     fn keys(&self) -> Vec<&str> {
@@ -29,16 +33,28 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrierRef<'a> {
     }
 }
 
-pub fn propagate_context(headers: &mut http::HeaderMap) {
+/// Link `span` to any non-`Connection`-nominated parent trace context in `headers`.
+/// Must be called BEFORE `span` is first entered so `tracing-opentelemetry` builds
+/// the underlying OTel `Span` with the extracted parent `TraceId`.
+pub fn attach_parent_context(span: &tracing::Span, headers: &http::HeaderMap) {
+    if span.id().is_none() {
+        return;
+    }
     let parent_cx = global::get_text_map_propagator(|propagator| {
         propagator.extract(&HeaderMapCarrierRef(headers))
     });
+    if opentelemetry::trace::TraceContextExt::has_active_span(&parent_cx) {
+        let _ = tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(span, parent_cx);
+    }
+}
 
+pub fn propagate_context(headers: &mut http::HeaderMap) {
     let span = tracing::Span::current();
     let cx = if span.id().is_none() {
-        parent_cx
+        global::get_text_map_propagator(|propagator| {
+            propagator.extract(&HeaderMapCarrierRef(headers))
+        })
     } else {
-        let _ = tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&span, parent_cx);
         tracing_opentelemetry::OpenTelemetrySpanExt::context(&span)
     };
 

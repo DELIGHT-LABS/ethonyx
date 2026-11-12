@@ -1,15 +1,21 @@
-//! WebSocket handshake and bounded relay. HTTP/1 and HTTP/2 share the same dial path.
+//! WebSocket handshake and bounded single-loop relay. HTTP/1 and HTTP/2 share the same dial path.
 use crate::lifecycle::Lifecycle;
 use crate::proxy::{BoxError, ResBody, box_full, text_response};
 use crate::rpc::{MockResult, mock_syncing};
-use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use http::{Method, Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio_tungstenite::tungstenite::{Error, Message, protocol::Role};
+use tokio::sync::OwnedSemaphorePermit;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 use tracing::debug;
+
+const WS_CLOSE_GRACE: Duration = Duration::from_secs(1);
+const WS_CONTROL_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WsMode {
@@ -34,11 +40,13 @@ impl WsMode {
         }
     }
 
-    fn response(self, req: &mut Request<()>) -> Result<Response<()>, BoxError> {
+    fn response(self, req: &mut Request<()>, otel_enabled: bool) -> Result<Response<()>, BoxError> {
         use http::header::{
             CONNECTION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL,
             SEC_WEBSOCKET_VERSION, UPGRADE,
         };
+        #[cfg(not(feature = "otel"))]
+        let _ = otel_enabled;
         let mut versions = req.headers().get_all(SEC_WEBSOCKET_VERSION).iter();
         if versions.next().is_none_or(|v| v != "13") || versions.next().is_some() {
             return Err("invalid websocket version".into());
@@ -60,9 +68,13 @@ impl WsMode {
         };
         normalize_subprotocols(req.headers_mut())?;
         let protocol = req.headers().get(SEC_WEBSOCKET_PROTOCOL).cloned();
-        // Strip hop-by-hop and Connection-nominated headers before overwriting
-        // Connection/Upgrade, then restore canonical WebSocket handshake fields.
+        // Strip hop-by-hop and Connection-nominated headers BEFORE injecting OTel
+        // trace context or restoring canonical WebSocket handshake fields.
         crate::headers::strip_hop_by_hop(req.headers_mut());
+        #[cfg(feature = "otel")]
+        if otel_enabled {
+            crate::otel::propagate_context(req.headers_mut());
+        }
         // Each hop terminates frames; Tungstenite cannot decode negotiated compression.
         req.headers_mut().remove(SEC_WEBSOCKET_EXTENSIONS);
         req.headers_mut().remove(SEC_WEBSOCKET_KEY);
@@ -170,18 +182,20 @@ fn get_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig 
         .max_frame_size(Some(16 * 1024 * 1024))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn upgrade(
     req: Request<Incoming>,
     mode: WsMode,
     upstream: &crate::upstream::WsUpstream,
-    connect_timeout: Duration,
+    io_timeout: Duration,
     mock_enabled: bool,
+    otel_enabled: bool,
     lifecycle: Lifecycle,
-    permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    permit: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Result<Response<ResBody>, BoxError> {
     let (parts, _body) = req.into_parts();
     let mut req = Request::from_parts(parts, ());
-    let mut response = match mode.response(&mut req) {
+    let mut response = match mode.response(&mut req, otel_enabled) {
         Ok(response) => response,
         Err(_) => {
             return Ok(text_response(
@@ -193,7 +207,7 @@ pub(crate) async fn upgrade(
     let on_upgrade = hyper::upgrade::on(&mut req);
     let ws_req = build_ws_request(req, upstream, mode)?;
     let (upstream_ws, upstream_response) = match tokio::time::timeout(
-        connect_timeout,
+        io_timeout,
         tokio_tungstenite::connect_async_with_config(ws_req, Some(get_ws_config()), true),
     )
     .await
@@ -242,13 +256,13 @@ pub(crate) async fn upgrade(
         let _permit = permit;
         match on_upgrade.await {
             Ok(upgraded) => {
-                let client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                let client_ws = WebSocketStream::from_raw_socket(
                     TokioIo::new(upgraded),
                     Role::Server,
                     Some(get_ws_config()),
                 )
                 .await;
-                bridge_ws(client_ws, upstream_ws, mock_enabled).await;
+                bridge_ws(client_ws, upstream_ws, mock_enabled, io_timeout).await;
             }
             Err(e) => debug!(error = %e, "client ws upgrade failed"),
         }
@@ -256,103 +270,129 @@ pub(crate) async fn upgrade(
     Ok(response.map(|()| box_full(http_body_util::Full::new(bytes::Bytes::new()))))
 }
 
-async fn forward<R, W>(mut reader: R, mut writer: W)
+async fn send_bounded<S>(ws: &mut WebSocketStream<S>, msg: Message, timeout: Duration) -> bool
 where
-    R: Stream<Item = Result<Message, Error>> + Unpin,
-    W: Sink<Message, Error = Error> + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    while let Some(Ok(message)) = reader.next().await {
-        let closing = message.is_close();
-        let sent = writer.send(message).await;
-        if closing {
-            // Reading once more flushes Tungstenite's queued close acknowledgement
-            // on this reader's socket without adding a shared sink mutex.
-            let _ = tokio::time::timeout(Duration::from_secs(1), reader.next()).await;
-            break;
-        }
-        if sent.is_err() {
-            break;
-        }
+    tokio::time::timeout(timeout, ws.send(msg))
+        .await
+        .is_ok_and(|res| res.is_ok())
+}
+
+async fn flush_bounded<S>(ws: &mut WebSocketStream<S>, timeout: Duration) -> bool
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(timeout, ws.flush())
+        .await
+        .is_ok_and(|res| res.is_ok())
+}
+
+async fn finish_close<A, B>(
+    closer: &mut WebSocketStream<A>,
+    other: &mut WebSocketStream<B>,
+    frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Flush Tungstenite's auto-queued Close reply to the initiator first, then
+    // forward Close to the opposite peer and bound its post-close drain.
+    let _ = flush_bounded(closer, WS_CLOSE_GRACE).await;
+    if send_bounded(other, Message::Close(frame), WS_CLOSE_GRACE).await {
+        let _ = tokio::time::timeout(WS_CLOSE_GRACE, async {
+            while let Some(Ok(msg)) = other.next().await {
+                if msg.is_close() {
+                    break;
+                }
+            }
+        })
+        .await;
     }
 }
 
 async fn bridge_ws<C, U>(
-    client_ws: tokio_tungstenite::WebSocketStream<C>,
-    upstream_ws: tokio_tungstenite::WebSocketStream<U>,
+    mut client_ws: WebSocketStream<C>,
+    mut upstream_ws: WebSocketStream<U>,
     mock_enabled: bool,
+    io_timeout: Duration,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let _guard = crate::metrics::ActiveConnectionGuard::ws();
-    let (c_tx, mut c_rx) = client_ws.split();
-    let (mut u_tx, mut u_rx) = upstream_ws.split();
-    if !mock_enabled {
-        drain_pair(forward(c_rx, u_tx), forward(u_rx, c_tx)).await;
-        return;
-    }
-    let c_tx = tokio::sync::Mutex::new(c_tx);
-
-    let c2u = async {
-        while let Some(Ok(m)) = c_rx.next().await {
-            if let Message::Text(text) = &m {
-                match mock_syncing(text.as_bytes()) {
-                    MockResult::Silent => continue,
-                    MockResult::Reply(reply) => {
-                        if c_tx
-                            .lock()
-                            .await
-                            .send(Message::Text(reply.into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
+    loop {
+        tokio::select! {
+            client_item = client_ws.next() => match client_item {
+                Some(Ok(Message::Text(text))) => {
+                    if mock_enabled {
+                        match mock_syncing(text.as_bytes()) {
+                            MockResult::Silent => continue,
+                            MockResult::Reply(reply) => {
+                                if !send_bounded(&mut client_ws, Message::Text(reply.into()), io_timeout).await {
+                                    break;
+                                }
+                                continue;
+                            }
+                            MockResult::Forward => {}
                         }
-                        continue;
                     }
-                    MockResult::Forward => {}
+                    if !send_bounded(&mut upstream_ws, Message::Text(text), io_timeout).await {
+                        break;
+                    }
                 }
-            }
-            let closing = m.is_close();
-            let sent = u_tx.send(m).await;
-            if closing {
-                let _ = tokio::time::timeout(Duration::from_secs(1), c_rx.next()).await;
-                break;
-            }
-            if sent.is_err() {
-                break;
-            }
+                Some(Ok(Message::Binary(bin))) => {
+                    if !send_bounded(&mut upstream_ws, Message::Binary(bin), io_timeout).await {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Ping(_))) => {
+                    // Ping/Pong are hop-by-hop control frames: Tungstenite queued
+                    // the matching Pong on `client_ws` during `next()`, so flush it
+                    // immediately instead of forwarding Ping upstream.
+                    if !flush_bounded(&mut client_ws, WS_CONTROL_FLUSH_TIMEOUT).await {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                Some(Ok(Message::Close(frame))) => {
+                    finish_close(&mut client_ws, &mut upstream_ws, frame).await;
+                    break;
+                }
+                Some(Err(_)) => {
+                    let _ = flush_bounded(&mut client_ws, WS_CLOSE_GRACE).await;
+                    break;
+                }
+                None => break,
+            },
+            upstream_item = upstream_ws.next() => match upstream_item {
+                Some(Ok(Message::Text(text))) => {
+                    if !send_bounded(&mut client_ws, Message::Text(text), io_timeout).await {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Binary(bin))) => {
+                    if !send_bounded(&mut client_ws, Message::Binary(bin), io_timeout).await {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Ping(_))) => {
+                    if !flush_bounded(&mut upstream_ws, WS_CONTROL_FLUSH_TIMEOUT).await {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                Some(Ok(Message::Close(frame))) => {
+                    finish_close(&mut upstream_ws, &mut client_ws, frame).await;
+                    break;
+                }
+                Some(Err(_)) => {
+                    let _ = flush_bounded(&mut upstream_ws, WS_CLOSE_GRACE).await;
+                    break;
+                }
+                None => break,
+            },
         }
-    };
-    let u2c = async {
-        while let Some(Ok(m)) = u_rx.next().await {
-            let closing = m.is_close();
-            let sent = c_tx.lock().await.send(m).await;
-            if closing {
-                let _ = tokio::time::timeout(Duration::from_secs(1), u_rx.next()).await;
-                break;
-            }
-            if sent.is_err() {
-                break;
-            }
-        }
-    };
-    drain_pair(c2u, u2c).await;
-}
-
-async fn drain_pair(
-    a: impl std::future::Future<Output = ()>,
-    b: impl std::future::Future<Output = ()>,
-) {
-    tokio::pin!(a, b);
-    // Give the opposite direction time to flush its close reply; a broken peer
-    // must not keep the other half of a tunnel alive indefinitely.
-    let a_finished = tokio::select! { _ = &mut a => true, _ = &mut b => false };
-    let grace = Duration::from_secs(1);
-    if a_finished {
-        let _ = tokio::time::timeout(grace, b).await;
-    } else {
-        let _ = tokio::time::timeout(grace, a).await;
     }
 }
 
@@ -550,7 +590,7 @@ mod tests {
                     "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
                 );
             }
-            let resp = mode.response(&mut req).unwrap();
+            let resp = mode.response(&mut req, false).unwrap();
             assert_eq!(
                 resp.status(),
                 if mode == WsMode::Upgrade {
@@ -579,5 +619,98 @@ mod tests {
                 "/ws/sub?api_key=secret&tag=1"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn single_loop_bridge_flushes_ping_locally_without_forwarding_or_duplicating_pong() {
+        let (client_io, proxy_client_io) = tokio::io::duplex(16 * 1024);
+        let (proxy_upstream_io, upstream_io) = tokio::io::duplex(16 * 1024);
+
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let proxy_client =
+            WebSocketStream::from_raw_socket(proxy_client_io, Role::Server, Some(get_ws_config()))
+                .await;
+        let proxy_upstream = WebSocketStream::from_raw_socket(
+            proxy_upstream_io,
+            Role::Client,
+            Some(get_ws_config()),
+        )
+        .await;
+        let mut upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
+
+        let relay = tokio::spawn(bridge_ws(
+            proxy_client,
+            proxy_upstream,
+            true,
+            Duration::from_secs(5),
+        ));
+
+        // 1. Client Ping while upstream is completely idle (not even reading!) must
+        // immediately yield 1 Pong to the client and never forward Ping to upstream.
+        client
+            .send(Message::Ping(bytes::Bytes::from_static(b"hb-1")))
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(pong, Message::Pong(bytes::Bytes::from_static(b"hb-1")));
+
+        // 2. Unsolicited Pong from client is absorbed locally.
+        client
+            .send(Message::Pong(bytes::Bytes::from_static(b"unsolicited")))
+            .await
+            .unwrap();
+
+        // 3. Mocked eth_syncing replies locally without touching upstream.
+        client
+            .send(Message::Text(
+                r#"{"jsonrpc":"2.0","method":"eth_syncing","id":9}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let mock_reply = client.next().await.unwrap().unwrap();
+        assert_eq!(
+            mock_reply,
+            Message::Text(r#"{"jsonrpc":"2.0","id":9,"result":false}"#.into())
+        );
+
+        // 4. Non-eth_syncing message is the VERY FIRST frame upstream sees!
+        client
+            .send(Message::Text(
+                r#"{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let seen_by_upstream = upstream.next().await.unwrap().unwrap();
+        assert_eq!(
+            seen_by_upstream,
+            Message::Text(r#"{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}"#.into())
+        );
+        upstream
+            .send(Message::Text(
+                r#"{"jsonrpc":"2.0","id":1,"result":"0x2a"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let forwarded_reply = client.next().await.unwrap().unwrap();
+        assert_eq!(
+            forwarded_reply,
+            Message::Text(r#"{"jsonrpc":"2.0","id":1,"result":"0x2a"}"#.into())
+        );
+
+        // 5. Orderly close completes with zero extra Pong frames.
+        client.close(None).await.unwrap();
+        let close_reply = client.next().await.unwrap().unwrap();
+        assert!(matches!(close_reply, Message::Close(_)), "{close_reply:?}");
+        assert!(matches!(
+            upstream.next().await,
+            Some(Ok(Message::Close(_))) | None
+        ));
+        // Poll once more (as a server read loop does) so Tungstenite flushes its Close-ack.
+        assert!(upstream.next().await.is_none());
+        relay.await.unwrap();
     }
 }

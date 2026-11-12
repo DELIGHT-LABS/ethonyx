@@ -79,6 +79,16 @@ pub fn sanitize_response_headers(status: StatusCode, headers: &mut HeaderMap) {
     }
 }
 
+#[cfg(feature = "otel")]
+pub(crate) fn is_connection_nominated(headers: &HeaderMap, target: &HeaderName) -> bool {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|&b| b == b','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim_ascii()).ok())
+        .any(|name| name == target)
+}
+
 fn remove_connection_nominated(headers: &mut HeaderMap) {
     // Read every Connection field before removing it: its options nominate
     // additional headers that must not cross this hop (RFC 9110, section 7.6.1).
