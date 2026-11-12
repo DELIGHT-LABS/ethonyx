@@ -278,6 +278,7 @@ ethonyx --otel-endpoint http://localhost:4318 ...
 When enabled:
 - **Distributed Tracing**: Context propagation is hooked into client requests (W3C standard `traceparent` headers are injected into upstream requests).
 - **Span Attributes**: Upstream requests are instrumented with tracing spans containing method, path, and upstream layer details.
+- **Resource Identity**: `service.name` defaults to `ethonyx` and honors standard `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` overrides.
 
 ## systemd
 

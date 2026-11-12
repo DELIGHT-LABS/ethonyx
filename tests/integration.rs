@@ -1641,7 +1641,7 @@ async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
     // Assert some of the metrics exist in the response
     assert!(metrics_str.contains("ethonyx_proxy_requests_total"));
     assert!(metrics_str.contains("ethonyx_proxy_request_duration_seconds"));
-    assert!(metrics_str.contains("ethonyx_active_connections"));
+    assert!(metrics_str.contains(r#"ethonyx_active_connections{protocol="tcp"}"#));
     assert!(metrics_str.contains("ethonyx_upstream_health_status"));
     assert!(metrics_str.contains("ethonyx_upstream_peers"));
 

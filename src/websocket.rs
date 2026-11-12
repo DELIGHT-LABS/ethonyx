@@ -285,7 +285,7 @@ async fn bridge_ws<C, U>(
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let _guard = crate::metrics::ActiveConnectionGuard::new("ws");
+    let _guard = crate::metrics::ActiveConnectionGuard::ws();
     let (c_tx, mut c_rx) = client_ws.split();
     let (mut u_tx, mut u_rx) = upstream_ws.split();
     if !mock_enabled {

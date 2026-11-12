@@ -33,7 +33,6 @@ impl Network {
 
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "ethonyx",
     version,
     about = "Ethonyx — Ethereum EL/CL reverse proxy & health-check sidecar"
 )]

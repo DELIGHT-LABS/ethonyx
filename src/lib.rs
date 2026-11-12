@@ -10,7 +10,7 @@ pub mod config;
 mod headers;
 mod health;
 mod lifecycle;
-pub mod metrics;
+mod metrics;
 #[cfg(feature = "otel")]
 pub mod otel;
 mod proxy;
@@ -293,7 +293,7 @@ async fn accept_loop(
                 let state = state.clone();
                 let mut conn_lifecycle = lifecycle.clone();
                 tokio::spawn(async move {
-                    let _guard = crate::metrics::ActiveConnectionGuard::new("tcp");
+                    let _guard = crate::metrics::ActiveConnectionGuard::tcp();
                     let io = TokioIo::new(stream);
                     let connection = Arc::new(proxy::Connection::new(
                         state,
