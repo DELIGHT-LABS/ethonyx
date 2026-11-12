@@ -1,7 +1,6 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -369,8 +368,7 @@ where
 {
     // Select at dispatch, after any mock body inspection. Local replies need
     // no transport lookup, and forwarded requests follow the latest verdict.
-    let client = state.el_client(state.el_use_h2.load(Ordering::Relaxed));
-    send_http(req, state, &state.el_http, None, client).await
+    send_http(req, state, &state.el_http, None, state.el_client()).await
 }
 
 async fn send_http<B>(

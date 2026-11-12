@@ -166,14 +166,14 @@ impl<'de> Deserialize<'de> for Batch {
 }
 
 pub(crate) fn mock_syncing(bytes: &[u8]) -> MockResult {
-    // A decoded eth_syncing method must occur literally or contain a JSON escape.
-    // Absence of BOTH rules out a local reply, without interpreting JSON ourselves.
-    // Possible matches, escapes and invalid UTF-8 still use the complete parser.
-    // Bound the extra scan so large bodies keep the single parsing pass.
+    // A decoded eth_syncing method must occur literally as ASCII bytes or contain
+    // a JSON backslash escape. Absence of BOTH rules out a local reply in a single
+    // byte-level pass without a separate UTF-8 validation scan. Possible matches,
+    // escapes and invalid inputs still go through the complete serde parser.
+    const NEEDLE: &[u8] = b"eth_syncing";
     if bytes.len() <= 256
-        && let Ok(text) = std::str::from_utf8(bytes)
-        && !text.contains("eth_syncing")
         && !bytes.contains(&b'\\')
+        && !bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE)
     {
         return MockResult::Forward;
     }

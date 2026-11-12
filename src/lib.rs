@@ -24,7 +24,6 @@ pub use upstream::RedactedUrl;
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hyper::service::service_fn;
@@ -149,12 +148,14 @@ where
     let (probe_tx, probe_rx) = watch::channel(Arc::new(health::Probe::pending()));
     let (shutdown_tx, _) = watch::channel(None);
 
-    let prefer_h2 = !cfg.trust_upstream && !el_http.is_tls();
+    let el_transport = health::ElTransport::new(cfg.trust_upstream, el_http.is_tls());
+    let cl_tls_version = cl_beacon.is_tls().then(health::ObservedHttpVersion::new);
     let state = Arc::new(AppState {
         cfg,
         client,
         el_h2_client,
-        el_use_h2: AtomicBool::new(prefer_h2),
+        el_transport,
+        cl_tls_version,
         el_http,
         el_ws,
         cl_beacon,
@@ -167,27 +168,24 @@ where
         probe: probe_rx,
     });
 
-    // Warm the health cache with one poll before serving, then refresh it in the
-    // background so /healthz and /readyz read a snapshot instead of hitting
-    // upstream on every probe.
-    let first_probe = Arc::new(health::probe_once(&state).await);
-    let first_report = health::evaluate_ready(&state, &first_probe);
-    health::update_metrics(&first_probe, &first_report);
-    let el_proto = if state.el_use_h2.load(Ordering::Relaxed) {
-        "HTTP/2 (h2c)"
-    } else {
-        "HTTP/1.1"
-    };
+    if !state.cfg.trust_upstream {
+        // Warm the health cache with one poll before serving, then refresh it in
+        // the background so /healthz and /readyz read a snapshot instead of
+        // hitting upstream on every probe.
+        let first_probe = Arc::new(health::probe_once(&state).await);
+        let first_report = health::evaluate_ready(&state, &first_probe);
+        health::update_metrics(&first_probe, &first_report);
+        let _ = probe_tx.send(first_probe);
+    }
     info!(
         el_http = %RedactedUrl(&state.cfg.el_http_url),
-        el_http_proto = %el_proto,
+        el_http_proto = %state.el_transport.startup_proto_label(),
         el_ws = %RedactedUrl(&state.cfg.el_ws_url),
         cl_beacon = %RedactedUrl(&state.cfg.cl_beacon_url),
         cl_mev_relay = %upstream::RedactedOptUrl(state.cfg.cl_mev_relay_url.as_deref()),
-        cl_proto = "HTTP/1.1",
+        cl_proto = %state.cl_startup_proto_label(),
         "upstreams connected"
     );
-    let _ = probe_tx.send(first_probe);
     let poller = (!state.cfg.trust_upstream).then(|| {
         tokio::spawn(health::poll_loop(
             state.clone(),

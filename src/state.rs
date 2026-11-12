@@ -1,26 +1,23 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use http::Uri;
 use tokio::sync::watch;
 
 use crate::config::Config;
-use crate::health::Probe;
+use crate::health::{ElTransport, ObservedHttpVersion, Probe};
 use crate::proxy::ProxyClient;
 use crate::upstream::{HttpUpstream, WsUpstream};
 
 pub struct AppState {
     pub cfg: Config,
     /// Default client: HTTP/1.1 for cleartext, h2 via ALPN for `https`. Serves
-    /// the CL Beacon hop, and the EL hop while `el_use_h2` is false.
+    /// the CL Beacon hop, and the EL hop unless cleartext `h2c` is active.
     pub client: ProxyClient,
-    /// HTTP/2-only client (cleartext h2c prior-knowledge, or h2 over TLS). Serves
-    /// the EL JSON-RPC hop while `el_use_h2` is true.
+    /// HTTP/2-only client (cleartext h2c prior-knowledge). Serves the EL
+    /// JSON-RPC hop while `el_transport.uses_h2c_client()` is true.
     pub el_h2_client: ProxyClient,
-    /// Whether the EL JSON-RPC hop currently uses HTTP/2. The health poller owns
-    /// this: it prefers h2c and falls back to HTTP/1.1 when the upstream does not
-    /// speak it, so an h2c↔h1 change self-heals within one poll.
-    pub el_use_h2: AtomicBool,
+    pub(crate) el_transport: ElTransport,
+    pub(crate) cl_tls_version: Option<ObservedHttpVersion>,
     pub(crate) el_http: HttpUpstream,
     pub(crate) el_ws: WsUpstream,
     pub(crate) cl_beacon: HttpUpstream,
@@ -35,12 +32,26 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Resolve one transport snapshot, shared by probing and forwarding.
-    pub const fn el_client(&self, use_h2: bool) -> &ProxyClient {
-        if use_h2 {
+    /// Resolve the active EL HTTP client from the current transport state.
+    pub fn el_client(&self) -> &ProxyClient {
+        if self.el_transport.uses_h2c_client() {
             &self.el_h2_client
         } else {
             &self.client
+        }
+    }
+
+    pub(crate) fn cl_transport_label(&self) -> &'static str {
+        self.cl_tls_version
+            .as_ref()
+            .map_or("http/1.1", ObservedHttpVersion::label)
+    }
+
+    pub(crate) fn cl_startup_proto_label(&self) -> &'static str {
+        if self.cl_transport_label() == "h2" {
+            "HTTP/2 (TLS)"
+        } else {
+            "HTTP/1.1"
         }
     }
 }
