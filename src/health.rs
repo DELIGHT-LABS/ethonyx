@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::proxy::{ProxyClient, ResBody, box_full};
+use crate::proxy::{H2cClient, ProxyClient, ResBody, UpstreamClient, box_full, build_h2c_client};
 use crate::state::AppState;
 
 /// Whether `/healthz` reflects active background probes or `--trust-upstream`.
@@ -20,16 +20,25 @@ pub enum HealthMode {
     Trusted,
 }
 
+/// Source of readiness and health data for `/healthz`, `/readyz`, and `node_health`.
+pub(crate) enum HealthSource {
+    /// `--trust-upstream`: no background poller or `watch` channel is allocated.
+    Trusted,
+    /// Active background polling feeding snapshots via `watch`.
+    Polled(watch::Receiver<Arc<Probe>>),
+}
+
 /// Tracks the negotiated HTTP protocol version observed on an `https://` upstream.
 #[derive(Default)]
 pub(crate) struct ObservedHttpVersion(AtomicU8);
 
 impl ObservedHttpVersion {
-    const HTTP_11: u8 = 0;
-    const HTTP_2: u8 = 1;
+    const UNOBSERVED: u8 = 0;
+    const HTTP_11: u8 = 1;
+    const HTTP_2: u8 = 2;
 
     pub(crate) const fn new() -> Self {
-        Self(AtomicU8::new(Self::HTTP_11))
+        Self(AtomicU8::new(Self::UNOBSERVED))
     }
 
     pub(crate) fn record(&self, version: Version) {
@@ -41,11 +50,58 @@ impl ObservedHttpVersion {
         self.0.store(encoded, Ordering::Relaxed);
     }
 
+    /// Machine-readable `/healthz` transport (`"h2"` once observed, conservative `"http/1.1"` otherwise).
     pub(crate) fn label(&self) -> &'static str {
         if self.0.load(Ordering::Relaxed) == Self::HTTP_2 {
             "h2"
         } else {
             "http/1.1"
+        }
+    }
+
+    /// Human-readable startup protocol summary (`"HTTPS (ALPN)"` before first TLS response).
+    pub(crate) fn startup_label(&self) -> &'static str {
+        match self.0.load(Ordering::Relaxed) {
+            Self::HTTP_2 => "HTTP/2 (TLS)",
+            Self::HTTP_11 => "HTTP/1.1 (TLS)",
+            _ => "HTTPS (ALPN)",
+        }
+    }
+}
+
+/// Transport tracker for the Consensus Layer Beacon HTTP hop.
+pub(crate) enum ClTransport {
+    CleartextH1,
+    TlsAuto(ObservedHttpVersion),
+}
+
+impl ClTransport {
+    pub(crate) const fn new(is_tls: bool) -> Self {
+        if is_tls {
+            Self::TlsAuto(ObservedHttpVersion::new())
+        } else {
+            Self::CleartextH1
+        }
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::CleartextH1 => "http/1.1",
+            Self::TlsAuto(obs) => obs.label(),
+        }
+    }
+
+    pub(crate) fn startup_proto_label(&self) -> &'static str {
+        match self {
+            Self::CleartextH1 => "HTTP/1.1",
+            Self::TlsAuto(obs) => obs.startup_label(),
+        }
+    }
+
+    pub(crate) const fn tls_observer(&self) -> Option<&ObservedHttpVersion> {
+        match self {
+            Self::CleartextH1 => None,
+            Self::TlsAuto(obs) => Some(obs),
         }
     }
 }
@@ -56,8 +112,12 @@ pub(crate) enum ElTransport {
     TrustedH1,
     /// `https://` upstream: negotiates `h2` vs `http/1.1` via TLS ALPN on `state.client`.
     TlsAuto(ObservedHttpVersion),
-    /// Probed cleartext `http://` upstream with one-shot `h2c` recovery verification.
-    AdaptiveH2c(AtomicU8),
+    /// Probed cleartext `http://` upstream with a dedicated cleartext `h2c` client
+    /// and one-shot `h2c` recovery verification.
+    AdaptiveH2c {
+        mode: AtomicU8,
+        client: Box<H2cClient>,
+    },
 }
 
 impl ElTransport {
@@ -66,33 +126,53 @@ impl ElTransport {
     const H1_VERIFY_ONCE: u8 = 2;
     const H1_CONFIRMED: u8 = 3;
 
-    pub(crate) const fn new(trust_upstream: bool, is_tls: bool) -> Self {
+    pub(crate) fn new(trust_upstream: bool, is_tls: bool) -> Self {
         if is_tls {
             Self::TlsAuto(ObservedHttpVersion::new())
         } else if trust_upstream {
             Self::TrustedH1
         } else {
-            Self::AdaptiveH2c(AtomicU8::new(Self::H2C_INITIAL))
+            Self::AdaptiveH2c {
+                mode: AtomicU8::new(Self::H2C_INITIAL),
+                client: Box::new(build_h2c_client()),
+            }
         }
     }
 
     #[cfg(test)]
-    const fn confirmed_cleartext(prefer_h2: bool) -> Self {
-        Self::AdaptiveH2c(AtomicU8::new(if prefer_h2 {
-            Self::H2C_CONFIRMED
-        } else {
-            Self::H1_CONFIRMED
-        }))
+    fn confirmed_cleartext(prefer_h2: bool) -> Self {
+        Self::AdaptiveH2c {
+            mode: AtomicU8::new(if prefer_h2 {
+                Self::H2C_CONFIRMED
+            } else {
+                Self::H1_CONFIRMED
+            }),
+            client: Box::new(build_h2c_client()),
+        }
     }
 
     /// Whether data-plane EL requests should use the cleartext `h2c` prior-knowledge client.
     pub(crate) fn uses_h2c_client(&self) -> bool {
         match self {
             Self::TrustedH1 | Self::TlsAuto(_) => false,
-            Self::AdaptiveH2c(mode) => matches!(
+            Self::AdaptiveH2c { mode, .. } => matches!(
                 mode.load(Ordering::Relaxed),
                 Self::H2C_INITIAL | Self::H2C_CONFIRMED
             ),
+        }
+    }
+
+    pub(crate) fn select_client<'a>(&'a self, default: &'a ProxyClient) -> UpstreamClient<'a> {
+        match self {
+            Self::AdaptiveH2c { mode, client }
+                if matches!(
+                    mode.load(Ordering::Relaxed),
+                    Self::H2C_INITIAL | Self::H2C_CONFIRMED
+                ) =>
+            {
+                UpstreamClient::H2c(client)
+            }
+            _ => UpstreamClient::Standard(default),
         }
     }
 
@@ -101,7 +181,7 @@ impl ElTransport {
         match self {
             Self::TrustedH1 => "http/1.1",
             Self::TlsAuto(obs) => obs.label(),
-            Self::AdaptiveH2c(_) => {
+            Self::AdaptiveH2c { .. } => {
                 if self.uses_h2c_client() {
                     "h2c"
                 } else {
@@ -115,14 +195,8 @@ impl ElTransport {
     pub(crate) fn startup_proto_label(&self) -> &'static str {
         match self {
             Self::TrustedH1 => "HTTP/1.1",
-            Self::TlsAuto(obs) => {
-                if obs.label() == "h2" {
-                    "HTTP/2 (TLS)"
-                } else {
-                    "HTTP/1.1"
-                }
-            }
-            Self::AdaptiveH2c(_) => {
+            Self::TlsAuto(obs) => obs.startup_label(),
+            Self::AdaptiveH2c { .. } => {
                 if self.uses_h2c_client() {
                     "HTTP/2 (h2c)"
                 } else {
@@ -135,7 +209,7 @@ impl ElTransport {
     pub(crate) const fn tls_observer(&self) -> Option<&ObservedHttpVersion> {
         match self {
             Self::TlsAuto(obs) => Some(obs),
-            Self::TrustedH1 | Self::AdaptiveH2c(_) => None,
+            Self::TrustedH1 | Self::AdaptiveH2c { .. } => None,
         }
     }
 }
@@ -181,10 +255,8 @@ pub struct ElHealth {
 
 #[derive(Serialize, Default)]
 pub struct ClHealth {
-    /// HTTP version ethonyx uses for the Beacon hop. The CL hop never uses h2c
-    /// prior-knowledge, so a cleartext upstream is always `http/1.1`; an `https`
-    /// upstream may negotiate `h2` via ALPN, which is not separately tracked and
-    /// is reported conservatively as `http/1.1`.
+    /// HTTP version ethonyx uses for the Beacon hop (`http/1.1` for cleartext;
+    /// `h2` or `http/1.1` for `https` once ALPN negotiation is observed).
     pub transport: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub syncing: Option<bool>,
@@ -215,7 +287,7 @@ pub struct ReadyReport {
     pub cl_slot_fresh: Option<Check>,
 }
 
-#[derive(Clone, serde::Deserialize)]
+#[derive(Clone, Copy, serde::Deserialize)]
 struct ClStatus {
     #[serde(deserialize_with = "decimal_string")]
     head_slot: u64,
@@ -224,7 +296,7 @@ struct ClStatus {
     is_syncing: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElSyncingResult {
     Synced(bool),
     Syncing {
@@ -268,7 +340,7 @@ impl<'de> serde::Deserialize<'de> for ElSyncingResult {
     }
 }
 
-#[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElBlockResult {
     #[serde(deserialize_with = "hex_string")]
     pub number: u64,
@@ -276,29 +348,30 @@ pub struct ElBlockResult {
     pub timestamp: u64,
 }
 
+pub(crate) type ProbeError = Arc<str>;
+
 /// The five upstream probe results captured by one poll, shared with the request
 /// handlers via a `watch` channel. `/healthz` and `/readyz` read the latest one
 /// instead of querying upstream per request, so upstream load is decoupled from
 /// probe rate. Stored as raw results so block / slot ages can be recomputed live.
 #[derive(Clone)]
 pub(crate) struct Probe {
-    el_syncing: Result<ElSyncingResult, String>,
-    el_peers: Result<u64, String>,
-    el_block: Result<ElBlockResult, String>,
-    cl_status: Result<ClStatus, String>,
-    cl_peers: Result<u64, String>,
+    el_syncing: Result<ElSyncingResult, ProbeError>,
+    el_peers: Result<u64, ProbeError>,
+    el_block: Result<ElBlockResult, ProbeError>,
+    cl_status: Result<ClStatus, ProbeError>,
+    cl_peers: Result<u64, ProbeError>,
 }
 
 impl Probe {
-    /// Placeholder used before the first poll lands. The cache is warmed with a
-    /// real poll before any listener accepts, so this is never actually served.
     pub(crate) fn pending() -> Self {
-        Probe {
-            el_syncing: Err("warming up".into()),
-            el_peers: Err("warming up".into()),
-            el_block: Err("warming up".into()),
-            cl_status: Err("warming up".into()),
-            cl_peers: Err("warming up".into()),
+        let pending: ProbeError = Arc::from("initial poll pending");
+        Self {
+            el_syncing: Err(pending.clone()),
+            el_peers: Err(pending.clone()),
+            el_block: Err(pending.clone()),
+            cl_status: Err(pending.clone()),
+            cl_peers: Err(pending),
         }
     }
 }
@@ -313,23 +386,26 @@ pub fn report(state: &AppState, head: bool) -> Response<ResBody> {
     if head {
         return empty_json_response(StatusCode::OK);
     }
-    let snapshot = if state.cfg.trust_upstream {
-        trusted_snapshot(state.el_transport.label(), state.cl_transport_label())
-    } else {
-        let probe = state.probe.borrow();
-        let mut snap = build_snapshot(
-            &probe.el_syncing,
-            &probe.el_peers,
-            &probe.el_block,
-            &probe.cl_status,
-            &probe.cl_peers,
-            state.cl_genesis_time,
-            state.cl_seconds_per_slot,
-            now_unix(),
-        );
-        snap.el.transport = state.el_transport.label();
-        snap.cl.transport = state.cl_transport_label();
-        snap
+    let snapshot = match &state.health {
+        HealthSource::Trusted => {
+            trusted_snapshot(state.el_transport.label(), state.cl_transport.label())
+        }
+        HealthSource::Polled(rx) => {
+            let probe = rx.borrow();
+            let mut snap = build_snapshot(
+                &probe.el_syncing,
+                &probe.el_peers,
+                &probe.el_block,
+                &probe.cl_status,
+                &probe.cl_peers,
+                state.cl_genesis_time,
+                state.cl_seconds_per_slot,
+                now_unix(),
+            );
+            snap.el.transport = state.el_transport.label();
+            snap.cl.transport = state.cl_transport.label();
+            snap
+        }
     };
     json_response(StatusCode::OK, &snapshot)
 }
@@ -361,17 +437,48 @@ fn trusted_snapshot(el_transport: &'static str, cl_transport: &'static str) -> H
 /// their thresholds — choose this when serving strictly-at-head data matters
 /// more than fleet availability during a network-wide stall.
 pub fn ready(state: &AppState, head: bool) -> Response<ResBody> {
-    let probe = state.probe.borrow();
-    let report = evaluate_ready(state, &probe);
-    let code = if report.status == "ready" {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    if head {
-        empty_json_response(code)
-    } else {
-        json_response(code, &report)
+    match &state.health {
+        HealthSource::Trusted => {
+            if head {
+                empty_json_response(StatusCode::OK)
+            } else {
+                json_response(
+                    StatusCode::OK,
+                    &ReadyReport {
+                        status: "ready",
+                        el_syncing: Check {
+                            ok: true,
+                            detail: "trusted upstream (unpolled)".into(),
+                        },
+                        cl_syncing: Check {
+                            ok: true,
+                            detail: "trusted upstream (unpolled)".into(),
+                        },
+                        el_block_fresh: None,
+                        cl_slot_fresh: None,
+                    },
+                )
+            }
+        }
+        HealthSource::Polled(rx) => {
+            let probe = rx.borrow();
+            if head {
+                let code = if evaluate_verdict(state, &probe).ready {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
+                empty_json_response(code)
+            } else {
+                let report = evaluate_ready_probed(state, &probe);
+                let code = if report.status == "ready" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
+                json_response(code, &report)
+            }
+        }
     }
 }
 
@@ -384,12 +491,14 @@ pub fn ready(state: &AppState, head: bool) -> Response<ResBody> {
 ///
 /// Serves an empty body with `content-type: application/json` in compliance with the spec.
 pub fn node_health(state: &AppState) -> Response<ResBody> {
-    if state.cfg.trust_upstream {
-        return empty_json_response(StatusCode::OK);
-    }
-    let probe = state.probe.borrow();
-    let report = evaluate_ready(state, &probe);
-    let code = classify_node_health(report.status == "ready", state.cfg.readyz_strict, &probe);
+    let code = match &state.health {
+        HealthSource::Trusted => StatusCode::OK,
+        HealthSource::Polled(rx) => {
+            let probe = rx.borrow();
+            let verdict = evaluate_verdict(state, &probe);
+            classify_node_health(verdict.ready, state.cfg.readyz_strict, &probe)
+        }
+    };
     empty_json_response(code)
 }
 
@@ -412,26 +521,49 @@ fn classify_node_health(ready: bool, readyz_strict: bool, probe: &Probe) -> Stat
     }
 }
 
-/// Build the `/readyz` verdict from a probe snapshot. Default gates on EL + CL
-/// sync only; `--readyz-strict` also gates on block / slot freshness. Shared by
-/// the endpoint and the poller's transition logging.
-pub(crate) fn evaluate_ready(state: &AppState, probe: &Probe) -> ReadyReport {
-    if state.cfg.trust_upstream {
-        return ReadyReport {
-            status: "ready",
-            el_syncing: Check {
-                ok: true,
-                detail: "trusted upstream (unpolled)".into(),
-            },
-            cl_syncing: Check {
-                ok: true,
-                detail: "trusted upstream (unpolled)".into(),
-            },
-            el_block_fresh: None,
-            cl_slot_fresh: None,
-        };
-    }
+/// Allocation-free readiness verdict shared by `poll_loop`, `HEAD /readyz`, and `node_health`.
+#[derive(Clone, Copy)]
+pub(crate) struct ReadinessVerdict {
+    pub el_sync_ok: bool,
+    pub cl_sync_ok: bool,
+    pub ready: bool,
+}
 
+pub(crate) fn evaluate_verdict(state: &AppState, probe: &Probe) -> ReadinessVerdict {
+    let el_sync_ok = matches!(probe.el_syncing, Ok(ElSyncingResult::Synced(false)));
+    let cl_sync_ok = matches!(&probe.cl_status, Ok(s) if !s.is_syncing);
+    let fresh_ok = if state.cfg.readyz_strict {
+        let now = now_unix();
+        let el_fresh = matches!(
+            &probe.el_block,
+            Ok(block) if now.saturating_sub(block.timestamp) <= state.cfg.el_max_block_age_secs
+        );
+        let cl_fresh = match &probe.cl_status {
+            Ok(_) if state.cl_genesis_time == 0 => true,
+            Ok(s) => {
+                slot_age(
+                    s.head_slot,
+                    state.cl_genesis_time,
+                    state.cl_seconds_per_slot,
+                    now,
+                ) <= state.cfg.cl_max_slot_age_secs
+            }
+            Err(_) => false,
+        };
+        el_fresh && cl_fresh
+    } else {
+        true
+    };
+    ReadinessVerdict {
+        el_sync_ok,
+        cl_sync_ok,
+        ready: el_sync_ok && cl_sync_ok && fresh_ok,
+    }
+}
+
+/// Build the detailed `/readyz` JSON report (formatted only on `GET /readyz` or
+/// `Transition::BecameNotReady` warning logs).
+fn evaluate_ready_probed(state: &AppState, probe: &Probe) -> ReadyReport {
     let el_syncing = check_el_syncing(&probe.el_syncing);
     let cl_syncing = check_cl_syncing(&probe.cl_status);
     // `now` is only needed for the strict freshness checks; the default
@@ -470,6 +602,7 @@ pub(crate) fn evaluate_ready(state: &AppState, probe: &Probe) -> ReadyReport {
 
 /// What [`poll_loop`] should log given the previous and current readiness, so a
 /// sustained state logs once (on transition) rather than once per poll.
+#[derive(Clone, Copy)]
 enum Transition {
     Silent,
     BecameNotReady,
@@ -496,9 +629,9 @@ pub(crate) async fn probe_once(state: &AppState) -> Probe {
         cl_peer_count(state),
     );
     Probe {
-        el_syncing: batch.syncing.map_err(|e| e.to_string()),
-        el_peers: batch.peers.map_err(|e| e.to_string()),
-        el_block: batch.block.map_err(|e| e.to_string()),
+        el_syncing: batch.syncing.map_err(HealthError::into_probe_error),
+        el_peers: batch.peers.map_err(HealthError::into_probe_error),
+        el_block: batch.block.map_err(HealthError::into_probe_error),
         cl_status,
         cl_peers,
     }
@@ -507,10 +640,19 @@ pub(crate) async fn probe_once(state: &AppState) -> Probe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HealthError {
     Timeout,
-    Transport(String),
+    Transport(ProbeError),
     HttpStatus(http::StatusCode),
-    Decode(String),
-    Rpc(String),
+    Decode(ProbeError),
+    Rpc(ProbeError),
+}
+
+impl HealthError {
+    fn into_probe_error(self) -> ProbeError {
+        match self {
+            Self::Timeout => Arc::from("timeout"),
+            other => Arc::from(other.to_string()),
+        }
+    }
 }
 
 impl std::fmt::Display for HealthError {
@@ -543,63 +685,69 @@ impl ElBatchResult {
 
 /// Query all three EL JSON-RPC methods in a batch request, maintaining the transport verdict.
 async fn el_batch_detect(state: &AppState) -> ElBatchResult {
+    let default_client = UpstreamClient::Standard(&state.client);
     let result = match &state.el_transport {
         ElTransport::TrustedH1 | ElTransport::TlsAuto(_) => {
-            el_batch_rpc(state, &state.client).await
+            el_batch_rpc(state, default_client).await
         }
-        ElTransport::AdaptiveH2c(mode) => match mode.load(Ordering::Relaxed) {
-            cur @ (ElTransport::H2C_INITIAL | ElTransport::H2C_CONFIRMED) => {
-                match el_batch_rpc(state, &state.el_h2_client).await {
+        ElTransport::AdaptiveH2c { mode, client } => {
+            let h2c_client = UpstreamClient::H2c(client);
+            match mode.load(Ordering::Relaxed) {
+                cur @ (ElTransport::H2C_INITIAL | ElTransport::H2C_CONFIRMED) => {
+                    match el_batch_rpc(state, h2c_client).await {
+                        Err(primary_err) if is_transport(&primary_err) => {
+                            let alt = el_batch_rpc(state, default_client).await;
+                            if matches!(&alt, Err(e) if is_transport(e)) {
+                                Err(primary_err)
+                            } else {
+                                mode.store(ElTransport::H1_VERIFY_ONCE, Ordering::Relaxed);
+                                if cur == ElTransport::H2C_CONFIRMED {
+                                    warn!(
+                                        "EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1"
+                                    );
+                                }
+                                alt
+                            }
+                        }
+                        reached => {
+                            if cur == ElTransport::H2C_INITIAL {
+                                mode.store(ElTransport::H2C_CONFIRMED, Ordering::Relaxed);
+                            }
+                            reached
+                        }
+                    }
+                }
+                ElTransport::H1_VERIFY_ONCE => {
+                    // Verify h2c one more time to self-heal if an h2c upstream was
+                    // probed mid-bind during startup or restart.
+                    let h2_try = el_batch_rpc(state, h2c_client).await;
+                    if !matches!(&h2_try, Err(e) if is_transport(e)) {
+                        mode.store(ElTransport::H2C_CONFIRMED, Ordering::Relaxed);
+                        info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
+                        h2_try
+                    } else {
+                        let h1_try = el_batch_rpc(state, default_client).await;
+                        if !matches!(&h1_try, Err(e) if is_transport(e)) {
+                            mode.store(ElTransport::H1_CONFIRMED, Ordering::Relaxed);
+                        }
+                        h1_try
+                    }
+                }
+                _ => match el_batch_rpc(state, default_client).await {
                     Err(primary_err) if is_transport(&primary_err) => {
-                        let alt = el_batch_rpc(state, &state.client).await;
+                        let alt = el_batch_rpc(state, h2c_client).await;
                         if matches!(&alt, Err(e) if is_transport(e)) {
                             Err(primary_err)
                         } else {
-                            mode.store(ElTransport::H1_VERIFY_ONCE, Ordering::Relaxed);
-                            if cur == ElTransport::H2C_CONFIRMED {
-                                warn!("EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1");
-                            }
+                            mode.store(ElTransport::H2C_CONFIRMED, Ordering::Relaxed);
+                            info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
                             alt
                         }
                     }
-                    reached => {
-                        if cur == ElTransport::H2C_INITIAL {
-                            mode.store(ElTransport::H2C_CONFIRMED, Ordering::Relaxed);
-                        }
-                        reached
-                    }
-                }
+                    reached => reached,
+                },
             }
-            ElTransport::H1_VERIFY_ONCE => {
-                // Verify h2c one more time to self-heal if an h2c upstream was
-                // probed mid-bind during startup or restart.
-                let h2_try = el_batch_rpc(state, &state.el_h2_client).await;
-                if !matches!(&h2_try, Err(e) if is_transport(e)) {
-                    mode.store(ElTransport::H2C_CONFIRMED, Ordering::Relaxed);
-                    info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
-                    h2_try
-                } else {
-                    let h1_try = el_batch_rpc(state, &state.client).await;
-                    if !matches!(&h1_try, Err(e) if is_transport(e)) {
-                        mode.store(ElTransport::H1_CONFIRMED, Ordering::Relaxed);
-                    }
-                    h1_try
-                }
-            }
-            _ => match el_batch_rpc(state, &state.client).await {
-                Err(primary_err) if is_transport(&primary_err) => {
-                    let alt = el_batch_rpc(state, &state.el_h2_client).await;
-                    if matches!(&alt, Err(e) if is_transport(e)) {
-                        Err(primary_err)
-                    } else {
-                        mode.store(ElTransport::H2C_CONFIRMED, Ordering::Relaxed);
-                        info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
-                        alt
-                    }
-                }
-                reached => reached,
-            },
-        },
+        }
     };
     result.unwrap_or_else(ElBatchResult::from_error)
 }
@@ -613,11 +761,11 @@ const fn is_transport(e: &HealthError) -> bool {
     matches!(e, HealthError::Transport(_) | HealthError::Timeout)
 }
 
-pub(crate) fn update_metrics(probe: &Probe, report: &ReadyReport) {
+pub(crate) fn update_metrics(probe: &Probe, verdict: ReadinessVerdict) {
     ::metrics::gauge!("ethonyx_upstream_health_status", "layer" => "el")
-        .set(if report.el_syncing.ok { 1.0 } else { 0.0 });
+        .set(if verdict.el_sync_ok { 1.0 } else { 0.0 });
     ::metrics::gauge!("ethonyx_upstream_health_status", "layer" => "cl")
-        .set(if report.cl_syncing.ok { 1.0 } else { 0.0 });
+        .set(if verdict.cl_sync_ok { 1.0 } else { 0.0 });
 
     ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "el")
         .set(probe.el_peers.as_ref().map_or(0.0, |&p| p as f64));
@@ -674,16 +822,17 @@ pub(crate) async fn poll_loop(
             probe = probe_once(&state) => probe,
         };
 
-        let report = evaluate_ready(&state, &probe);
-        let ready = report.status == "ready";
-        debug!(status = report.status, "health poll");
+        let verdict = evaluate_verdict(&state, &probe);
+        let status = if verdict.ready { "ready" } else { "not_ready" };
+        debug!(status, "health poll");
 
-        update_metrics(&probe, &report);
+        update_metrics(&probe, verdict);
 
-        match readiness_transition(prev_ready, ready) {
+        match readiness_transition(prev_ready, verdict.ready) {
             Transition::Silent => {}
             Transition::Recovered => info!("readiness recovered"),
             Transition::BecameNotReady => {
+                let report = evaluate_ready_probed(&state, &probe);
                 let el_block = report
                     .el_block_fresh
                     .as_ref()
@@ -701,7 +850,7 @@ pub(crate) async fn poll_loop(
                 );
             }
         }
-        prev_ready = Some(ready);
+        prev_ready = Some(verdict.ready);
 
         if tx.send(Arc::new(probe)).is_err() {
             return; // all receivers dropped
@@ -729,7 +878,7 @@ fn json_response<T: Serialize>(code: StatusCode, body: &T) -> Response<ResBody> 
 
 // ---- readiness verdicts (Check): sync is a fact; freshness uses thresholds ----
 
-fn check_el_syncing(r: &Result<ElSyncingResult, String>) -> Check {
+fn check_el_syncing(r: &Result<ElSyncingResult, ProbeError>) -> Check {
     match r {
         Ok(ElSyncingResult::Synced(false)) => Check {
             ok: true,
@@ -756,7 +905,7 @@ fn check_el_syncing(r: &Result<ElSyncingResult, String>) -> Check {
     }
 }
 
-fn check_cl_syncing(r: &Result<ClStatus, String>) -> Check {
+fn check_cl_syncing(r: &Result<ClStatus, ProbeError>) -> Check {
     match r {
         Ok(s) if !s.is_syncing => Check {
             ok: true,
@@ -779,7 +928,7 @@ fn check_cl_syncing(r: &Result<ClStatus, String>) -> Check {
     }
 }
 
-fn check_el_block_fresh(r: &Result<ElBlockResult, String>, max_age: u64, now: u64) -> Check {
+fn check_el_block_fresh(r: &Result<ElBlockResult, ProbeError>, max_age: u64, now: u64) -> Check {
     match r {
         Ok(block) => {
             let age = now.saturating_sub(block.timestamp);
@@ -803,7 +952,7 @@ fn check_el_block_fresh(r: &Result<ElBlockResult, String>, max_age: u64, now: u6
 }
 
 fn check_cl_slot_fresh(
-    r: &Result<ClStatus, String>,
+    r: &Result<ClStatus, ProbeError>,
     genesis: u64,
     seconds_per_slot: u64,
     max_age: u64,
@@ -842,11 +991,11 @@ fn check_cl_slot_fresh(
 /// `errors` and leave the field unset.
 #[allow(clippy::too_many_arguments)]
 fn build_snapshot(
-    sync_r: &Result<ElSyncingResult, String>,
-    peers_r: &Result<u64, String>,
-    block_r: &Result<ElBlockResult, String>,
-    cl_status_r: &Result<ClStatus, String>,
-    cl_peers_r: &Result<u64, String>,
+    sync_r: &Result<ElSyncingResult, ProbeError>,
+    peers_r: &Result<u64, ProbeError>,
+    block_r: &Result<ElBlockResult, ProbeError>,
+    cl_status_r: &Result<ClStatus, ProbeError>,
+    cl_peers_r: &Result<u64, ProbeError>,
     genesis: u64,
     seconds_per_slot: u64,
     now: u64,
@@ -913,14 +1062,14 @@ fn slot_age(head_slot: u64, genesis: u64, seconds_per_slot: u64, now: u64) -> u6
 async fn fetch_bytes(
     state: &AppState,
     req: Request<ResBody>,
-    client: &ProxyClient,
+    client: UpstreamClient<'_>,
     observed_tls: Option<&ObservedHttpVersion>,
 ) -> Result<Bytes, HealthError> {
     tokio::time::timeout(state.cfg.health_timeout, async {
         let resp = client
             .request(req)
             .await
-            .map_err(|e| HealthError::Transport(e.to_string()))?;
+            .map_err(|e| HealthError::Transport(Arc::from(e.to_string())))?;
         if let Some(obs) = observed_tls {
             obs.record(resp.version());
         }
@@ -931,7 +1080,7 @@ async fn fetch_bytes(
             .collect()
             .await
             .map(|c| c.to_bytes())
-            .map_err(|e| HealthError::Decode(e.to_string()))
+            .map_err(|e| HealthError::Decode(Arc::from(e.to_string())))
     })
     .await
     .map_err(|_| HealthError::Timeout)?
@@ -939,14 +1088,14 @@ async fn fetch_bytes(
 
 async fn el_batch_rpc(
     state: &AppState,
-    client: &ProxyClient,
+    client: UpstreamClient<'_>,
 ) -> Result<ElBatchResult, HealthError> {
     let req = Request::builder()
         .method(Method::POST)
         .uri(state.el_http.uri().clone())
         .header("content-type", "application/json")
         .body(box_full(Full::new(Bytes::from_static(EL_BATCH_REQ))))
-        .map_err(|e| HealthError::Transport(format!("build: {e}")))?;
+        .map_err(|e| HealthError::Transport(Arc::from(format!("build: {e}"))))?;
     let body = fetch_bytes(state, req, client, state.el_transport.tls_observer()).await?;
     parse_el_batch(&body)
 }
@@ -966,7 +1115,7 @@ fn parse_el_batch(body: &[u8]) -> Result<ElBatchResult, HealthError> {
     struct HexQuantity(#[serde(deserialize_with = "hex_string")] u64);
 
     let arr: [JsonObject<RpcResponse<'_>>; 3] =
-        serde_json::from_slice(body).map_err(|e| HealthError::Decode(e.to_string()))?;
+        serde_json::from_slice(body).map_err(|e| HealthError::Decode(Arc::from(e.to_string())))?;
     let mut slots: [Option<RpcResponse<'_>>; 3] = [None, None, None];
     for JsonObject(resp) in arr {
         let Some(idx) = usize::try_from(resp.id)
@@ -974,40 +1123,40 @@ fn parse_el_batch(body: &[u8]) -> Result<ElBatchResult, HealthError> {
             .and_then(|id| id.checked_sub(1))
             .filter(|&idx| idx < 3)
         else {
-            return Err(HealthError::Decode(
-                "duplicate or unexpected response id".into(),
-            ));
+            return Err(HealthError::Decode(Arc::from(
+                "duplicate or unexpected response id",
+            )));
         };
         if slots[idx].replace(resp).is_some() {
-            return Err(HealthError::Decode(
-                "duplicate or unexpected response id".into(),
-            ));
+            return Err(HealthError::Decode(Arc::from(
+                "duplicate or unexpected response id",
+            )));
         }
     }
 
     let decode_res = |idx: usize| -> Result<&serde_json::value::RawValue, HealthError> {
-        let resp = slots[idx]
-            .as_ref()
-            .ok_or_else(|| HealthError::Decode(format!("missing response for id {}", idx + 1)))?;
+        let resp = slots[idx].as_ref().ok_or_else(|| {
+            HealthError::Decode(Arc::from(format!("missing response for id {}", idx + 1)))
+        })?;
         if let Some(err) = resp.error {
-            return Err(HealthError::Rpc(err.get().to_owned()));
+            return Err(HealthError::Rpc(Arc::from(err.get())));
         }
         resp.result
-            .ok_or_else(|| HealthError::Decode("missing result".into()))
+            .ok_or_else(|| HealthError::Decode(Arc::from("missing result")))
     };
 
     let syncing = decode_res(0).and_then(|raw| {
-        serde_json::from_str(raw.get()).map_err(|e| HealthError::Decode(e.to_string()))
+        serde_json::from_str(raw.get()).map_err(|e| HealthError::Decode(Arc::from(e.to_string())))
     });
     let peers = decode_res(1).and_then(|raw| {
         serde_json::from_str::<HexQuantity>(raw.get())
             .map(|HexQuantity(n)| n)
-            .map_err(|e| HealthError::Decode(e.to_string()))
+            .map_err(|e| HealthError::Decode(Arc::from(e.to_string())))
     });
     let block = decode_res(2).and_then(|raw| {
         serde_json::from_str::<JsonObject<ElBlockResult>>(raw.get())
             .map(|JsonObject(block)| block)
-            .map_err(|e| HealthError::Decode(e.to_string()))
+            .map_err(|e| HealthError::Decode(Arc::from(e.to_string())))
     });
 
     Ok(ElBatchResult {
@@ -1045,10 +1194,10 @@ struct ClEnvelope<T> {
     data: JsonObject<T>,
 }
 
-fn parse_cl_response<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+fn parse_cl_response<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ProbeError> {
     serde_json::from_slice::<JsonObject<ClEnvelope<T>>>(body)
         .map(|JsonObject(envelope)| envelope.data.0)
-        .map_err(|e| format!("decode: {e}"))
+        .map_err(|e| Arc::from(format!("decode: {e}")))
 }
 
 fn decimal_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
@@ -1079,11 +1228,11 @@ fn hex_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, 
     deserializer.deserialize_str(Hex)
 }
 
-async fn cl_syncing_status(state: &AppState) -> Result<ClStatus, String> {
+async fn cl_syncing_status(state: &AppState) -> Result<ClStatus, ProbeError> {
     cl_get_json(state, &state.cl_syncing_uri).await
 }
 
-async fn cl_peer_count(state: &AppState) -> Result<u64, String> {
+async fn cl_peer_count(state: &AppState) -> Result<u64, ProbeError> {
     #[derive(serde::Deserialize)]
     struct Peers {
         #[serde(deserialize_with = "decimal_string")]
@@ -1096,15 +1245,20 @@ async fn cl_peer_count(state: &AppState) -> Result<u64, String> {
 async fn cl_get_json<T: serde::de::DeserializeOwned>(
     state: &AppState,
     uri: &Uri,
-) -> Result<T, String> {
+) -> Result<T, ProbeError> {
     let req = Request::builder()
         .method(Method::GET)
         .uri(uri.clone())
         .body(box_full(Full::new(Bytes::new())))
-        .map_err(|e| e.to_string())?;
-    let body = fetch_bytes(state, req, &state.client, state.cl_tls_version.as_ref())
-        .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Arc::from(e.to_string()))?;
+    let body = fetch_bytes(
+        state,
+        req,
+        UpstreamClient::Standard(&state.client),
+        state.cl_transport.tls_observer(),
+    )
+    .await
+    .map_err(HealthError::into_probe_error)?;
     parse_cl_response(&body)
 }
 
@@ -1203,14 +1357,14 @@ mod tests {
                 cl_syncing_uri: url.parse().unwrap(),
                 cl_peer_count_uri: url.parse().unwrap(),
                 cfg,
-                client: crate::proxy::build_client(false),
-                el_h2_client: crate::proxy::build_client(true),
+                client: crate::proxy::build_client(),
                 el_transport: ElTransport::confirmed_cleartext(prefer_h2),
-                cl_tls_version: None,
+                cl_transport: ClTransport::CleartextH1,
                 otel_enabled: false,
                 cl_genesis_time: 0,
                 cl_seconds_per_slot: 12,
-                probe,
+                conn_limit: None,
+                health: HealthSource::Polled(probe),
             };
             let result = el_batch_detect(&state).await;
             assert_eq!(state.el_transport.uses_h2c_client(), expected_h2);
@@ -1546,11 +1700,11 @@ mod tests {
     #[test]
     fn snapshot_records_errors_and_omits_values_on_failure() {
         let snap = build_snapshot(
-            &Err("timeout".to_string()),
-            &Err("http 500".to_string()),
-            &Err("timeout".to_string()),
-            &Err("http 404".to_string()),
-            &Err("http 404".to_string()),
+            &Err("timeout".into()),
+            &Err("http 500".into()),
+            &Err("timeout".into()),
+            &Err("http 404".into()),
+            &Err("http 404".into()),
             1000,
             12,
             1300,
@@ -1570,10 +1724,10 @@ mod tests {
                 current_block: 0x10,
                 highest_block: 0x20,
             }),
-            &Err("skip".to_string()),
-            &Err("skip".to_string()),
-            &Err("skip".to_string()),
-            &Err("skip".to_string()),
+            &Err("skip".into()),
+            &Err("skip".into()),
+            &Err("skip".into()),
+            &Err("skip".into()),
             0,
             12,
             1300,
@@ -1621,32 +1775,32 @@ mod tests {
 
     #[test]
     fn node_health_returns_206_only_when_both_layers_reachable_and_syncing() {
-        let synced_el = Ok(ElSyncingResult::Synced(false));
-        let syncing_el = Ok(ElSyncingResult::Syncing {
+        let synced_el = ElSyncingResult::Synced(false);
+        let syncing_el = ElSyncingResult::Syncing {
             current_block: 10,
             highest_block: 20,
-        });
-        let synced_cl = Ok(ClStatus {
+        };
+        let synced_cl = ClStatus {
             head_slot: 100,
             sync_distance: 0,
             is_syncing: false,
-        });
-        let syncing_cl = Ok(ClStatus {
+        };
+        let syncing_cl = ClStatus {
             head_slot: 50,
             sync_distance: 50,
             is_syncing: true,
-        });
-        let ok_block = Ok(ElBlockResult {
+        };
+        let ok_block = ElBlockResult {
             number: 10,
             timestamp: 1000,
-        });
+        };
 
         // 1. Ready -> 200 OK
         let ready_probe = Probe {
-            el_syncing: synced_el.clone(),
+            el_syncing: Ok(synced_el),
             el_peers: Ok(10),
-            el_block: ok_block.clone(),
-            cl_status: synced_cl.clone(),
+            el_block: Ok(ok_block),
+            cl_status: Ok(synced_cl),
             cl_peers: Ok(10),
         };
         assert_eq!(
@@ -1656,10 +1810,10 @@ mod tests {
 
         // 2. EL syncing + CL reachable -> 206 Partial Content
         let el_sync_probe = Probe {
-            el_syncing: syncing_el.clone(),
+            el_syncing: Ok(syncing_el),
             el_peers: Ok(10),
-            el_block: ok_block.clone(),
-            cl_status: synced_cl.clone(),
+            el_block: Ok(ok_block),
+            cl_status: Ok(synced_cl),
             cl_peers: Ok(10),
         };
         assert_eq!(
@@ -1673,9 +1827,9 @@ mod tests {
 
         // 3. EL syncing + CL down -> 503 Service Unavailable (must NOT mask CL crash as 206)
         let cl_down_probe = Probe {
-            el_syncing: syncing_el,
+            el_syncing: Ok(syncing_el),
             el_peers: Ok(10),
-            el_block: ok_block.clone(),
+            el_block: Ok(ok_block),
             cl_status: Err("connection refused".into()),
             cl_peers: Err("connection refused".into()),
         };
@@ -1689,7 +1843,7 @@ mod tests {
             el_syncing: Err("timeout".into()),
             el_peers: Err("timeout".into()),
             el_block: Err("timeout".into()),
-            cl_status: syncing_cl.clone(),
+            cl_status: Ok(syncing_cl),
             cl_peers: Ok(10),
         };
         assert_eq!(
@@ -1699,10 +1853,10 @@ mod tests {
 
         // 5. CL syncing + EL reachable under --readyz-strict, unless EL block RPC itself failed
         let cl_sync_probe = Probe {
-            el_syncing: synced_el.clone(),
+            el_syncing: Ok(synced_el),
             el_peers: Ok(10),
-            el_block: ok_block.clone(),
-            cl_status: syncing_cl.clone(),
+            el_block: Ok(ok_block),
+            cl_status: Ok(syncing_cl),
             cl_peers: Ok(10),
         };
         assert_eq!(
@@ -1720,10 +1874,10 @@ mod tests {
 
         // 6. Both layers report not-syncing, but --readyz-strict failed freshness (stale/halted) -> 503
         let strict_stale_probe = Probe {
-            el_syncing: synced_el,
+            el_syncing: Ok(synced_el),
             el_peers: Ok(10),
-            el_block: ok_block,
-            cl_status: synced_cl,
+            el_block: Ok(ok_block),
+            cl_status: Ok(synced_cl),
             cl_peers: Ok(10),
         };
         assert_eq!(
@@ -1788,14 +1942,14 @@ mod tests {
             cl_syncing_uri: url.parse().unwrap(),
             cl_peer_count_uri: url.parse().unwrap(),
             cfg,
-            client: crate::proxy::build_client(false),
-            el_h2_client: crate::proxy::build_client(true),
+            client: crate::proxy::build_client(),
             el_transport: ElTransport::new(false, false),
-            cl_tls_version: None,
+            cl_transport: ClTransport::CleartextH1,
             otel_enabled: false,
             cl_genesis_time: 0,
             cl_seconds_per_slot: 12,
-            probe,
+            conn_limit: None,
+            health: HealthSource::Polled(probe),
         };
 
         // Case A: h1-only upstream -> H2C_INITIAL -> H1_VERIFY_ONCE -> H1_CONFIRMED.
@@ -1807,8 +1961,8 @@ mod tests {
 
         // Case B: simulate a confirmed h2c upstream hitting a transient h2c rejection
         // during restart, then recovering h2c on the verify-once poll.
-        if let ElTransport::AdaptiveH2c(ref m) = state.el_transport {
-            m.store(ElTransport::H2C_CONFIRMED, Ordering::SeqCst);
+        if let ElTransport::AdaptiveH2c { ref mode, .. } = state.el_transport {
+            mode.store(ElTransport::H2C_CONFIRMED, Ordering::SeqCst);
         }
         assert!(el_batch_detect(&state).await.syncing.is_ok());
         assert_eq!(state.el_transport.label(), "http/1.1"); // fell back to H1_VERIFY_ONCE
@@ -1818,5 +1972,20 @@ mod tests {
         assert_eq!(state.el_transport.label(), "h2c"); // self-healed back to H2C_CONFIRMED!
 
         server.abort();
+    }
+
+    #[test]
+    fn observed_http_version_distinguishes_unobserved_startup_label() {
+        let obs = ObservedHttpVersion::new();
+        assert_eq!(obs.startup_label(), "HTTPS (ALPN)");
+        assert_eq!(obs.label(), "http/1.1");
+
+        obs.record(Version::HTTP_11);
+        assert_eq!(obs.startup_label(), "HTTP/1.1 (TLS)");
+        assert_eq!(obs.label(), "http/1.1");
+
+        obs.record(Version::HTTP_2);
+        assert_eq!(obs.startup_label(), "HTTP/2 (TLS)");
+        assert_eq!(obs.label(), "h2");
     }
 }

@@ -225,17 +225,26 @@ pub(crate) struct ValidatedConfig {
 }
 
 impl Config {
-    pub fn resolve_cl_genesis_time(&self) -> Result<u64, &'static str> {
-        self.cl_genesis_time
-            .or_else(|| self.network.preset_genesis_time())
-            .ok_or("--network custom requires --cl-genesis-time (use 0 to disable slot-age check)")
+    pub const fn resolve_cl_genesis_time(&self) -> Result<u64, &'static str> {
+        match self.cl_genesis_time {
+            Some(t) => Ok(t),
+            None => match self.network.preset_genesis_time() {
+                Some(t) => Ok(t),
+                None => Err(
+                    "--network custom requires --cl-genesis-time (use 0 to disable slot-age check)",
+                ),
+            },
+        }
     }
 
-    pub fn resolve_cl_seconds_per_slot(&self) -> Result<u64, &'static str> {
-        let secs = self
-            .cl_seconds_per_slot
-            .or_else(|| self.network.preset_seconds_per_slot())
-            .ok_or("--network custom requires --cl-seconds-per-slot")?;
+    pub const fn resolve_cl_seconds_per_slot(&self) -> Result<u64, &'static str> {
+        let secs = match self.cl_seconds_per_slot {
+            Some(s) => s,
+            None => match self.network.preset_seconds_per_slot() {
+                Some(s) => s,
+                None => return Err("--network custom requires --cl-seconds-per-slot"),
+            },
+        };
         if secs == 0 {
             return Err("cl-seconds-per-slot must be at least 1");
         }
@@ -248,8 +257,15 @@ impl Config {
     }
 
     pub(crate) fn parse_validated(&self) -> Result<ValidatedConfig, BoxError> {
-        if self.listen.is_empty() {
+        if self.listen.is_empty() || self.listen.iter().any(|addr| addr.trim().is_empty()) {
             return Err("no listen addresses configured".into());
+        }
+        if self.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "max-connections must be at most {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )
+            .into());
         }
         if self.health_poll_interval.is_zero() {
             return Err("health-poll-interval must be at least 1 second".into());
@@ -270,6 +286,10 @@ impl Config {
             .as_deref()
             .map(|u| HttpUpstream::parse("--cl-mev-relay-url", u))
             .transpose()?;
+        #[cfg(feature = "otel")]
+        if let Some(ref ep) = self.otel_endpoint {
+            crate::otel::validate_endpoint(ep)?;
+        }
         Ok(ValidatedConfig {
             el_http,
             el_ws,
@@ -558,7 +578,15 @@ mod tests {
         ]);
         assert!(zero_optional.validate().is_ok());
 
+        let max_permits_overflow = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
         for (flag, val, expected_substr) in [
+            ("--listen", "", "listen"),
+            ("--listen", "   ", "listen"),
+            (
+                "--max-connections",
+                max_permits_overflow.as_str(),
+                "max-connections",
+            ),
             ("--health-poll-interval", "0", "health-poll-interval"),
             ("--health-timeout", "0", "health-timeout"),
             ("--proxy-timeout", "0", "proxy-timeout"),
@@ -571,6 +599,8 @@ mod tests {
                 "wss://127.0.0.1:18550",
                 "--cl-mev-relay-url",
             ),
+            #[cfg(feature = "otel")]
+            ("--otel-endpoint", "http://:4318", "--otel-endpoint"),
         ] {
             let err = parse(&[flag, val])
                 .validate()

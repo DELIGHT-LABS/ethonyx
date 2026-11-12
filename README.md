@@ -134,16 +134,22 @@ Subprotocol offers from all request header lines are combined, and the selected
 protocol is relayed from the upstream. Unsupported extensions, including
 compression, are not negotiated; unsolicited extension responses are rejected.
 Frames remain limited to 16 MiB and complete messages to 64 MiB, including
-fragmented messages. The single-task `tokio::select!` relay reads in 8 KiB chunks
-with frame storage that grows for larger frames and uses 16 KiB write buffers
-with no split-sink lock; hop-by-hop `Ping` frames flush their local `Pong`
-immediately without forwarding `Ping` or duplicating `Pong` across hops. Tungstenite
-continues to validate masking, UTF-8, control frames, and upstream handshakes.
+fragmented messages. The single-task non-blocking full-duplex `poll_fn` relay reads
+in 8 KiB chunks with frame storage that grows for larger frames and uses 16 KiB
+write buffers with independent directional backpressure and no split-sink lock;
+hop-by-hop `Ping` frames flush their local `Pong` immediately without forwarding
+`Ping` or duplicating `Pong` across hops. Tungstenite continues to validate
+masking, UTF-8, control frames, and upstream handshakes.
 
 Inbound connections are bounded by `--max-connections` (`ETHONYX_MAX_CONNECTIONS`,
-default `4096`, `0` = unlimited) across HTTP/1.1, HTTP/2 (`max_concurrent_streams = 256`,
-`keep_alive_interval = 30s`), and upgraded WebSockets, with a 15-second HTTP/1.1
-header read timeout. Upstream response bodies are guarded by per-chunk idle
+default `4096`, `0` = unlimited) across all `--listen` addresses (including probe
+endpoints), HTTP/1.1, HTTP/2 (`max_concurrent_streams = 256`,
+`keep_alive_interval = 30s`), HTTP/1.1 upgraded WebSockets, and concurrent HTTP/2
+Extended `CONNECT` WebSocket streams (`503 Service Unavailable` when saturated).
+Newly accepted sockets enforce a 15-second initial protocol-preface read timeout
+(evicting silent or partial HTTP/2-preface sockets), followed by a 65-second
+HTTP/1.1 header / keep-alive idle timeout (> standard 60-second LB and client pool
+idle timeouts). Upstream response bodies are guarded by per-chunk idle
 timeouts: `--proxy-timeout` (default `60s`) for standard responses and
 `--sse-idle-timeout` (`ETHONYX_SSE_IDLE_TIMEOUT`, default `900s`, `0` = disabled)
 for `text/event-stream` Beacon event streams.
@@ -200,8 +206,8 @@ ethonyx \
 ETHONYX_LISTEN=0.0.0.0:8547,127.0.0.1:9547 ethonyx ...
 ```
 
-Each listener runs an independent accept loop on the tokio runtime, so cores
-saturate naturally without cross-listener locks.
+All listeners share a single fair round-robin accept loop and `--max-connections`
+permit pool, so an idle listener never withholds capacity from an active port.
 
 ## Logging
 
@@ -210,15 +216,17 @@ Structured JSON to stdout. Levels follow a sidecar-appropriate discipline:
 | Level   | What                                                                |
 |---------|---------------------------------------------------------------------|
 | `error` | genuine internal faults                                             |
-| `warn`  | readiness became **not-ready** (LB will deroute); `accept()` failed |
+| `warn`  | readiness became **not-ready** (LB will deroute); upstream `502` proxy / WS dial errors; connection-limit saturation; `accept()` failed |
 | `info`  | lifecycle (start w/ version / listen / shutdown), readiness **recovered**, the EL upstream h2c↔h1 switch |
-| `debug` | routine activity: per-request proxy / WS outcomes, each health poll, connection errors |
+| `debug` | routine activity: each health poll, client connection/body read errors, WS disconnects |
 | `trace` | fine-grained internal flow (request routing, connection accept / close) |
 
 `info` is reserved for notable, low-frequency events, so a healthy sidecar is
 nearly silent between state changes — request rates and latencies belong in
-metrics, not one log line per request. Routine upstream / client failures (a 502,
-a dropped WebSocket) are `debug`, not `error` — for a sidecar they are everyday.
+metrics, not one log line per request. Upstream `502` proxy / WebSocket dial
+failures and connection-limit saturation transitions emit `warn` so degraded
+upstream connectivity is visible under the default `info` level, while routine
+client disconnects stay `debug`.
 Readiness *changes* are logged once by the poller (not per probe).
 
 The startup line carries two version fields: `version` (the crate version, e.g.
@@ -262,6 +270,7 @@ ethonyx exports core application and proxy metrics on `GET /metrics`.
 
 The following metrics are exposed:
 - `ethonyx_active_connections`: Number of currently active client connections (labeled by `protocol` as `tcp` or `ws`).
+- `ethonyx_connection_limit_saturated_total`: Total number of inbound TCP accepts queued or HTTP/2 Extended `CONNECT` WebSocket streams rejected due to `--max-connections` saturation.
 - `ethonyx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`).
 - `ethonyx_proxy_request_duration_seconds`: Latency histogram of upstream proxied requests (labeled by `upstream`).
 - `ethonyx_upstream_peers`: Number of peers reported by upstream nodes (labeled by `layer` as `el` or `cl`).

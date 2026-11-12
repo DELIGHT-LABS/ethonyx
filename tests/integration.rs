@@ -4311,3 +4311,238 @@ async fn traceparent_survives_connection_nomination_and_propagates_to_websocket(
 
     ws_server.await.unwrap();
 }
+
+#[tokio::test]
+async fn multi_listener_max_connections_fairness_and_h2_extended_connect_cap() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_url = format!("ws://{}", ws_listener.local_addr().unwrap());
+    let ws_dials = Arc::new(AtomicUsize::new(0));
+    let ws_dials_srv = ws_dials.clone();
+    let ws_server = tokio::spawn(async move {
+        while let Ok((sock, _)) = ws_listener.accept().await {
+            ws_dials_srv.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut ws) = accept_async(sock).await {
+                    while let Some(Ok(msg)) = ws.next().await {
+                        if msg.is_close() {
+                            let _ = ws.close(None).await;
+                            break;
+                        }
+                        if ws.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let second_port = pick_port().await;
+    let second_listen = format!("127.0.0.1:{second_port}");
+    let proxy = EthonyxHandle::start(&[
+        "--listen",
+        &second_listen,
+        "--trust-upstream",
+        "--max-connections",
+        "1",
+        "--el-ws-url",
+        &ws_url,
+    ])
+    .await;
+
+    // 1. Even with --max-connections 1 and an idle second listener, repeated
+    // connections on either port succeed without permit starvation.
+    for port in [proxy.port, proxy.port, second_port, proxy.port] {
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        sock.write_all(b"GET /livez HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        sock.read_to_end(&mut buf).await.unwrap();
+        assert!(buf.starts_with(b"HTTP/1.1 200 OK"));
+    }
+
+    // 2. Over a single HTTP/2 connection under --max-connections 1:
+    //    - 1st Extended CONNECT WS stream reuses the H2 connection's permit (200 OK).
+    //    - 2nd concurrent Extended CONNECT WS stream is rejected with 503 before dialing.
+    //    - Closing the 1st stream frees the slot for reuse.
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, TestBody>(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let h2_conn = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let make_ext_connect = |port: u16| {
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("http://127.0.0.1:{port}/"))
+            .header("sec-websocket-version", "13")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+        req
+    };
+
+    let resp1 = sender
+        .send_request(make_ext_connect(proxy.port))
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let upgraded1 = hyper::upgrade::on(resp1).await.unwrap();
+    let mut ws1 = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(upgraded1),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    ws1.send(Message::Text("hello".into())).await.unwrap();
+    assert_eq!(
+        ws1.next().await.unwrap().unwrap(),
+        Message::Text("hello".into())
+    );
+    assert_eq!(ws_dials.load(Ordering::SeqCst), 1);
+
+    let resp2 = sender
+        .send_request(make_ext_connect(proxy.port))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(resp2);
+    assert_eq!(
+        ws_dials.load(Ordering::SeqCst),
+        1,
+        "saturated stream must not dial upstream"
+    );
+
+    ws1.close(None).await.unwrap();
+    while let Some(Ok(msg)) = ws1.next().await {
+        if msg.is_close() {
+            break;
+        }
+    }
+    drop(ws1);
+
+    // Wait briefly for the spawned bridge task to drop its IncludedH2 permit.
+    let mut reused_ok = false;
+    for _ in 0..20 {
+        let resp3 = sender
+            .send_request(make_ext_connect(proxy.port))
+            .await
+            .unwrap();
+        if resp3.status() == StatusCode::OK {
+            let upgraded3 = hyper::upgrade::on(resp3).await.unwrap();
+            drop(upgraded3);
+            reused_ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(reused_ok, "closed H2 WS stream must release slot for reuse");
+
+    drop(sender);
+    h2_conn.abort();
+    let _ = h2_conn.await;
+
+    // Saturation metric is exposed on /metrics once the H2 TCP connection closes.
+    let c = client();
+    let metrics_resp = tokio::time::timeout(
+        Duration::from_secs(3),
+        c.get(proxy.url("/metrics").parse().unwrap()),
+    )
+    .await
+    .expect("closing H2 connection must release --max-connections 1 permit")
+    .unwrap();
+    let metrics_text = String::from_utf8(
+        metrics_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        metrics_text.contains("ethonyx_connection_limit_saturated_total"),
+        "expected saturation counter in /metrics, got:\n{metrics_text}"
+    );
+
+    proxy.shutdown().await;
+    ws_server.abort();
+}
+
+#[tokio::test]
+async fn uppercase_ws_scheme_and_non_origin_targets_work_safely() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let el = MockServer::start(ok_handler()).await;
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uppercase_ws_url = format!("WS://{}/ws", ws_listener.local_addr().unwrap());
+    let ws_server = tokio::spawn(async move {
+        let (sock, _) = ws_listener.accept().await.unwrap();
+        let mut ws = accept_async(sock).await.unwrap();
+        if let Some(Ok(msg)) = ws.next().await {
+            let _ = ws.send(msg).await;
+        }
+        let _ = ws.close(None).await;
+    });
+
+    let scoped_el = format!("{}/v3/SECRET", el.url);
+    let proxy = EthonyxHandle::start(&[
+        "--trust-upstream",
+        "--el-http-url",
+        &scoped_el,
+        "--el-ws-url",
+        &uppercase_ws_url,
+    ])
+    .await;
+
+    // 1. Uppercase WS:// scheme connects and echoes cleanly.
+    let (mut ws, resp) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .expect("uppercase WS:// upstream must succeed");
+    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+    ws.send(Message::Text("upper-ok".into())).await.unwrap();
+    assert_eq!(
+        ws.next().await.unwrap().unwrap(),
+        Message::Text("upper-ok".into())
+    );
+    let _ = ws.close(None).await;
+
+    // 2. Asterisk-form `OPTIONS *` and authority-form `CONNECT host:port` return 400
+    // locally without forwarding or corrupting `/v3/SECRET`.
+    for raw_req in [
+        "OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    ] {
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+            .await
+            .unwrap();
+        sock.write_all(raw_req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        sock.read_to_end(&mut buf).await.unwrap();
+        assert!(
+            buf.starts_with(b"HTTP/1.1 400 Bad Request"),
+            "expected 400 for {raw_req:?}, got: {}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+    assert!(
+        el.received().is_empty(),
+        "non-origin targets must never reach upstream"
+    );
+
+    proxy.shutdown().await;
+    ws_server.await.unwrap();
+}

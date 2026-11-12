@@ -3,15 +3,23 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 
 const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");
+static TRACEPARENT: http::HeaderName = http::HeaderName::from_static("traceparent");
+static TRACESTATE: http::HeaderName = http::HeaderName::from_static("tracestate");
 
 struct HeaderMapCarrier<'a>(&'a mut http::HeaderMap);
 
 impl<'a> opentelemetry::propagation::Injector for HeaderMapCarrier<'a> {
     fn set(&mut self, key: &str, value: String) {
-        if let (Ok(name), Ok(val)) = (
-            http::HeaderName::from_bytes(key.as_bytes()),
-            http::HeaderValue::from_str(&value),
-        ) {
+        let name = if key.eq_ignore_ascii_case("traceparent") {
+            TRACEPARENT.clone()
+        } else if key.eq_ignore_ascii_case("tracestate") {
+            TRACESTATE.clone()
+        } else if let Ok(custom) = http::HeaderName::from_bytes(key.as_bytes()) {
+            custom
+        } else {
+            return;
+        };
+        if let Ok(val) = http::HeaderValue::try_from(value) {
             self.0.insert(name, val);
         }
     }
@@ -21,11 +29,8 @@ struct HeaderMapCarrierRef<'a>(&'a http::HeaderMap);
 
 impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrierRef<'a> {
     fn get(&self, key: &str) -> Option<&str> {
-        let name = http::HeaderName::from_bytes(key.as_bytes()).ok()?;
-        if crate::headers::is_connection_nominated(self.0, &name) {
-            return None;
-        }
-        self.0.get(name).and_then(|v| v.to_str().ok())
+        let val = self.0.get(key)?.to_str().ok()?;
+        (!crate::headers::is_connection_nominated(self.0, key)).then_some(val)
     }
 
     fn keys(&self) -> Vec<&str> {
@@ -94,16 +99,58 @@ pub async fn start(endpoint: Option<&str>) -> Result<Option<Telemetry>, crate::B
         .map(Some)
 }
 
-fn signal_endpoint(endpoint: &str, signal: &str) -> Result<String, crate::BoxError> {
-    let uri: http::Uri = endpoint.parse()?;
-    if !matches!(uri.scheme_str(), Some("http" | "https"))
-        || uri.authority().is_none()
-        || uri.query().is_some()
-        || endpoint.contains('#')
-    {
-        return Err("OTLP endpoint must be an HTTP(S) base URL without a query or fragment".into());
+pub(crate) fn validate_endpoint(
+    endpoint: &str,
+) -> Result<(&'static str, http::Uri), crate::BoxError> {
+    use crate::upstream::{RedactedUrl, validate_authority};
+
+    if endpoint.contains('#') {
+        return Err(format!(
+            "invalid --otel-endpoint ({}): OTLP endpoint must not contain a #fragment",
+            RedactedUrl(endpoint)
+        )
+        .into());
     }
-    Ok(format!("{}/v1/{signal}", endpoint.trim_end_matches('/')))
+    let uri: http::Uri = endpoint.parse().map_err(|_| {
+        format!(
+            "invalid --otel-endpoint ({}): malformed URI",
+            RedactedUrl(endpoint)
+        )
+    })?;
+    let scheme = match uri.scheme_str() {
+        Some(s) if s.eq_ignore_ascii_case("http") => "http",
+        Some(s) if s.eq_ignore_ascii_case("https") => "https",
+        _ => {
+            return Err(format!(
+                "invalid --otel-endpoint ({}): OTLP endpoint must be an HTTP(S) base URL without a query or fragment",
+                RedactedUrl(endpoint)
+            )
+            .into());
+        }
+    };
+    if uri.query().is_some() {
+        return Err(format!(
+            "invalid --otel-endpoint ({}): OTLP endpoint must be an HTTP(S) base URL without a query or fragment",
+            RedactedUrl(endpoint)
+        )
+        .into());
+    }
+    let Some(authority) = uri.authority() else {
+        return Err(format!(
+            "invalid --otel-endpoint ({}): missing host",
+            RedactedUrl(endpoint)
+        )
+        .into());
+    };
+    validate_authority("--otel-endpoint", endpoint, authority)?;
+    Ok((scheme, uri))
+}
+
+fn signal_endpoint(endpoint: &str, signal: &str) -> Result<String, crate::BoxError> {
+    let (scheme, uri) = validate_endpoint(endpoint)?;
+    let authority = uri.authority().expect("validated authority");
+    let prefix = uri.path().trim_end_matches('/');
+    Ok(format!("{scheme}://{authority}{prefix}/v1/{signal}"))
 }
 
 fn build_resource() -> Resource {
@@ -483,23 +530,37 @@ mod tests {
         for base in [
             "https://collector:4318/prefix",
             "https://collector:4318/prefix/",
+            "HTTP://collector:4318",
         ] {
+            let expected_scheme = if base.starts_with("HTTP:") {
+                "http://collector:4318"
+            } else {
+                "https://collector:4318/prefix"
+            };
             assert_eq!(
                 signal_endpoint(base, "traces").unwrap(),
-                "https://collector:4318/prefix/v1/traces"
+                format!("{expected_scheme}/v1/traces")
             );
             assert_eq!(
                 signal_endpoint(base, "metrics").unwrap(),
-                "https://collector:4318/prefix/v1/metrics"
+                format!("{expected_scheme}/v1/metrics")
             );
         }
         for invalid in [
             "collector:4318",
             "ftp://collector",
-            "http://collector?x=1",
-            "http://collector/#fragment",
+            "http://user:SECRET@collector:4318",
+            "http://:4318",
+            "http://collector:0",
+            "http://collector:99999",
+            "http://collector:",
+            "http://collector?x=SECRET",
+            "http://collector/#SECRET",
         ] {
-            assert!(signal_endpoint(invalid, "traces").is_err(), "{invalid}");
+            let err = signal_endpoint(invalid, "traces")
+                .expect_err(invalid)
+                .to_string();
+            assert!(!err.contains("SECRET"), "leaked secret in {err}");
         }
     }
 }
