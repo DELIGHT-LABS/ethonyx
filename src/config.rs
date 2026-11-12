@@ -1,10 +1,11 @@
 use std::fmt;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 
 use crate::BoxError;
-use crate::upstream::{HttpUpstream, RedactedUrl, WsUpstream};
+use crate::upstream::{HttpUpstream, RedactedUrl, WsUpstream, parse_canonical_port};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Network {
@@ -215,13 +216,81 @@ pub struct Config {
     pub otel_endpoint: Option<String>,
 }
 
+/// Validated beacon-chain slot timing (`None` when `--cl-genesis-time 0` disables slot-age checks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotClock {
+    genesis_time: NonZeroU64,
+    seconds_per_slot: NonZeroU64,
+}
+
+impl SlotClock {
+    pub(crate) const fn new(genesis_time: u64, seconds_per_slot: u64) -> Option<Self> {
+        match (
+            NonZeroU64::new(genesis_time),
+            NonZeroU64::new(seconds_per_slot),
+        ) {
+            (Some(genesis_time), Some(seconds_per_slot)) => Some(Self {
+                genesis_time,
+                seconds_per_slot,
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn slot_age(self, head_slot: u64, now: u64) -> u64 {
+        // Saturate: a garbage `head_slot` from upstream must not overflow-panic
+        // (debug) or wrap (release).
+        let expected = self
+            .genesis_time
+            .get()
+            .saturating_add(head_slot.saturating_mul(self.seconds_per_slot.get()));
+        now.saturating_sub(expected)
+    }
+}
+
 pub(crate) struct ValidatedConfig {
+    pub listen: Vec<Box<str>>,
     pub el_http: HttpUpstream,
     pub el_ws: WsUpstream,
     pub cl_beacon: HttpUpstream,
     pub cl_mev_relay: Option<HttpUpstream>,
-    pub cl_genesis_time: u64,
-    pub cl_seconds_per_slot: u64,
+    pub slot_clock: Option<SlotClock>,
+}
+
+fn validate_listen_addr(raw: &str) -> Result<&str, BoxError> {
+    let addr = raw.trim();
+    if addr.is_empty() {
+        return Err("no listen addresses configured".into());
+    }
+    let port_str = if let Some(rest) = addr.strip_prefix('[') {
+        let Some((ipv6, port_part)) = rest.split_once(']') else {
+            return Err(format!("invalid --listen address '{addr}': unclosed IPv6 bracket").into());
+        };
+        let Some(port_str) = port_part.strip_prefix(':') else {
+            return Err(format!("invalid --listen address '{addr}': expected [ipv6]:port").into());
+        };
+        if ipv6.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(format!("invalid --listen address '{addr}': invalid IPv6 host").into());
+        }
+        port_str
+    } else {
+        let Some((host, port_str)) = addr.rsplit_once(':') else {
+            return Err(format!("invalid --listen address '{addr}': expected host:port").into());
+        };
+        if host.is_empty()
+            || host.contains(':')
+            || host
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b == b'/' || b == b'@')
+        {
+            return Err(format!("invalid --listen address '{addr}': invalid host").into());
+        }
+        port_str
+    };
+    if parse_canonical_port(port_str, true).is_none() {
+        return Err(format!("invalid --listen address '{addr}': invalid port").into());
+    }
+    Ok(addr)
 }
 
 impl Config {
@@ -257,9 +326,14 @@ impl Config {
     }
 
     pub(crate) fn parse_validated(&self) -> Result<ValidatedConfig, BoxError> {
-        if self.listen.is_empty() || self.listen.iter().any(|addr| addr.trim().is_empty()) {
+        if self.listen.is_empty() {
             return Err("no listen addresses configured".into());
         }
+        let listen = self
+            .listen
+            .iter()
+            .map(|raw| validate_listen_addr(raw).map(Box::from))
+            .collect::<Result<Vec<_>, _>>()?;
         if self.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(format!(
                 "max-connections must be at most {}",
@@ -288,15 +362,15 @@ impl Config {
             .transpose()?;
         #[cfg(feature = "otel")]
         if let Some(ref ep) = self.otel_endpoint {
-            crate::otel::validate_endpoint(ep)?;
+            crate::otel::parse_endpoint(ep)?;
         }
         Ok(ValidatedConfig {
+            listen,
             el_http,
             el_ws,
             cl_beacon,
             cl_mev_relay,
-            cl_genesis_time,
-            cl_seconds_per_slot,
+            slot_clock: SlotClock::new(cl_genesis_time, cl_seconds_per_slot),
         })
     }
 }
@@ -578,10 +652,29 @@ mod tests {
         ]);
         assert!(zero_optional.validate().is_ok());
 
+        let trimmed_listen = parse(&["--listen", " 127.0.0.1:8547 , [::1]:8548 , localhost:0 "]);
+        let validated = trimmed_listen.parse_validated().unwrap();
+        assert_eq!(
+            validated
+                .listen
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            vec!["127.0.0.1:8547", "[::1]:8548", "localhost:0"]
+        );
+
         let max_permits_overflow = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
         for (flag, val, expected_substr) in [
             ("--listen", "", "listen"),
             ("--listen", "   ", "listen"),
+            ("--listen", "127.0.0.1", "--listen"),
+            ("--listen", "18823", "--listen"),
+            ("--listen", ":8547", "--listen"),
+            ("--listen", "[::1:8547", "--listen"),
+            ("--listen", "127.0.0.1:99999", "--listen"),
+            ("--listen", "127.0.0.1:+8547", "--listen"),
+            ("--listen", "127.0.0.1:0080", "--listen"),
+            ("--listen", "http://127.0.0.1:8547", "--listen"),
             (
                 "--max-connections",
                 max_permits_overflow.as_str(),

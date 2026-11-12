@@ -28,12 +28,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use hyper_util::server::conn::auto;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, TryAcquireError, watch};
+use tokio::sync::{TryAcquireError, watch};
 use tracing::{debug, info, trace, warn};
 
 use crate::state::AppState;
@@ -100,31 +100,21 @@ where
 
 async fn run_inner<F>(
     cfg: Config,
-    validated: config::ValidatedConfig,
+    mut validated: config::ValidatedConfig,
     shutdown: F,
     #[cfg(feature = "otel")] has_telemetry: bool,
 ) -> Result<(), BoxError>
 where
     F: Future<Output = ()> + Send,
 {
-    let config::ValidatedConfig {
-        el_http,
-        el_ws,
-        cl_beacon,
-        cl_mev_relay,
-        cl_genesis_time,
-        cl_seconds_per_slot,
-    } = validated;
-
-    // Install default rustls cryptoprovider to prevent panics during parallel tests
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let listen_addrs = std::mem::take(&mut validated.listen);
 
     let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
     let prometheus_recorder = prometheus_builder.build_recorder();
     let prometheus_handle = prometheus_recorder.handle();
 
     #[cfg(feature = "otel")]
-    let otel_enabled = has_telemetry || cfg.otel_endpoint.is_some();
+    let otel_enabled = has_telemetry;
     #[cfg(not(feature = "otel"))]
     let otel_enabled = false;
 
@@ -160,11 +150,6 @@ where
         "starting ethonyx"
     );
 
-    let client = proxy::build_client();
-    let cl_syncing_uri =
-        cl_beacon.rewrite_uri(http::Uri::from_static("/"), Some("/eth/v1/node/syncing"))?;
-    let cl_peer_count_uri =
-        cl_beacon.rewrite_uri(http::Uri::from_static("/"), Some("/eth/v1/node/peer_count"))?;
     let poll_interval = cfg.health_poll_interval;
     let shutdown_grace = cfg.shutdown_grace;
 
@@ -175,40 +160,24 @@ where
         (Some(tx), health::HealthSource::Polled(rx))
     };
     let (shutdown_tx, _) = watch::channel(None);
-    let conn_limit =
-        (cfg.max_connections > 0).then(|| Arc::new(Semaphore::new(cfg.max_connections)));
 
-    let el_transport = health::ElTransport::new(cfg.trust_upstream, el_http.is_tls());
-    let cl_transport = health::ClTransport::new(cl_beacon.is_tls());
-    let state = Arc::new(AppState {
-        cfg,
-        client,
-        el_transport,
-        cl_transport,
-        el_http,
-        el_ws,
-        cl_beacon,
-        cl_mev_relay,
-        cl_syncing_uri,
-        cl_peer_count_uri,
-        cl_genesis_time,
-        cl_seconds_per_slot,
-        otel_enabled,
-        conn_limit,
-        health,
-    });
+    let state = Arc::new(AppState::new(cfg, validated, otel_enabled, health)?);
 
+    let mut initial_degraded = false;
     if let Some(ref tx) = probe_tx {
         // Warm the health cache with one poll before serving, then refresh it in
         // the background so /healthz and /readyz read a snapshot instead of
         // hitting upstream on every probe.
         let first_probe = Arc::new(health::probe_once(&state).await);
-        let verdict = health::evaluate_verdict(&state, &first_probe);
-        health::update_metrics(&first_probe, verdict);
+        let eval = health::evaluate_readiness(&state, &first_probe);
+        health::update_metrics(&first_probe, eval);
+        initial_degraded = first_probe.has_errors();
         let _ = tx.send(first_probe);
     }
     let startup_msg = if state.cfg.trust_upstream {
         "upstreams configured (trusted)"
+    } else if initial_degraded {
+        "upstreams configured (initial probe degraded)"
     } else {
         "upstreams connected"
     };
@@ -222,9 +191,9 @@ where
         "{startup_msg}"
     );
 
-    let mut listeners = Vec::with_capacity(state.cfg.listen.len());
-    for addr in &state.cfg.listen {
-        let listener = TcpListener::bind(addr).await?;
+    let mut listeners = Vec::with_capacity(listen_addrs.len());
+    for addr in &listen_addrs {
+        let listener = TcpListener::bind(&**addr).await?;
         info!(listen = %addr, "listening");
         listeners.push(listener);
     }
@@ -341,13 +310,19 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<I> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetectedProto {
+    Http1,
+    Http2,
+}
+
 /// Bounds silent (`0`-byte) and partial HTTP/2-preface (`"PRI ..."`) sockets by
-/// `timeout` before handing off to `auto::Builder` (which has no preface timer).
+/// `timeout` and classifies HTTP/1 vs HTTP/2 in a single stack-only pass.
 async fn read_initial_preface<I: AsyncRead + Unpin>(
     mut stream: I,
     timeout: Duration,
     lifecycle: &mut lifecycle::Lifecycle,
-) -> Option<PrefixedIo<I>> {
+) -> Option<(DetectedProto, PrefixedIo<I>)> {
     let mut buf = [0u8; 64];
     let mut len = 0usize;
     let deadline = tokio::time::Instant::now() + timeout;
@@ -369,15 +344,160 @@ async fn read_initial_preface<I: AsyncRead + Unpin>(
         biased;
         _ = lifecycle.deadline() => None,
         res = tokio::time::timeout_at(deadline, read_preface) => match res {
-            Ok(Some(())) => Some(PrefixedIo {
-                inner: stream,
-                buf,
-                pos: 0,
-                len: len as u8,
-            }),
+            Ok(Some(())) => {
+                let proto = if len >= H2_PREFACE.len() && buf[..H2_PREFACE.len()] == *H2_PREFACE {
+                    DetectedProto::Http2
+                } else {
+                    DetectedProto::Http1
+                };
+                Some((
+                    proto,
+                    PrefixedIo {
+                        inner: stream,
+                        buf,
+                        pos: 0,
+                        len: len as u8,
+                    },
+                ))
+            }
             _ => None,
         },
     }
+}
+
+/// Pre-configured HTTP/1.1 and HTTP/2 server builders constructed once so
+/// accepted connections share `TokioTimer` handles without per-connection setup.
+#[derive(Clone)]
+struct ServerBuilders {
+    http1: http1::Builder,
+    http2: http2::Builder<lifecycle::Lifecycle>,
+}
+
+impl ServerBuilders {
+    fn new(lifecycle: lifecycle::Lifecycle) -> Self {
+        let mut http1 = http1::Builder::new();
+        http1
+            .timer(TokioTimer::new())
+            .header_read_timeout(Some(HTTP1_HEADER_READ_TIMEOUT));
+        let mut http2 = http2::Builder::new(lifecycle);
+        http2
+            .timer(TokioTimer::new())
+            .enable_connect_protocol()
+            .max_concurrent_streams(256)
+            .keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10));
+        Self { http1, http2 }
+    }
+}
+
+trait GracefulConn: Future<Output = hyper::Result<()>> {
+    fn initiate_graceful_shutdown(self: Pin<&mut Self>);
+}
+
+impl<I, B, S> GracefulConn for http1::UpgradeableConnection<I, S>
+where
+    S: hyper::service::HttpService<hyper::body::Incoming, ResBody = B>,
+    S::Error: Into<BoxError>,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    B: hyper::body::Body + 'static,
+    B::Error: Into<BoxError>,
+{
+    fn initiate_graceful_shutdown(self: Pin<&mut Self>) {
+        self.graceful_shutdown();
+    }
+}
+
+impl<I, B, S, E> GracefulConn for http2::Connection<I, S, E>
+where
+    S: hyper::service::HttpService<hyper::body::Incoming, ResBody = B>,
+    S::Error: Into<BoxError>,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin,
+    B: hyper::body::Body + 'static,
+    B::Error: Into<BoxError>,
+    E: hyper::rt::bounds::Http2ServerConnExec<S::Future, B>,
+{
+    fn initiate_graceful_shutdown(self: Pin<&mut Self>) {
+        self.graceful_shutdown();
+    }
+}
+
+async fn drive_graceful<C: GracefulConn>(
+    conn: C,
+    conn_lifecycle: &mut lifecycle::Lifecycle,
+    peer: std::net::SocketAddr,
+) {
+    tokio::pin!(conn);
+    tokio::select! {
+        res = conn.as_mut() => match res {
+            Ok(()) => trace!(%peer, "connection closed"),
+            Err(e) => debug!(error = %e, %peer, "connection closed"),
+        },
+        deadline = conn_lifecycle.deadline() => {
+            conn.as_mut().initiate_graceful_shutdown();
+            match tokio::time::timeout_at(deadline, conn).await {
+                Ok(Ok(())) => trace!(%peer, "connection closed after shutdown"),
+                Ok(Err(e)) => debug!(error = %e, %peer, "connection closed after shutdown"),
+                Err(_) => trace!(%peer, "connection drain deadline reached"),
+            }
+        }
+    }
+}
+
+async fn serve_detected<I, B, S>(
+    builders: &ServerBuilders,
+    proto: DetectedProto,
+    io: TokioIo<PrefixedIo<I>>,
+    svc: S,
+    conn_lifecycle: &mut lifecycle::Lifecycle,
+    peer: std::net::SocketAddr,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: hyper::service::Service<
+            http::Request<hyper::body::Incoming>,
+            Response = http::Response<B>,
+            Error = std::convert::Infallible,
+        >,
+    S::Future: Send + 'static,
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<BoxError>,
+{
+    match proto {
+        DetectedProto::Http1 => {
+            let conn = builders.http1.serve_connection(io, svc).with_upgrades();
+            drive_graceful(conn, conn_lifecycle, peer).await;
+        }
+        DetectedProto::Http2 => {
+            let conn = builders.http2.serve_connection(io, svc);
+            drive_graceful(conn, conn_lifecycle, peer).await;
+        }
+    }
+}
+
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+    state: Arc<AppState>,
+    mut conn_lifecycle: lifecycle::Lifecycle,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    builders: ServerBuilders,
+) {
+    let _guard = state.metrics.active_tcp();
+    let Some((proto, prefixed)) =
+        read_initial_preface(stream, INITIAL_READ_TIMEOUT, &mut conn_lifecycle).await
+    else {
+        trace!(%peer, "connection closed before protocol preface");
+        return;
+    };
+    let io = TokioIo::new(prefixed);
+    let connection = Arc::new(proxy::Connection::new(
+        state,
+        conn_lifecycle.clone(),
+        peer,
+        permit,
+    ));
+    let svc = service_fn(move |req| Arc::clone(&connection).dispatch(req));
+    serve_detected(&builders, proto, io, svc, &mut conn_lifecycle, peer).await;
 }
 
 async fn accept_loop(
@@ -388,128 +508,79 @@ async fn accept_loop(
     if listeners.is_empty() {
         return;
     }
+    let builders = ServerBuilders::new(lifecycle.clone());
     let mut next_idx = 0usize;
     let mut saturated = false;
     loop {
-        let permit = if let Some(ref sem) = state.conn_limit {
-            match sem.clone().try_acquire_owned() {
-                Ok(permit) => {
-                    saturated = false;
-                    Some(Arc::new(permit))
-                }
-                Err(TryAcquireError::Closed) => return,
-                Err(TryAcquireError::NoPermits) => {
-                    ::metrics::counter!("ethonyx_connection_limit_saturated_total").increment(1);
-                    if !saturated {
-                        saturated = true;
-                        warn!(
-                            max_connections = state.cfg.max_connections,
-                            "connection limit reached; queueing accepts"
-                        );
-                    }
+        let (stream, peer) = tokio::select! {
+            biased;
+            _ = lifecycle.deadline() => return,
+            accept = accept_round_robin(&listeners, &mut next_idx) => match accept {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(error = %e, "accept failed");
+                    // Back off so a persistent error (e.g. fd exhaustion)
+                    // doesn't busy-spin a core retrying immediately.
                     tokio::select! {
                         biased;
                         _ = lifecycle.deadline() => return,
-                        res = sem.clone().acquire_owned() => match res {
-                            Ok(permit) => Some(Arc::new(permit)),
-                            Err(_) => return,
-                        },
+                        () = tokio::time::sleep(Duration::from_millis(100)) => continue,
                     }
                 }
-            }
-        } else {
-            None
+            },
         };
-        tokio::select! {
-            biased;
-            _ = lifecycle.deadline() => return,
-            accept = accept_round_robin(&listeners, &mut next_idx) => {
-                let (stream, peer) = match accept {
-                    Ok(x) => x,
-                    Err(e) => {
-                        drop(permit);
-                        warn!(error = %e, "accept failed");
-                        // Back off so a persistent error (e.g. fd exhaustion)
-                        // doesn't busy-spin a core retrying immediately.
-                        tokio::select! {
-                            biased;
-                            _ = lifecycle.deadline() => return,
-                            () = tokio::time::sleep(Duration::from_millis(100)) => continue,
-                        }
-                    }
-                };
-                if let Err(e) = stream.set_nodelay(true) {
-                    debug!(error = %e, "set_nodelay failed");
-                }
-                let sock_ref = socket2::SockRef::from(&stream);
-                let keepalive = socket2::TcpKeepalive::new()
-                    .with_time(Duration::from_secs(60))
-                    .with_interval(Duration::from_secs(10));
-                if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-                    debug!(error = %e, "failed to set TCP keepalive");
-                }
-                // Connection lifecycle is fine-grained, high-frequency detail, so
-                // it lives at trace (accept/close) and on a dedicated `access_log`
-                // target (the negotiated protocol + first request line) rather
-                // than the main info log — which stays reserved for lifecycle and
-                // state changes. See the `access_log` config flag.
-                trace!(%peer, "connection accepted");
-                let state = state.clone();
-                let mut conn_lifecycle = lifecycle.clone();
-                tokio::spawn(async move {
-                    let _guard = crate::metrics::ActiveConnectionGuard::tcp();
-                    let Some(prefixed) =
-                        read_initial_preface(stream, INITIAL_READ_TIMEOUT, &mut conn_lifecycle)
-                            .await
-                    else {
-                        trace!(%peer, "connection closed before protocol preface");
-                        return;
-                    };
-                    let io = TokioIo::new(prefixed);
-                    let connection = Arc::new(proxy::Connection::new(
-                        state,
-                        conn_lifecycle.clone(),
-                        peer,
-                        permit,
-                    ));
-                    let svc = service_fn(move |req| connection.clone().dispatch(req));
-                    // Auto-detect HTTP/1 vs HTTP/2 (incl. cleartext h2c preface);
-                    // `_with_upgrades` keeps HTTP/1.1 WebSocket Upgrade working;
-                    // `enable_connect_protocol` advertises RFC 8441 Extended CONNECT
-                    // (HTTP/2 WebSocket).
-                    let mut builder = auto::Builder::new(conn_lifecycle.clone());
-                    builder
-                        .http1()
-                        .timer(TokioTimer::new())
-                        .header_read_timeout(HTTP1_HEADER_READ_TIMEOUT);
-                    builder
-                        .http2()
-                        .timer(TokioTimer::new())
-                        .enable_connect_protocol()
-                        .max_concurrent_streams(256)
-                        .keep_alive_interval(Duration::from_secs(30))
-                        .keep_alive_timeout(Duration::from_secs(10));
-                    let conn = builder.serve_connection_with_upgrades(io, svc);
-                    tokio::pin!(conn);
-                    tokio::select! {
-                        res = conn.as_mut() => {
-                            match res {
-                                Ok(()) => trace!(%peer, "connection closed"),
-                                Err(e) => debug!(error = %e, %peer, "connection closed"),
-                            }
-                        }
-                        deadline = conn_lifecycle.deadline() => {
-                            conn.as_mut().graceful_shutdown();
-                            match tokio::time::timeout_at(deadline, conn).await {
-                                Ok(Ok(())) => trace!(%peer, "connection closed after shutdown"),
-                                Ok(Err(e)) => debug!(error = %e, %peer, "connection closed after shutdown"),
-                                Err(_) => trace!(%peer, "connection drain deadline reached"),
-                            }
-                        }
-                    }
-                });
+        // Acquire a permit AFTER accepting an actual TCP connection so idle listeners
+        // never pre-hoard permits needed by HTTP/2 Extended CONNECT streams or inflate
+        // `ethonyx_connection_limit_saturated_total` before real contention occurs.
+        let permit = match state.conn_limit.clone().try_acquire_owned() {
+            Ok(permit) => {
+                saturated = false;
+                Arc::new(permit)
             }
+            Err(TryAcquireError::Closed) => return,
+            Err(TryAcquireError::NoPermits) => {
+                state.metrics.inc_saturated();
+                if !saturated {
+                    saturated = true;
+                    warn!(
+                        max_connections = state.cfg.max_connections,
+                        "connection limit reached; queueing accepts"
+                    );
+                }
+                tokio::select! {
+                    biased;
+                    _ = lifecycle.deadline() => return,
+                    res = state.conn_limit.clone().acquire_owned() => match res {
+                        Ok(permit) => Arc::new(permit),
+                        Err(_) => return,
+                    },
+                }
+            }
+        };
+        if let Err(e) = stream.set_nodelay(true) {
+            debug!(error = %e, "set_nodelay failed");
         }
+        let sock_ref = socket2::SockRef::from(&stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(10));
+        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+            debug!(error = %e, "failed to set TCP keepalive");
+        }
+        // Connection lifecycle is fine-grained, high-frequency detail, so
+        // it lives at trace (accept/close) and on a dedicated `access_log`
+        // target (the negotiated protocol + first request line) rather
+        // than the main info log — which stays reserved for lifecycle and
+        // state changes. See the `access_log` config flag.
+        trace!(%peer, "connection accepted");
+        tokio::spawn(serve_connection(
+            stream,
+            peer,
+            Arc::clone(&state),
+            lifecycle.clone(),
+            permit,
+            builders.clone(),
+        ));
     }
 }
 
@@ -548,6 +619,7 @@ fn status_to_static_str(status: u16) -> &'static str {
         408 => "408",
         409 => "409",
         413 => "413",
+        414 => "414",
         415 => "415",
         429 => "429",
         500 => "500",
@@ -585,6 +657,7 @@ mod tests {
         assert_eq!(status_to_static_str(404), "404");
         assert_eq!(status_to_static_str(408), "408");
         assert_eq!(status_to_static_str(413), "413");
+        assert_eq!(status_to_static_str(414), "414");
         assert_eq!(status_to_static_str(502), "502");
         // Edge case: Custom/unmapped status falls back to OTHER
         assert_eq!(status_to_static_str(418), "OTHER");
@@ -619,7 +692,7 @@ mod tests {
         assert!(silent_task.await.unwrap());
 
         // 2. Partial "PRI " H2-preface prefix socket ALSO times out at 15s instead of
-        // hanging forever inside auto::Builder.
+        // hanging forever waiting for the rest of the 24-byte preface.
         let (mut pri_client, pri_server) = tokio::io::duplex(256);
         pri_client.write_all(b"PRI ").await.unwrap();
         let mut lc2 = lifecycle.clone();
@@ -635,25 +708,38 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(pri_task.await.unwrap());
 
+        // 2b. Complete 24-byte HTTP/2 preface is classified as DetectedProto::Http2.
+        let (mut h2_client, h2_server) = tokio::io::duplex(256);
+        h2_client.write_all(H2_PREFACE).await.unwrap();
+        let mut lc_h2 = lifecycle.clone();
+        let (h2_proto, _) = read_initial_preface(h2_server, INITIAL_READ_TIMEOUT, &mut lc_h2)
+            .await
+            .expect("HTTP/2 preface");
+        assert_eq!(h2_proto, DetectedProto::Http2);
+
         // 3. HTTP/1.1 connection completes preface immediately, survives 30s idle (> 15s),
-        // and closes after 65s of keep-alive inactivity.
+        // and closes after 65s of keep-alive inactivity via `serve_detected`.
         let (mut h1_client, h1_server) = tokio::io::duplex(4096);
         let mut lc3 = lifecycle.clone();
+        let builders = ServerBuilders::new(lc3.clone());
+        let peer: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let server_task = tokio::spawn(async move {
-            let prefixed = read_initial_preface(h1_server, INITIAL_READ_TIMEOUT, &mut lc3)
+            let (proto, prefixed) = read_initial_preface(h1_server, INITIAL_READ_TIMEOUT, &mut lc3)
                 .await
                 .expect("HTTP/1.1 preface");
+            assert_eq!(proto, DetectedProto::Http1);
             let svc = service_fn(|_req| async {
                 Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
             });
-            let mut builder = auto::Builder::new(lc3);
-            builder
-                .http1()
-                .timer(TokioTimer::new())
-                .header_read_timeout(HTTP1_HEADER_READ_TIMEOUT);
-            let _ = builder
-                .serve_connection_with_upgrades(TokioIo::new(prefixed), svc)
-                .await;
+            serve_detected(
+                &builders,
+                proto,
+                TokioIo::new(prefixed),
+                svc,
+                &mut lc3,
+                peer,
+            )
+            .await;
         });
 
         h1_client

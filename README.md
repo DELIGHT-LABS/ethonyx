@@ -138,7 +138,10 @@ fragmented messages. The single-task non-blocking full-duplex `poll_fn` relay re
 in 8 KiB chunks with frame storage that grows for larger frames and uses 16 KiB
 write buffers with independent directional backpressure and no split-sink lock;
 hop-by-hop `Ping` frames flush their local `Pong` immediately without forwarding
-`Ping` or duplicating `Pong` across hops. Tungstenite continues to validate
+`Ping` or duplicating `Pong` across hops, and outbound relay sinks enforce
+progress-based stall deadlines (`--proxy-timeout` for data frames, `5s` when only
+a control reply is pending) that reset on actual socket byte writes while refusing
+extensions from queued trickle frames. Tungstenite continues to validate
 masking, UTF-8, control frames, and upstream handshakes.
 
 Inbound connections are bounded by `--max-connections` (`ETHONYX_MAX_CONNECTIONS`,
@@ -269,7 +272,7 @@ RUST_LOG=ethonyx=debug,access_log=info ethonyx ...
 ethonyx exports core application and proxy metrics on `GET /metrics`.
 
 The following metrics are exposed:
-- `ethonyx_active_connections`: Number of currently active client connections (labeled by `protocol` as `tcp` or `ws`).
+- `ethonyx_active_connections`: Number of currently active client connections (labeled by `protocol`: `tcp` tracks open inbound HTTP/1.1 and HTTP/2 TCP sessions until upgrade handoff or socket close, while `ws` tracks active upgraded HTTP/1.1 and HTTP/2 Extended `CONNECT` WebSocket relays).
 - `ethonyx_connection_limit_saturated_total`: Total number of inbound TCP accepts queued or HTTP/2 Extended `CONNECT` WebSocket streams rejected due to `--max-connections` saturation.
 - `ethonyx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`).
 - `ethonyx_proxy_request_duration_seconds`: Latency histogram of upstream proxied requests (labeled by `upstream`).

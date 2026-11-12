@@ -1,17 +1,16 @@
 //! WebSocket handshake and bounded full-duplex single-task relay. HTTP/1 and HTTP/2 share the same dial path.
-use crate::proxy::{BoxError, Connection, ResBody, box_full, text_response};
+use crate::lifecycle::LazyDeadline;
+use crate::proxy::{BoxError, Connection, ResBody, box_full, text_response, uri_too_long_response};
 use crate::rpc::{MockResult, mock_syncing};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use http::{Method, Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use std::collections::HashSet;
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::time::Sleep;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{
     Message,
@@ -114,10 +113,34 @@ fn is_upgrade_request<B>(req: &Request<B>) -> bool {
         && contains(req.headers(), http::header::UPGRADE, "websocket")
 }
 
+fn is_valid_subprotocol_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 // HeaderMap::get sees only one field line, as does Tungstenite's offer parser.
 // Preserve the complete ordered offer and validate each case-sensitive token.
 fn normalize_subprotocols(headers: &mut http::HeaderMap) -> Result<(), BoxError> {
     use http::header::SEC_WEBSOCKET_PROTOCOL;
+    let mut iter = headers.get_all(SEC_WEBSOCKET_PROTOCOL).iter();
+    let Some(first) = iter.next() else {
+        return Ok(());
+    };
+    if iter.next().is_none() && !first.as_bytes().contains(&b',') {
+        let raw = first.to_str()?;
+        let trimmed = raw.trim_matches([' ', '\t']);
+        if !is_valid_subprotocol_token(trimmed) {
+            return Err("invalid websocket subprotocol offer".into());
+        }
+        if trimmed.len() != raw.len() {
+            let val = http::HeaderValue::from_str(trimmed)?;
+            headers.insert(SEC_WEBSOCKET_PROTOCOL, val);
+        }
+        return Ok(());
+    }
+
     let mut protocols = String::new();
     // Borrow tokens from the original headers. The set only checks uniqueness;
     // appending below retains offer order and case without a quadratic scan.
@@ -125,12 +148,7 @@ fn normalize_subprotocols(headers: &mut http::HeaderMap) -> Result<(), BoxError>
     for value in headers.get_all(SEC_WEBSOCKET_PROTOCOL) {
         for token in value.to_str()?.split(',') {
             let token = token.trim_matches([' ', '\t']);
-            if token.is_empty()
-                || !token
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
-                || !seen.insert(token)
-            {
+            if !is_valid_subprotocol_token(token) || !seen.insert(token) {
                 return Err("invalid websocket subprotocol offer".into());
             }
             if !protocols.is_empty() {
@@ -153,7 +171,7 @@ fn build_ws_request(
     mut req: Request<()>,
     upstream: &crate::upstream::WsUpstream,
     mode: WsMode,
-) -> Result<Request<()>, BoxError> {
+) -> Result<Request<()>, http::Error> {
     let inbound_uri = std::mem::take(req.uri_mut());
     let uri = upstream.rewrite_uri(inbound_uri)?;
     req.headers_mut()
@@ -164,7 +182,7 @@ fn build_ws_request(
         let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
         req.headers_mut().insert(
             http::header::SEC_WEBSOCKET_KEY,
-            http::HeaderValue::try_from(key)?,
+            http::HeaderValue::try_from(key).expect("base64 key is valid header value"),
         );
     }
     *req.uri_mut() = uri;
@@ -201,21 +219,41 @@ pub(crate) async fn upgrade(
             ));
         }
     };
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    let Ok(ws_req) = build_ws_request(req, &state.el_ws, mode) else {
+        return Ok(uri_too_long_response());
+    };
     let Some(permit) = connection.acquire_ws_permit(mode) else {
         return Ok(text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "connection limit reached",
         ));
     };
-    let on_upgrade = hyper::upgrade::on(&mut req);
-    let ws_req = build_ws_request(req, &state.el_ws, mode)?;
     let io_timeout = state.cfg.proxy_timeout;
-    let (upstream_ws, mut upstream_response) = match tokio::time::timeout(
-        io_timeout,
-        tokio_tungstenite::connect_async_with_config(ws_req, Some(get_ws_config()), true),
-    )
-    .await
-    {
+    let dial = async {
+        let tcp =
+            tokio::net::TcpStream::connect((state.el_ws.dial_host(), state.el_ws.dial_port()))
+                .await
+                .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
+        if let Err(e) = tcp.set_nodelay(true) {
+            debug!(error = %e, "failed to set upstream WS TCP_NODELAY");
+        }
+        let sock_ref = socket2::SockRef::from(&tcp);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(10));
+        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+            debug!(error = %e, "failed to set upstream WS TCP keepalive");
+        }
+        tokio_tungstenite::client_async_tls_with_config(
+            ws_req,
+            WriteProgressIo::new(tcp),
+            Some(get_ws_config()),
+            Some(state.ws_tls.clone()),
+        )
+        .await
+    };
+    let (upstream_ws, mut upstream_response) = match tokio::time::timeout(io_timeout, dial).await {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             warn!(error = %e, "upstream ws connect failed");
@@ -248,7 +286,6 @@ pub(crate) async fn upgrade(
             "invalid upstream websocket negotiation",
         ));
     }
-    configure_ws_keepalive(&upstream_ws);
     // Tungstenite checks that the selected protocol was offered by the client.
     if let Some(protocol) = upstream_response
         .headers_mut()
@@ -260,12 +297,14 @@ pub(crate) async fn upgrade(
     }
     let lifecycle = connection.lifecycle.clone();
     let mock_enabled = state.cfg.mock_eth_syncing;
+    let state = Arc::clone(state);
     tokio::spawn(lifecycle.run(async move {
         let _permit = permit;
         match on_upgrade.await {
             Ok(upgraded) => {
+                let _ws_guard = state.metrics.active_ws();
                 let client_ws = WebSocketStream::from_raw_socket(
-                    TokioIo::new(upgraded),
+                    WriteProgressIo::new(TokioIo::new(upgraded)),
                     Role::Server,
                     Some(get_ws_config()),
                 )
@@ -276,6 +315,96 @@ pub(crate) async fn upgrade(
         }
     }));
     Ok(response.map(|()| box_full(http_body_util::Full::new(bytes::Bytes::new()))))
+}
+
+/// Tracks whether at least one byte was written to the underlying transport
+/// since the last stall check, distinguishing slow-but-progressing peers from
+/// genuinely stalled (`0`-byte) sockets.
+struct WriteProgressIo<I> {
+    inner: I,
+    progressed: bool,
+}
+
+impl<I> WriteProgressIo<I> {
+    const fn new(inner: I) -> Self {
+        Self {
+            inner,
+            progressed: false,
+        }
+    }
+}
+
+impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteProgressIo<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteProgressIo<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = poll
+            && n > 0
+        {
+            self.progressed = true;
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = poll
+            && n > 0
+        {
+            self.progressed = true;
+        }
+        poll
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+trait HasWriteProgress {
+    fn take_write_progress(&mut self) -> bool;
+}
+
+impl<I> HasWriteProgress for WriteProgressIo<I> {
+    fn take_write_progress(&mut self) -> bool {
+        std::mem::replace(&mut self.progressed, false)
+    }
+}
+
+impl<S: HasWriteProgress> HasWriteProgress for tokio_tungstenite::MaybeTlsStream<S> {
+    fn take_write_progress(&mut self) -> bool {
+        match self {
+            Self::Plain(s) => s.take_write_progress(),
+            Self::Rustls(tls) => tls.get_mut().0.take_write_progress(),
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
 }
 
 async fn send_bounded<S>(ws: &mut WebSocketStream<S>, msg: Message, timeout: Duration) -> bool
@@ -296,172 +425,259 @@ where
         .is_ok_and(|res| res.is_ok())
 }
 
+enum OutboundState {
+    Idle,
+    ControlFlush,
+    DataActive { queued: Option<Message> },
+}
+
+#[derive(Clone, Copy)]
+enum Side {
+    Client,
+    Upstream,
+}
+
+enum Stop {
+    Closed(Option<CloseFrame>),
+    Eof,
+    Failed,
+    Abort,
+}
+
 /// Non-blocking full-duplex WebSocket endpoint state with a 1-slot outbound
-/// backpressure queue and lazy stall timer.
+/// backpressure queue, 1-slot local mock-reply buffer, and progress-based stall timer.
 struct WsEndpoint<S> {
     ws: WebSocketStream<S>,
-    queued: Option<Message>,
-    needs_flush: bool,
-    write_deadline: Option<Pin<Box<Sleep>>>,
-    timer_armed: bool,
-    pending_timeout: Duration,
+    outbound: OutboundState,
+    local_reply: Option<Message>,
+    deadline: LazyDeadline,
+    io_timeout: Duration,
 }
 
 impl<S> WsEndpoint<S>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
 {
-    const fn new(ws: WebSocketStream<S>, default_timeout: Duration) -> Self {
+    const fn new(ws: WebSocketStream<S>, io_timeout: Duration) -> Self {
         Self {
             ws,
-            queued: None,
-            needs_flush: false,
-            write_deadline: None,
-            timer_armed: false,
-            pending_timeout: default_timeout,
+            outbound: OutboundState::Idle,
+            local_reply: None,
+            deadline: LazyDeadline::new(),
+            io_timeout,
         }
     }
 
     const fn can_accept(&self) -> bool {
-        self.queued.is_none()
+        !matches!(self.outbound, OutboundState::DataActive { queued: Some(_) })
     }
 
-    fn enqueue(&mut self, msg: Message, timeout: Duration) {
-        debug_assert!(self.queued.is_none());
-        if !self.needs_flush {
-            self.pending_timeout = timeout;
+    fn enqueue_data(&mut self, msg: Message) {
+        debug_assert!(self.can_accept());
+        if matches!(self.outbound, OutboundState::ControlFlush) {
+            // Upgrade from 5s control flush to full data `io_timeout`.
+            self.deadline.disarm();
         }
-        self.queued = Some(msg);
+        self.outbound = OutboundState::DataActive { queued: Some(msg) };
     }
 
     fn request_control_flush(&mut self) {
-        if self.needs_flush || self.queued.is_some() {
-            self.pending_timeout = self.pending_timeout.min(WS_CONTROL_FLUSH_TIMEOUT);
-        } else {
-            self.pending_timeout = WS_CONTROL_FLUSH_TIMEOUT;
-        }
-        self.needs_flush = true;
-    }
-
-    fn poll_send_queued(&mut self, cx: &mut Context<'_>) -> Result<(), ()> {
-        if self.queued.is_none() {
-            return Ok(());
-        }
-        match Pin::new(&mut self.ws).poll_ready(cx) {
-            Poll::Ready(Ok(())) => {
-                let msg = self.queued.take().expect("queued checked");
-                Pin::new(&mut self.ws).start_send(msg).map_err(|_| ())?;
-                self.needs_flush = true;
-                Ok(())
-            }
-            Poll::Ready(Err(_)) => Err(()),
-            Poll::Pending => self.poll_write_timer(cx),
+        // Never downgrade an active data transfer's `io_timeout` to 5s on `Ping`.
+        if matches!(self.outbound, OutboundState::Idle) {
+            self.outbound = OutboundState::ControlFlush;
         }
     }
 
-    fn poll_flush_and_timer(&mut self, cx: &mut Context<'_>) -> Result<(), ()> {
-        if self.queued.is_some() {
-            return self.poll_write_timer(cx);
+    fn check_stall_deadline(
+        &mut self,
+        cx: &mut Context<'_>,
+        timeout: Duration,
+    ) -> Result<(), Stop> {
+        if self.ws.get_mut().take_write_progress() {
+            self.deadline.disarm();
         }
-        if !self.needs_flush {
-            self.timer_armed = false;
-            return Ok(());
-        }
-        match Pin::new(&mut self.ws).poll_flush(cx) {
-            Poll::Ready(Ok(())) => {
-                self.needs_flush = false;
-                self.timer_armed = false;
-                Ok(())
-            }
-            Poll::Ready(Err(_)) => Err(()),
-            Poll::Pending => self.poll_write_timer(cx),
-        }
-    }
-
-    fn poll_write_timer(&mut self, cx: &mut Context<'_>) -> Result<(), ()> {
-        let desired = tokio::time::Instant::now() + self.pending_timeout;
-        if !self.timer_armed {
-            match self.write_deadline.as_mut() {
-                Some(sleep) => sleep.as_mut().reset(desired),
-                None => self.write_deadline = Some(Box::pin(tokio::time::sleep_until(desired))),
-            }
-            self.timer_armed = true;
-        } else if let Some(sleep) = self.write_deadline.as_mut()
-            && desired < sleep.deadline()
-        {
-            sleep.as_mut().reset(desired);
-        }
-        if self
-            .write_deadline
-            .as_mut()
-            .expect("write_deadline initialized when armed")
-            .as_mut()
-            .poll(cx)
-            .is_ready()
-        {
-            self.timer_armed = false;
-            Err(())
+        if self.deadline.poll_expired(cx, timeout) {
+            Err(Stop::Abort)
         } else {
             Ok(())
         }
     }
 
-    async fn drain_pending(&mut self, extra: Option<Message>, timeout: Duration) -> bool {
-        if let Some(msg) = self.queued.take() {
+    fn poll_send_queued(&mut self, cx: &mut Context<'_>) -> Result<(), Stop> {
+        let OutboundState::DataActive { ref mut queued } = self.outbound else {
+            return Ok(());
+        };
+        if queued.is_none() {
+            return Ok(());
+        }
+        match Pin::new(&mut self.ws).poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                let OutboundState::DataActive { ref mut queued } = self.outbound else {
+                    unreachable!();
+                };
+                let msg = queued.take().expect("queued checked");
+                Pin::new(&mut self.ws)
+                    .start_send(msg)
+                    .map_err(|_| Stop::Abort)?;
+                Ok(())
+            }
+            Poll::Ready(Err(_)) => Err(Stop::Abort),
+            Poll::Pending => self.check_stall_deadline(cx, self.io_timeout),
+        }
+    }
+
+    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Result<(), Stop> {
+        self.poll_send_queued(cx)?;
+        if self.can_accept()
+            && let Some(reply) = self.local_reply.take()
+        {
+            self.enqueue_data(reply);
+            self.poll_send_queued(cx)?;
+        }
+        Ok(())
+    }
+
+    fn poll_flush_and_timer(&mut self, cx: &mut Context<'_>) -> Result<(), Stop> {
+        let timeout = match self.outbound {
+            OutboundState::Idle => {
+                self.deadline.disarm();
+                return Ok(());
+            }
+            OutboundState::DataActive { queued: Some(_) } => {
+                return self.check_stall_deadline(cx, self.io_timeout);
+            }
+            OutboundState::DataActive { queued: None } => self.io_timeout,
+            OutboundState::ControlFlush => WS_CONTROL_FLUSH_TIMEOUT,
+        };
+        match Pin::new(&mut self.ws).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                self.outbound = OutboundState::Idle;
+                let _ = self.ws.get_mut().take_write_progress();
+                self.deadline.disarm();
+                Ok(())
+            }
+            Poll::Ready(Err(_)) => Err(Stop::Abort),
+            Poll::Pending => self.check_stall_deadline(cx, timeout),
+        }
+    }
+
+    async fn drain_pending(&mut self, timeout: Duration) -> bool {
+        let was_active = !matches!(self.outbound, OutboundState::Idle);
+        let mut flushed_via_send = false;
+        if let OutboundState::DataActive { ref mut queued } = self.outbound
+            && let Some(msg) = queued.take()
+        {
             if !send_bounded(&mut self.ws, msg, timeout).await {
+                self.outbound = OutboundState::Idle;
                 return false;
             }
-            self.needs_flush = false;
+            flushed_via_send = true;
         }
-        if let Some(msg) = extra {
-            let ok = send_bounded(&mut self.ws, msg, timeout).await;
-            if ok {
-                self.needs_flush = false;
-            }
-            return ok;
+        self.outbound = OutboundState::Idle;
+        if let Some(reply) = self.local_reply.take() {
+            return send_bounded(&mut self.ws, reply, timeout).await;
         }
-        if self.needs_flush {
-            self.needs_flush = false;
+        if was_active && !flushed_via_send {
             return flush_bounded(&mut self.ws, timeout).await;
         }
         true
     }
 }
 
-enum BridgeExit {
-    ClientClosed(Option<CloseFrame>),
-    UpstreamClosed(Option<CloseFrame>),
-    ClientEof,
-    UpstreamEof,
-    ClientError,
-    UpstreamError,
-    Abort,
-}
-
-async fn finish_close<A, B>(
-    closer: &mut WsEndpoint<A>,
-    other: &mut WsEndpoint<B>,
-    extra_for_other: Option<Message>,
-    frame: Option<CloseFrame>,
-) where
-    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+fn pump<A, B>(
+    cx: &mut Context<'_>,
+    src: &mut WsEndpoint<A>,
+    dst: &mut WsEndpoint<B>,
+    intercept_mock: bool,
+) -> Result<bool, Stop>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
 {
-    // Flush Tungstenite's auto-queued Close reply (and any queued frame) to the
-    // initiator first, then drain queued frames + Close to the opposite peer.
-    closer.needs_flush = true;
-    let _ = closer.drain_pending(None, WS_CLOSE_GRACE).await;
-    if other.drain_pending(extra_for_other, WS_CLOSE_GRACE).await
-        && send_bounded(&mut other.ws, Message::Close(frame), WS_CLOSE_GRACE).await
-    {
-        let _ = tokio::time::timeout(WS_CLOSE_GRACE, async {
-            while let Some(Ok(msg)) = other.ws.next().await {
-                if msg.is_close() {
-                    break;
+    let mut count = 0;
+    while count < MAX_BATCH_FRAMES {
+        if !dst.can_accept() || src.local_reply.is_some() {
+            break;
+        }
+        match Pin::new(&mut src.ws).poll_next(cx) {
+            Poll::Pending => break,
+            Poll::Ready(None) => return Err(Stop::Eof),
+            Poll::Ready(Some(Err(_))) => return Err(Stop::Failed),
+            Poll::Ready(Some(Ok(msg))) => {
+                count += 1;
+                match msg {
+                    Message::Text(text) => {
+                        if intercept_mock {
+                            match mock_syncing(text.as_bytes()) {
+                                MockResult::Silent => continue,
+                                MockResult::Reply(reply) => {
+                                    let reply_msg = Message::Text(reply.into());
+                                    if src.can_accept() {
+                                        src.enqueue_data(reply_msg);
+                                        src.poll_send_queued(cx)?;
+                                    } else {
+                                        src.local_reply = Some(reply_msg);
+                                    }
+                                    continue;
+                                }
+                                MockResult::Forward => {}
+                            }
+                        }
+                        dst.enqueue_data(Message::Text(text));
+                        dst.poll_send_queued(cx)?;
+                    }
+                    Message::Binary(bin) => {
+                        dst.enqueue_data(Message::Binary(bin));
+                        dst.poll_send_queued(cx)?;
+                    }
+                    Message::Ping(_) => {
+                        // Ping/Pong are hop-by-hop control frames: Tungstenite queued
+                        // the matching Pong on `src.ws` during `poll_next`.
+                        src.request_control_flush();
+                    }
+                    Message::Pong(_) | Message::Frame(_) => {}
+                    Message::Close(frame) => return Err(Stop::Closed(frame)),
                 }
             }
-        })
-        .await;
+        }
+    }
+    Ok(count == MAX_BATCH_FRAMES)
+}
+
+async fn finish<A, B>(src: &mut WsEndpoint<A>, other: &mut WsEndpoint<B>, stop: Stop)
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
+{
+    match stop {
+        Stop::Closed(frame) => {
+            // `src` initiated Close, so Tungstenite is now in closing state and
+            // rejects new `ws.send(data)` calls with `SendAfterClosing`. Drop
+            // unsent frames destined for `src` and flush its Close reply directly.
+            src.outbound = OutboundState::Idle;
+            src.local_reply = None;
+            let _ = flush_bounded(&mut src.ws, WS_CLOSE_GRACE).await;
+            if other.drain_pending(WS_CLOSE_GRACE).await
+                && send_bounded(&mut other.ws, Message::Close(frame), WS_CLOSE_GRACE).await
+            {
+                let _ = tokio::time::timeout(WS_CLOSE_GRACE, async {
+                    while let Some(Ok(msg)) = other.ws.next().await {
+                        if msg.is_close() {
+                            break;
+                        }
+                    }
+                })
+                .await;
+            }
+        }
+        Stop::Eof => {
+            let _ = other.drain_pending(WS_CLOSE_GRACE).await;
+        }
+        Stop::Failed => {
+            let _ = other.drain_pending(WS_CLOSE_GRACE).await;
+            let _ = flush_bounded(&mut src.ws, WS_CLOSE_GRACE).await;
+        }
+        Stop::Abort => {}
     }
 }
 
@@ -471,202 +687,46 @@ async fn bridge_ws<C, U>(
     mock_enabled: bool,
     io_timeout: Duration,
 ) where
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress + Send + 'static,
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress + Send + 'static,
 {
-    let _guard = crate::metrics::ActiveConnectionGuard::ws();
     let mut client = WsEndpoint::new(client_ws, io_timeout);
     let mut upstream = WsEndpoint::new(upstream_ws, io_timeout);
-    // Dedicated 1-slot buffer for local `eth_syncing` replies so `client -> upstream`
-    // forwarding never stalls behind `upstream -> client` write backpressure.
-    let mut pending_mock_reply: Option<Message> = None;
 
-    let exit = std::future::poll_fn(|cx| {
-        let mut hit_budget = false;
-
+    let (side, stop) = std::future::poll_fn(|cx| {
         // 1. Advance any already-queued outbound frames first so freed slots are
         // immediately visible to both directional read loops below.
-        if upstream.poll_send_queued(cx).is_err() || client.poll_send_queued(cx).is_err() {
-            return Poll::Ready(BridgeExit::Abort);
-        }
-        if client.can_accept()
-            && let Some(reply) = pending_mock_reply.take()
-        {
-            client.enqueue(reply, io_timeout);
-            if client.poll_send_queued(cx).is_err() {
-                return Poll::Ready(BridgeExit::Abort);
-            }
+        if upstream.poll_pending(cx).is_err() || client.poll_pending(cx).is_err() {
+            return Poll::Ready((Side::Client, Stop::Abort));
         }
 
         // 2. Client -> Upstream (bounded batch per poll turn for scheduler fairness).
-        let mut c2u_count = 0;
-        while c2u_count < MAX_BATCH_FRAMES {
-            if !upstream.can_accept() || pending_mock_reply.is_some() {
-                break;
-            }
-            match Pin::new(&mut client.ws).poll_next(cx) {
-                Poll::Pending => break,
-                Poll::Ready(None) => return Poll::Ready(BridgeExit::ClientEof),
-                Poll::Ready(Some(Err(_))) => return Poll::Ready(BridgeExit::ClientError),
-                Poll::Ready(Some(Ok(msg))) => {
-                    c2u_count += 1;
-                    match msg {
-                        Message::Text(text) => {
-                            if mock_enabled {
-                                match mock_syncing(text.as_bytes()) {
-                                    MockResult::Silent => continue,
-                                    MockResult::Reply(reply) => {
-                                        let reply_msg = Message::Text(reply.into());
-                                        if client.can_accept() {
-                                            client.enqueue(reply_msg, io_timeout);
-                                            if client.poll_send_queued(cx).is_err() {
-                                                return Poll::Ready(BridgeExit::Abort);
-                                            }
-                                        } else {
-                                            pending_mock_reply = Some(reply_msg);
-                                        }
-                                        continue;
-                                    }
-                                    MockResult::Forward => {}
-                                }
-                            }
-                            upstream.enqueue(Message::Text(text), io_timeout);
-                            if upstream.poll_send_queued(cx).is_err() {
-                                return Poll::Ready(BridgeExit::Abort);
-                            }
-                        }
-                        Message::Binary(bin) => {
-                            upstream.enqueue(Message::Binary(bin), io_timeout);
-                            if upstream.poll_send_queued(cx).is_err() {
-                                return Poll::Ready(BridgeExit::Abort);
-                            }
-                        }
-                        Message::Ping(_) => {
-                            // Ping/Pong are hop-by-hop control frames: Tungstenite queued
-                            // the matching Pong on `client.ws` during `poll_next`.
-                            client.request_control_flush();
-                        }
-                        Message::Pong(_) | Message::Frame(_) => {}
-                        Message::Close(frame) => {
-                            return Poll::Ready(BridgeExit::ClientClosed(frame));
-                        }
-                    }
-                }
-            }
-        }
-        if c2u_count == MAX_BATCH_FRAMES {
-            hit_budget = true;
-        }
+        let c2u_full = match pump(cx, &mut client, &mut upstream, mock_enabled) {
+            Ok(full) => full,
+            Err(stop) => return Poll::Ready((Side::Client, stop)),
+        };
 
         // 3. Upstream -> Client (independent full-duplex progress even when `upstream` sink is full).
-        let mut u2c_count = 0;
-        while u2c_count < MAX_BATCH_FRAMES {
-            if !client.can_accept() {
-                break;
-            }
-            match Pin::new(&mut upstream.ws).poll_next(cx) {
-                Poll::Pending => break,
-                Poll::Ready(None) => return Poll::Ready(BridgeExit::UpstreamEof),
-                Poll::Ready(Some(Err(_))) => return Poll::Ready(BridgeExit::UpstreamError),
-                Poll::Ready(Some(Ok(msg))) => {
-                    u2c_count += 1;
-                    match msg {
-                        Message::Text(text) => {
-                            client.enqueue(Message::Text(text), io_timeout);
-                            if client.poll_send_queued(cx).is_err() {
-                                return Poll::Ready(BridgeExit::Abort);
-                            }
-                        }
-                        Message::Binary(bin) => {
-                            client.enqueue(Message::Binary(bin), io_timeout);
-                            if client.poll_send_queued(cx).is_err() {
-                                return Poll::Ready(BridgeExit::Abort);
-                            }
-                        }
-                        Message::Ping(_) => {
-                            upstream.request_control_flush();
-                        }
-                        Message::Pong(_) | Message::Frame(_) => {}
-                        Message::Close(frame) => {
-                            return Poll::Ready(BridgeExit::UpstreamClosed(frame));
-                        }
-                    }
-                }
-            }
-        }
-        if u2c_count == MAX_BATCH_FRAMES {
-            hit_budget = true;
-        }
-
-        if client.can_accept()
-            && let Some(reply) = pending_mock_reply.take()
-        {
-            client.enqueue(reply, io_timeout);
-            if client.poll_send_queued(cx).is_err() {
-                return Poll::Ready(BridgeExit::Abort);
-            }
-        }
+        let u2c_full = match pump(cx, &mut upstream, &mut client, false) {
+            Ok(full) => full,
+            Err(stop) => return Poll::Ready((Side::Upstream, stop)),
+        };
 
         // 4. Flush batched outbound frames once per direction & enforce stall deadlines.
         if upstream.poll_flush_and_timer(cx).is_err() || client.poll_flush_and_timer(cx).is_err() {
-            return Poll::Ready(BridgeExit::Abort);
+            return Poll::Ready((Side::Client, Stop::Abort));
         }
 
-        if hit_budget {
+        if c2u_full || u2c_full {
             cx.waker().wake_by_ref();
         }
         Poll::Pending
     })
     .await;
 
-    match exit {
-        BridgeExit::ClientClosed(frame) => {
-            finish_close(&mut client, &mut upstream, None, frame).await;
-        }
-        BridgeExit::UpstreamClosed(frame) => {
-            finish_close(&mut upstream, &mut client, pending_mock_reply, frame).await;
-        }
-        BridgeExit::ClientEof => {
-            let _ = upstream.drain_pending(None, WS_CLOSE_GRACE).await;
-        }
-        BridgeExit::UpstreamEof => {
-            let _ = client
-                .drain_pending(pending_mock_reply, WS_CLOSE_GRACE)
-                .await;
-        }
-        BridgeExit::ClientError => {
-            let _ = upstream.drain_pending(None, WS_CLOSE_GRACE).await;
-            let _ = flush_bounded(&mut client.ws, WS_CLOSE_GRACE).await;
-        }
-        BridgeExit::UpstreamError => {
-            let _ = client
-                .drain_pending(pending_mock_reply, WS_CLOSE_GRACE)
-                .await;
-            let _ = flush_bounded(&mut upstream.ws, WS_CLOSE_GRACE).await;
-        }
-        BridgeExit::Abort => {}
-    }
-}
-
-fn configure_ws_keepalive(
-    ws: &tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) {
-    let inner = ws.get_ref();
-    let tcp_stream = match inner {
-        tokio_tungstenite::MaybeTlsStream::Plain(s) => Some(s),
-        tokio_tungstenite::MaybeTlsStream::Rustls(s) => Some(s.get_ref().0),
-        _ => None,
-    };
-    if let Some(stream) = tcp_stream {
-        let sock_ref = socket2::SockRef::from(stream);
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(60))
-            .with_interval(Duration::from_secs(10));
-        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-            debug!(error = %e, "failed to set upstream WS TCP keepalive");
-        }
+    match side {
+        Side::Client => finish(&mut client, &mut upstream, stop).await,
+        Side::Upstream => finish(&mut upstream, &mut client, stop).await,
     }
 }
 
@@ -873,29 +933,45 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn single_loop_bridge_flushes_ping_locally_without_forwarding_or_duplicating_pong() {
-        let (client_io, proxy_client_io) = tokio::io::duplex(16 * 1024);
-        let (proxy_upstream_io, upstream_io) = tokio::io::duplex(16 * 1024);
-
-        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-        let proxy_client =
-            WebSocketStream::from_raw_socket(proxy_client_io, Role::Server, Some(get_ws_config()))
-                .await;
+    async fn duplex_bridge(
+        c2p_cap: usize,
+        p2u_cap: usize,
+        mock_enabled: bool,
+        io_timeout: Duration,
+    ) -> (
+        WebSocketStream<tokio::io::DuplexStream>,
+        WebSocketStream<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client_io, proxy_client_io) = tokio::io::duplex(c2p_cap);
+        let (proxy_upstream_io, upstream_io) = tokio::io::duplex(p2u_cap);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let proxy_client = WebSocketStream::from_raw_socket(
+            WriteProgressIo::new(proxy_client_io),
+            Role::Server,
+            Some(get_ws_config()),
+        )
+        .await;
         let proxy_upstream = WebSocketStream::from_raw_socket(
-            proxy_upstream_io,
+            WriteProgressIo::new(proxy_upstream_io),
             Role::Client,
             Some(get_ws_config()),
         )
         .await;
-        let mut upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
-
+        let upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
         let relay = tokio::spawn(bridge_ws(
             proxy_client,
             proxy_upstream,
-            true,
-            Duration::from_secs(5),
+            mock_enabled,
+            io_timeout,
         ));
+        (client, upstream, relay)
+    }
+
+    #[tokio::test]
+    async fn single_loop_bridge_flushes_ping_locally_without_forwarding_or_duplicating_pong() {
+        let (mut client, mut upstream, relay) =
+            duplex_bridge(16 * 1024, 16 * 1024, true, Duration::from_secs(5)).await;
 
         // 1. Client Ping while upstream is completely idle (not even reading!) must
         // immediately yield 1 Pong to the client and never forward Ping to upstream.
@@ -972,31 +1048,8 @@ mod tests {
             // Scenario A: Client pipelines 64 x 16 KiB (1 MiB) requests before reading a
             // single reply over 64 KiB duplexes while upstream replies 2 KiB per request
             // (128 KiB total > 64 KiB c2p duplex, saturating the outbound client sink).
-            let (client_io, proxy_client_io) = tokio::io::duplex(64 * 1024);
-            let (proxy_upstream_io, upstream_io) = tokio::io::duplex(64 * 1024);
-
-            let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-            let proxy_client = WebSocketStream::from_raw_socket(
-                proxy_client_io,
-                Role::Server,
-                Some(get_ws_config()),
-            )
-            .await;
-            let proxy_upstream = WebSocketStream::from_raw_socket(
-                proxy_upstream_io,
-                Role::Client,
-                Some(get_ws_config()),
-            )
-            .await;
-            let mut upstream =
-                WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
-
-            let relay = tokio::spawn(bridge_ws(
-                proxy_client,
-                proxy_upstream,
-                mock_enabled,
-                Duration::from_secs(5),
-            ));
+            let (mut client, mut upstream, relay) =
+                duplex_bridge(64 * 1024, 64 * 1024, mock_enabled, Duration::from_secs(5)).await;
             let upstream_task = tokio::spawn(async move {
                 let reply_pad = "r".repeat(2048);
                 while let Some(Ok(msg)) = upstream.next().await {
@@ -1050,30 +1103,8 @@ mod tests {
 
             // Scenario B: Simultaneous 96 KiB bursts (> 64 KiB duplex) from BOTH client
             // and upstream before either side begins reading.
-            let (client_io, proxy_client_io) = tokio::io::duplex(64 * 1024);
-            let (proxy_upstream_io, upstream_io) = tokio::io::duplex(64 * 1024);
-            let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-            let proxy_client = WebSocketStream::from_raw_socket(
-                proxy_client_io,
-                Role::Server,
-                Some(get_ws_config()),
-            )
-            .await;
-            let proxy_upstream = WebSocketStream::from_raw_socket(
-                proxy_upstream_io,
-                Role::Client,
-                Some(get_ws_config()),
-            )
-            .await;
-            let mut upstream =
-                WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
-
-            let relay = tokio::spawn(bridge_ws(
-                proxy_client,
-                proxy_upstream,
-                mock_enabled,
-                Duration::from_secs(5),
-            ));
+            let (mut client, mut upstream, relay) =
+                duplex_bridge(64 * 1024, 64 * 1024, mock_enabled, Duration::from_secs(5)).await;
             let chunk = bytes::Bytes::from(vec![b'x'; 16 * 1024]);
             let up_chunk = chunk.clone();
             let upstream_burst = tokio::spawn(async move {
@@ -1109,26 +1140,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stalled_sink_deadline_is_not_extended_by_trickle_frames() {
         // Tiny 256-byte duplex so a single 1 KiB frame blocks inside `poll_flush`.
-        let (client_io, proxy_client_io) = tokio::io::duplex(16 * 1024);
-        let (proxy_upstream_io, _stalled_upstream_io) = tokio::io::duplex(256);
-
-        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-        let proxy_client =
-            WebSocketStream::from_raw_socket(proxy_client_io, Role::Server, Some(get_ws_config()))
-                .await;
-        let proxy_upstream = WebSocketStream::from_raw_socket(
-            proxy_upstream_io,
-            Role::Client,
-            Some(get_ws_config()),
-        )
-        .await;
-
-        let relay = tokio::spawn(bridge_ws(
-            proxy_client,
-            proxy_upstream,
-            false,
-            Duration::from_secs(10),
-        ));
+        let (mut client, _stalled_upstream, relay) =
+            duplex_bridge(16 * 1024, 256, false, Duration::from_secs(10)).await;
 
         // Frame 1 (1 KiB) fits in Tungstenite's 16 KiB write_buffer, blocks in poll_flush,
         // and arms the 10s deadline at t = 0.
@@ -1151,6 +1164,118 @@ mod tests {
 
         // Advancing 3s more (t = 11s > 10s, even though only 3s since last trickle) aborts!
         tokio::time::advance(Duration::from_secs(3)).await;
+        relay.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_progressing_reader_survives_past_io_timeout_and_concurrent_ping() {
+        // 4 KiB client duplex with io_timeout = 10s (> 5s WS_CONTROL_FLUSH_TIMEOUT).
+        let (mut client, mut upstream, relay) =
+            duplex_bridge(4096, 64 * 1024, false, Duration::from_secs(10)).await;
+
+        let sender = tokio::spawn(async move {
+            for i in 0u8..8 {
+                upstream
+                    .send(Message::Binary(bytes::Bytes::from(vec![i; 8 * 1024])))
+                    .await
+                    .unwrap();
+            }
+            upstream
+        });
+        tokio::task::yield_now().await;
+
+        // At t = 1s, send a client Ping while `proxy_client` is already blocked in
+        // `DataActive` (writing 64 KiB through a 4 KiB socket). The 5s control-flush
+        // timeout must NOT overwrite the active 10s data deadline!
+        tokio::time::advance(Duration::from_secs(1)).await;
+        client
+            .send(Message::Ping(bytes::Bytes::from_static(b"hb-under-load")))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        // Wait 7s after Ping (t = 8s: > 5s control timeout, < 10s data timeout).
+        tokio::time::advance(Duration::from_secs(7)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !relay.is_finished(),
+            "Ping must not shrink active data io_timeout to 5s"
+        );
+
+        // Drain slowly: 1 frame every 6s across 8 frames -> t = 56s (5.6x io_timeout!).
+        // Because each read frees bytes in the 4 KiB socket, `WriteProgressIo` observes
+        // real write progress and resets the stall deadline.
+        let mut data_received = 0usize;
+        let mut saw_pong = false;
+        while data_received < 8 || !saw_pong {
+            tokio::time::advance(Duration::from_secs(6)).await;
+            match client.next().await.unwrap().unwrap() {
+                Message::Binary(b) => {
+                    assert_eq!(b, vec![data_received as u8; 8 * 1024]);
+                    data_received += 1;
+                }
+                Message::Pong(p) => {
+                    assert_eq!(p, bytes::Bytes::from_static(b"hb-under-load"));
+                    saw_pong = true;
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        let mut upstream = sender.await.unwrap();
+        client.close(None).await.unwrap();
+        while let Some(Ok(msg)) = client.next().await {
+            if msg.is_close() {
+                break;
+            }
+        }
+        let _ = upstream.next().await;
+        relay.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_close_while_sink_is_backpressured_still_flushes_close_reply_and_drains_other() {
+        // Tiny 512-byte client duplex so upstream frames immediately backpressure `client`.
+        let (mut client, mut upstream, relay) =
+            duplex_bridge(512, 64 * 1024, false, Duration::from_secs(5)).await;
+
+        // Fill `proxy_client`'s 16 KiB write buffer + 1-slot `queued` (`DataActive { queued: Some(_) }`).
+        for _ in 0..3 {
+            upstream
+                .send(Message::Binary(bytes::Bytes::from(vec![b'p'; 12 * 1024])))
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+
+        // Also pipeline a client->upstream frame right before Close to verify `other` drains cleanly.
+        client
+            .send(Message::Text("final-before-close".into()))
+            .await
+            .unwrap();
+        client
+            .send(Message::Close(Some(CloseFrame {
+                code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+                reason: "done".into(),
+            })))
+            .await
+            .unwrap();
+
+        // Drain inbound frames on client until the RFC 6455 Close echo arrives cleanly
+        // (must not fail with `ResetWithoutClosingHandshake` from `SendAfterClosing`).
+        let mut saw_close_echo = false;
+        while let Some(res) = client.next().await {
+            if res.expect("clean close handshake").is_close() {
+                saw_close_echo = true;
+                break;
+            }
+        }
+        assert!(saw_close_echo, "client must receive Close echo");
+
+        let forwarded = upstream.next().await.unwrap().unwrap();
+        assert_eq!(forwarded, Message::Text("final-before-close".into()));
+        let close_to_upstream = upstream.next().await.unwrap().unwrap();
+        assert!(close_to_upstream.is_close());
+        let _ = upstream.next().await;
         relay.await.unwrap();
     }
 }

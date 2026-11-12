@@ -4,7 +4,7 @@ use http::header::{
 };
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
-static RESPONSE_HOP_BY_HOP: [HeaderName; 11] = [
+static HOP_BY_HOP: [HeaderName; 10] = [
     CONNECTION,
     HeaderName::from_static("keep-alive"),
     HeaderName::from_static("proxy-connection"),
@@ -13,7 +13,6 @@ static RESPONSE_HOP_BY_HOP: [HeaderName; 11] = [
     TE,
     TRAILER,
     HeaderName::from_static("trailers"),
-    TRANSFER_ENCODING,
     UPGRADE,
     HOST,
 ];
@@ -22,10 +21,14 @@ static RESPONSE_HOP_BY_HOP: [HeaderName; 11] = [
 /// `Content-Length` from an inbound request before forwarding upstream (where
 /// Hyper recalculates body framing and `Host`/`:authority` from the target URI).
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    if headers.is_empty() {
+        return;
+    }
     remove_connection_nominated(headers);
-    for name in &RESPONSE_HOP_BY_HOP {
+    for name in &HOP_BY_HOP {
         headers.remove(name);
     }
+    headers.remove(TRANSFER_ENCODING);
     headers.remove(CONTENT_LENGTH);
 }
 
@@ -34,9 +37,12 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
 /// `Content-Length` whenever framing is unambiguous (RFC 9110 §8.6, RFC 9112 §6.1–6.2)
 /// so HTTP/1.1 responses do not unnecessarily degrade to `Transfer-Encoding: chunked`.
 pub fn sanitize_response_headers(status: StatusCode, headers: &mut HeaderMap) {
-    let had_transfer_encoding = headers.contains_key(TRANSFER_ENCODING);
+    if headers.is_empty() {
+        return;
+    }
+    let had_transfer_encoding = headers.remove(TRANSFER_ENCODING).is_some();
     remove_connection_nominated(headers);
-    for name in &RESPONSE_HOP_BY_HOP {
+    for name in &HOP_BY_HOP {
         headers.remove(name);
     }
 
@@ -102,13 +108,26 @@ pub(crate) fn is_connection_nominated(headers: &HeaderMap, target: &str) -> bool
 fn remove_connection_nominated(headers: &mut HeaderMap) {
     // Read every Connection field before removing it: its options nominate
     // additional headers that must not cross this hop (RFC 9110, section 7.6.1).
-    let nominated: Vec<HeaderName> = headers
-        .get_all(CONNECTION)
-        .iter()
-        .flat_map(|value| value.as_bytes().split(|&b| b == b','))
-        .filter_map(|name| HeaderName::from_bytes(name.trim_ascii()).ok())
-        .filter(|name| !RESPONSE_HOP_BY_HOP.contains(name) && headers.contains_key(name))
-        .collect();
+    let mut nominated = Vec::new();
+    for value in headers.get_all(CONNECTION) {
+        for raw in value.as_bytes().split(|&b| b == b',') {
+            let Ok(token) = std::str::from_utf8(raw.trim_ascii()) else {
+                continue;
+            };
+            if token.is_empty()
+                || token.eq_ignore_ascii_case("keep-alive")
+                || token.eq_ignore_ascii_case("upgrade")
+                || token.eq_ignore_ascii_case("connection")
+            {
+                continue;
+            }
+            if headers.contains_key(token)
+                && let Ok(name) = HeaderName::from_bytes(token.as_bytes())
+            {
+                nominated.push(name);
+            }
+        }
+    }
     for name in nominated {
         headers.remove(name);
     }

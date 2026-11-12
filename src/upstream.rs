@@ -64,9 +64,23 @@ impl fmt::Display for RedactedOptUrl<'_> {
     }
 }
 
+/// Parse a canonical decimal TCP port without `+` or leading zeros (`"0"` allowed iff `allow_zero`).
+pub(crate) fn parse_canonical_port(s: &str, allow_zero: bool) -> Option<u16> {
+    if s.is_empty() {
+        return None;
+    }
+    if s == "0" {
+        return allow_zero.then_some(0);
+    }
+    if s.starts_with('0') || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u16>().ok()
+}
+
 /// Shared authority validation for upstream and OTLP URLs: rejects deprecated
 /// `user:pass@` userinfo (RFC 9110 §4.2.4 / RFC 6455 §3), empty hosts, and
-/// empty, zero, or out-of-range `:port` suffixes without leaking URL secrets.
+/// empty, zero, non-canonical, or out-of-range `:port` suffixes without leaking URL secrets.
 pub(crate) fn validate_authority(
     flag: &'static str,
     raw: &str,
@@ -87,7 +101,7 @@ pub(crate) fn validate_authority(
         Some((_, rest)) => rest.strip_prefix(':'),
         None => auth.split_once(':').map(|(_, p)| p),
     };
-    if port_str.is_some_and(|p| p.is_empty() || authority.port_u16().is_none_or(|n| n == 0)) {
+    if port_str.is_some_and(|p| parse_canonical_port(p, false).is_none()) {
         return Err(format!("invalid {flag} ({}): invalid port", RedactedUrl(raw)).into());
     }
     Ok(())
@@ -95,23 +109,17 @@ pub(crate) fn validate_authority(
 
 /// Pre-classified base path/query shape so `rewrite_uri` avoids repeating string
 /// trimming or multi-stage `format!` allocations on every proxied request.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum BaseTarget {
     /// Root upstream (`/` or empty path, no query): moves inbound `PathAndQuery` zero-copy.
     Root,
     /// Path-prefixed or query-bearing commercial RPC URL.
-    Scoped {
-        root_path: Box<str>,
-        join_prefix: Box<str>,
-        query: Option<Box<str>>,
-    },
+    Scoped { join_prefix_len: usize },
 }
 
 #[derive(Clone)]
 struct Endpoint {
     uri: Uri,
-    scheme: Scheme,
-    authority: Authority,
     target: BaseTarget,
     is_tls: bool,
 }
@@ -153,34 +161,27 @@ impl Endpoint {
         };
 
         let mut parts = parsed.into_parts();
-        let Some(authority) = parts.authority.take() else {
+        let Some(authority) = parts.authority.as_ref() else {
             return Err(format!("invalid {flag} ({}): missing host", RedactedUrl(raw)).into());
         };
-        validate_authority(flag, raw, &authority)?;
+        validate_authority(flag, raw, authority)?;
 
-        parts.scheme = Some(scheme.clone());
-        parts.authority = Some(authority.clone());
+        parts.scheme = Some(scheme);
         let uri = Uri::from_parts(parts)
             .map_err(|_| format!("invalid {flag} ({}): malformed URI", RedactedUrl(raw)))?;
 
         let base_path = uri.path();
-        let base_query = uri.query();
-        let target = if matches!(base_path, "" | "/") && base_query.is_none() {
+        let target = if matches!(base_path, "" | "/") && uri.query().is_none() {
             BaseTarget::Root
         } else {
-            let root_path: Box<str> = if base_path.is_empty() { "/" } else { base_path }.into();
-            let join_prefix: Box<str> = root_path.trim_end_matches('/').into();
+            let root_path = if base_path.is_empty() { "/" } else { base_path };
             BaseTarget::Scoped {
-                root_path,
-                join_prefix,
-                query: base_query.map(Box::from),
+                join_prefix_len: root_path.trim_end_matches('/').len(),
             }
         };
 
         Ok(Self {
             uri,
-            scheme,
-            authority,
             target,
             is_tls,
         })
@@ -190,78 +191,46 @@ impl Endpoint {
     /// into [`Uri::from_parts`] on root-based upstreams (zero heap allocation),
     /// and assembling a single pre-sized [`BytesMut`] buffer when joining scoped
     /// prefixes or queries.
-    fn rewrite_uri(
-        &self,
-        inbound: Uri,
-        override_path: Option<&'static str>,
-    ) -> Result<Uri, RewriteUriError> {
+    fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {
         let inbound_pq = inbound.into_parts().path_and_query;
-        let inbound_path =
-            override_path.unwrap_or_else(|| inbound_pq.as_ref().map_or("", PathAndQuery::path));
-        if !inbound_path.is_empty() && !inbound_path.starts_with('/') {
-            return Err(RewriteUriError::NonOriginTarget);
-        }
+        let inbound_path = inbound_pq.as_ref().map_or("", PathAndQuery::path);
         let inbound_query = inbound_pq.as_ref().and_then(PathAndQuery::query);
 
-        if override_path.is_none() && matches!(inbound_path, "" | "/") && inbound_query.is_none() {
+        if matches!(inbound_path, "" | "/") && inbound_query.is_none() {
             return Ok(self.uri.clone());
         }
 
-        let pq = match &self.target {
-            BaseTarget::Root => match (override_path, inbound_query) {
-                (Some(static_path), None) => PathAndQuery::from_static(static_path),
-                (None, _) => inbound_pq.unwrap_or_else(|| PathAndQuery::from_static("/")),
-                (Some(static_path), Some(iq)) => compose_pq("", static_path, None, Some(iq))
-                    .map_err(|e| RewriteUriError::Http(e.into()))?,
-            },
-            BaseTarget::Scoped {
-                root_path,
-                join_prefix,
-                query,
-            } => {
-                let (head, tail) = if override_path.is_none() && matches!(inbound_path, "" | "/") {
-                    (root_path.as_ref(), "")
+        let pq = match self.target {
+            BaseTarget::Root => inbound_pq.unwrap_or_else(|| PathAndQuery::from_static("/")),
+            BaseTarget::Scoped { join_prefix_len } => {
+                let base_path = self.uri.path();
+                let root_path = if base_path.is_empty() { "/" } else { base_path };
+                let (head, tail) = if matches!(inbound_path, "" | "/") {
+                    (root_path, "")
                 } else {
-                    (join_prefix.as_ref(), inbound_path)
+                    (&root_path[..join_prefix_len], inbound_path)
                 };
-                compose_pq(head, tail, query.as_deref(), inbound_query)
-                    .map_err(|e| RewriteUriError::Http(e.into()))?
+                compose_pq(head, tail, self.uri.query(), inbound_query)?
             }
         };
-        self.with_path_and_query(pq)
-    }
-
-    fn with_path_and_query(&self, pq: PathAndQuery) -> Result<Uri, RewriteUriError> {
         let mut parts = Parts::default();
-        parts.scheme = Some(self.scheme.clone());
-        parts.authority = Some(self.authority.clone());
+        parts.scheme = self.uri.scheme().cloned();
+        parts.authority = self.uri.authority().cloned();
         parts.path_and_query = Some(pq);
-        Uri::from_parts(parts).map_err(|e| RewriteUriError::Http(e.into()))
+        Uri::from_parts(parts).map_err(http::Error::from)
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum RewriteUriError {
-    NonOriginTarget,
-    Http(http::Error),
-}
-
-impl fmt::Display for RewriteUriError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NonOriginTarget => f.write_str("inbound request target must be origin-form"),
-            Self::Http(e) => e.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for RewriteUriError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::NonOriginTarget => None,
-            Self::Http(e) => Some(e),
-        }
-    }
+/// Replace `uri`'s path with `static_path` while preserving any query string
+/// (zero allocation when `uri` has no query).
+pub(crate) fn replace_uri_path(uri: Uri, static_path: &'static str) -> Result<Uri, http::Error> {
+    let Some(query) = uri.query() else {
+        return Ok(Uri::from_static(static_path));
+    };
+    let pq = compose_pq("", static_path, None, Some(query))?;
+    let mut parts = Parts::default();
+    parts.path_and_query = Some(pq);
+    Uri::from_parts(parts).map_err(http::Error::from)
 }
 
 fn compose_pq(
@@ -315,12 +284,8 @@ impl HttpUpstream {
         &self.0.uri
     }
 
-    pub(crate) fn rewrite_uri(
-        &self,
-        inbound: Uri,
-        override_path: Option<&'static str>,
-    ) -> Result<Uri, RewriteUriError> {
-        self.0.rewrite_uri(inbound, override_path)
+    pub(crate) fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {
+        self.0.rewrite_uri(inbound)
     }
 }
 
@@ -334,7 +299,8 @@ pub(crate) struct WsUpstream {
 impl WsUpstream {
     pub(crate) fn parse(flag: &'static str, raw: &str) -> Result<Self, BoxError> {
         let endpoint = Endpoint::parse(flag, raw, ("ws", "wss"))?;
-        let host_header = HeaderValue::from_str(endpoint.authority.as_str())
+        let authority = endpoint.uri.authority().expect("validated authority");
+        let host_header = HeaderValue::from_str(authority.as_str())
             .map_err(|_| format!("invalid {flag} ({}): invalid Host header", RedactedUrl(raw)))?;
         Ok(Self {
             endpoint,
@@ -346,8 +312,30 @@ impl WsUpstream {
         &self.host_header
     }
 
-    pub(crate) fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, RewriteUriError> {
-        self.endpoint.rewrite_uri(inbound, None)
+    /// Host suitable for `TcpStream::connect` (IPv6 square brackets stripped).
+    pub(crate) fn dial_host(&self) -> &str {
+        let host = self
+            .endpoint
+            .uri
+            .authority()
+            .expect("validated authority")
+            .host();
+        host.strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host)
+    }
+
+    pub(crate) fn dial_port(&self) -> u16 {
+        self.endpoint
+            .uri
+            .authority()
+            .expect("validated authority")
+            .port_u16()
+            .unwrap_or(if self.endpoint.is_tls { 443 } else { 80 })
+    }
+
+    pub(crate) fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {
+        self.endpoint.rewrite_uri(inbound)
     }
 }
 
@@ -419,10 +407,15 @@ mod tests {
         );
         let upper_wss = WsUpstream::parse("--el-ws-url", "Wss://[::1]:8546").unwrap();
         assert_eq!(upper_wss.host_header(), "[::1]:8546");
+        assert_eq!(upper_wss.dial_host(), "::1");
+        assert_eq!(upper_wss.dial_port(), 8546);
         assert_eq!(
             upper_wss.rewrite_uri(Uri::from_static("/")).unwrap(),
             "wss://[::1]:8546"
         );
+        let default_ports_ws = WsUpstream::parse("--el-ws-url", "wss://ws.example.com").unwrap();
+        assert_eq!(default_ports_ws.dial_host(), "ws.example.com");
+        assert_eq!(default_ports_ws.dial_port(), 443);
 
         for bad_http in [
             "ws://user:TOPSECRET@127.0.0.1:8546/APIKEY",
@@ -430,6 +423,8 @@ mod tests {
             "https://alice:TOPSECRET@rpc.example.com/v3/APIKEY",
             "http://127.0.0.1:99999/APIKEY",
             "http://127.0.0.1:0/APIKEY",
+            "http://127.0.0.1:+8545/APIKEY",
+            "http://127.0.0.1:008545/APIKEY",
             "http://127.0.0.1:/APIKEY",
             "http://[::1]:/APIKEY",
             "http://[::1]:70000/APIKEY",
@@ -454,6 +449,8 @@ mod tests {
             "wss://user:TOPSECRET@ws.example.com:8546/APIKEY",
             "ws://127.0.0.1:/APIKEY",
             "ws://127.0.0.1:0/APIKEY",
+            "ws://127.0.0.1:+8546/APIKEY",
+            "ws://127.0.0.1:008546/APIKEY",
             "ws://127.0.0.1:99999/APIKEY",
             "ws:///APIKEY",
             "wss://ws.example.com/APIKEY#FRAGSECRET",
@@ -469,58 +466,43 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_uri_rejects_asterisk_form_without_corrupting_scoped_paths() {
-        let root_http = HttpUpstream::parse("--el-http-url", "http://127.0.0.1:8545").unwrap();
-        let scoped_http =
-            HttpUpstream::parse("--el-http-url", "https://mainnet.infura.io/v3/SECRET").unwrap();
-        assert!(root_http.rewrite_uri(Uri::from_static("*"), None).is_err());
-        assert!(
-            scoped_http
-                .rewrite_uri(Uri::from_static("*"), None)
-                .is_err()
-        );
-    }
-
-    #[test]
     fn rewrite_uri_preserves_paths_queries_and_overrides_for_http_and_ws() {
         let root_http = HttpUpstream::parse("--cl-beacon-url", "http://127.0.0.1:5052").unwrap();
         assert_eq!(
-            root_http.rewrite_uri(Uri::from_static("/"), None).unwrap(),
+            root_http.rewrite_uri(Uri::from_static("/")).unwrap(),
             "http://127.0.0.1:5052/"
         );
         assert_eq!(
             root_http
-                .rewrite_uri(Uri::from_static("/eth/v1/node/syncing?foo=1"), None)
+                .rewrite_uri(Uri::from_static("/eth/v1/node/syncing?foo=1"))
                 .unwrap(),
             "http://127.0.0.1:5052/eth/v1/node/syncing?foo=1"
         );
+        let mev_replaced = replace_uri_path(
+            Uri::from_static("/eth/v1/validator/register_validator"),
+            "/eth/v1/builder/validators",
+        )
+        .unwrap();
         assert_eq!(
-            root_http
-                .rewrite_uri(
-                    Uri::from_static("/eth/v1/validator/register_validator"),
-                    Some("/eth/v1/builder/validators")
-                )
-                .unwrap(),
+            root_http.rewrite_uri(mev_replaced).unwrap(),
             "http://127.0.0.1:5052/eth/v1/builder/validators"
         );
 
         let prefixed_http =
             HttpUpstream::parse("--el-http-url", "https://rpc.example.com/rpc?key=a%2Fb").unwrap();
         assert_eq!(
-            prefixed_http
-                .rewrite_uri(Uri::from_static("/"), None)
-                .unwrap(),
+            prefixed_http.rewrite_uri(Uri::from_static("/")).unwrap(),
             "https://rpc.example.com/rpc?key=a%2Fb"
         );
         assert_eq!(
             prefixed_http
-                .rewrite_uri(Uri::from_static("/?tag=a%2Fb"), None)
+                .rewrite_uri(Uri::from_static("/?tag=a%2Fb"))
                 .unwrap(),
             "https://rpc.example.com/rpc?key=a%2Fb&tag=a%2Fb"
         );
         assert_eq!(
             prefixed_http
-                .rewrite_uri(Uri::from_static("/rpc/extra?tag=a%2Fb"), None)
+                .rewrite_uri(Uri::from_static("/rpc/extra?tag=a%2Fb"))
                 .unwrap(),
             "https://rpc.example.com/rpc/rpc/extra?key=a%2Fb&tag=a%2Fb"
         );
@@ -603,7 +585,11 @@ mod tests {
         ] {
             let upstream = HttpUpstream::parse("--el-http-url", base).unwrap();
             let inbound_uri: Uri = inbound.parse().unwrap();
-            let uri = upstream.rewrite_uri(inbound_uri, override_path).unwrap();
+            let target_uri = match override_path {
+                Some(static_path) => replace_uri_path(inbound_uri, static_path).unwrap(),
+                None => inbound_uri,
+            };
+            let uri = upstream.rewrite_uri(target_uri).unwrap();
             assert_eq!(
                 uri.path_and_query().unwrap().as_str(),
                 expected,

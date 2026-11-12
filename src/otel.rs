@@ -42,7 +42,7 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrierRef<'a> {
 /// Must be called BEFORE `span` is first entered so `tracing-opentelemetry` builds
 /// the underlying OTel `Span` with the extracted parent `TraceId`.
 pub fn attach_parent_context(span: &tracing::Span, headers: &http::HeaderMap) {
-    if span.id().is_none() {
+    if span.is_disabled() {
         return;
     }
     let parent_cx = global::get_text_map_propagator(|propagator| {
@@ -55,14 +55,12 @@ pub fn attach_parent_context(span: &tracing::Span, headers: &http::HeaderMap) {
 
 pub fn propagate_context(headers: &mut http::HeaderMap) {
     let span = tracing::Span::current();
-    let cx = if span.id().is_none() {
-        global::get_text_map_propagator(|propagator| {
-            propagator.extract(&HeaderMapCarrierRef(headers))
-        })
-    } else {
-        tracing_opentelemetry::OpenTelemetrySpanExt::context(&span)
-    };
-
+    if span.is_disabled() {
+        // When no tracing subscriber/span is active, any non-Connection-nominated
+        // incoming `traceparent` was already preserved intact by `strip_hop_by_hop`.
+        return;
+    }
+    let cx = tracing_opentelemetry::OpenTelemetrySpanExt::context(&span);
     global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&cx, &mut HeaderMapCarrier(headers))
     });
@@ -93,64 +91,37 @@ pub async fn start(endpoint: Option<&str>) -> Result<Option<Telemetry>, crate::B
     let Some(endpoint) = endpoint else {
         return Ok(None);
     };
-    let endpoint = endpoint.to_owned();
-    tokio::task::spawn_blocking(move || init_otel(&endpoint))
+    let base = parse_endpoint(endpoint)?;
+    tokio::task::spawn_blocking(move || init_otel(&base))
         .await?
         .map(Some)
 }
 
-pub(crate) fn validate_endpoint(
+pub(crate) fn parse_endpoint(
     endpoint: &str,
-) -> Result<(&'static str, http::Uri), crate::BoxError> {
-    use crate::upstream::{RedactedUrl, validate_authority};
-
-    if endpoint.contains('#') {
-        return Err(format!(
-            "invalid --otel-endpoint ({}): OTLP endpoint must not contain a #fragment",
-            RedactedUrl(endpoint)
-        )
-        .into());
-    }
-    let uri: http::Uri = endpoint.parse().map_err(|_| {
-        format!(
-            "invalid --otel-endpoint ({}): malformed URI",
-            RedactedUrl(endpoint)
-        )
-    })?;
-    let scheme = match uri.scheme_str() {
-        Some(s) if s.eq_ignore_ascii_case("http") => "http",
-        Some(s) if s.eq_ignore_ascii_case("https") => "https",
-        _ => {
-            return Err(format!(
-                "invalid --otel-endpoint ({}): OTLP endpoint must be an HTTP(S) base URL without a query or fragment",
-                RedactedUrl(endpoint)
-            )
-            .into());
-        }
-    };
-    if uri.query().is_some() {
+) -> Result<crate::upstream::HttpUpstream, crate::BoxError> {
+    let upstream = crate::upstream::HttpUpstream::parse("--otel-endpoint", endpoint)?;
+    if upstream.uri().query().is_some() {
         return Err(format!(
             "invalid --otel-endpoint ({}): OTLP endpoint must be an HTTP(S) base URL without a query or fragment",
-            RedactedUrl(endpoint)
+            crate::upstream::RedactedUrl(endpoint)
         )
         .into());
     }
-    let Some(authority) = uri.authority() else {
-        return Err(format!(
-            "invalid --otel-endpoint ({}): missing host",
-            RedactedUrl(endpoint)
-        )
-        .into());
-    };
-    validate_authority("--otel-endpoint", endpoint, authority)?;
-    Ok((scheme, uri))
+    Ok(upstream)
 }
 
-fn signal_endpoint(endpoint: &str, signal: &str) -> Result<String, crate::BoxError> {
-    let (scheme, uri) = validate_endpoint(endpoint)?;
+fn signal_url(base: &crate::upstream::HttpUpstream, signal: &str) -> String {
+    let uri = base.uri();
+    let scheme = uri.scheme_str().expect("validated scheme");
     let authority = uri.authority().expect("validated authority");
     let prefix = uri.path().trim_end_matches('/');
-    Ok(format!("{scheme}://{authority}{prefix}/v1/{signal}"))
+    format!("{scheme}://{authority}{prefix}/v1/{signal}")
+}
+
+#[cfg(test)]
+fn signal_endpoint(endpoint: &str, signal: &str) -> Result<String, crate::BoxError> {
+    parse_endpoint(endpoint).map(|base| signal_url(&base, signal))
 }
 
 fn build_resource() -> Resource {
@@ -178,14 +149,14 @@ fn build_resource_with(
     builder.build()
 }
 
-fn init_otel(endpoint: &str) -> Result<Telemetry, crate::BoxError> {
+fn init_otel(base: &crate::upstream::HttpUpstream) -> Result<Telemetry, crate::BoxError> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_endpoint(signal_endpoint(endpoint, "traces")?)
+        .with_endpoint(signal_url(base, "traces"))
         .build()?;
     let meter_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
-        .with_endpoint(signal_endpoint(endpoint, "metrics")?)
+        .with_endpoint(signal_url(base, "metrics"))
         .build()?;
 
     let resource = build_resource();
@@ -452,10 +423,11 @@ mod tests {
             .build();
         let recorder = OtelRecorder::with_meter(provider.meter(SERVICE_NAME));
 
+        let proxy_metrics = crate::metrics::ProxyMetrics::default();
         let tcp_guard = ::metrics::with_local_recorder(&recorder, || {
-            let tcp = crate::metrics::ActiveConnectionGuard::tcp();
+            let tcp = proxy_metrics.active_tcp();
             // Open and immediately drop a WS connection to verify symmetrical +1 / -1.
-            drop(crate::metrics::ActiveConnectionGuard::ws());
+            drop(proxy_metrics.active_ws());
             ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "el").set(8.0);
             tcp
         });
@@ -552,6 +524,8 @@ mod tests {
             "http://user:SECRET@collector:4318",
             "http://:4318",
             "http://collector:0",
+            "http://collector:+4318",
+            "http://collector:004318",
             "http://collector:99999",
             "http://collector:",
             "http://collector?x=SECRET",

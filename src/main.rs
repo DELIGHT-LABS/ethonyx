@@ -11,34 +11,35 @@ async fn main() -> Result<(), BoxError> {
 
     use tracing_subscriber::prelude::*;
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+    let fmt_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let access = if cfg.access_log { "info" } else { "off" };
         tracing_subscriber::EnvFilter::new(format!("{},access_log={access}", cfg.log_level))
     });
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_filter(fmt_filter);
 
     #[cfg(feature = "otel")]
     {
-        if let Some(ref telemetry) = telemetry {
-            let tracer = telemetry.tracer();
-            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(otel_layer)
-                .with(tracing_subscriber::fmt::layer().json())
-                .init();
-        } else {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(tracing_subscriber::fmt::layer().json())
-                .init();
-        }
+        let otel_layer = telemetry.as_ref().map(|telemetry| {
+            // Keep OTel request spans active when `--log-level warn` quiets stdout,
+            // while still honoring `RUST_LOG` if explicitly provided.
+            let otel_filter =
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("ethonyx=info,access_log=off")
+                });
+            tracing_opentelemetry::layer()
+                .with_tracer(telemetry.tracer())
+                .with_filter(otel_filter)
+        });
+        tracing_subscriber::registry()
+            .with(otel_layer)
+            .with(fmt_layer)
+            .init();
     }
     #[cfg(not(feature = "otel"))]
     {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer().json())
-            .init();
+        tracing_subscriber::registry().with(fmt_layer).init();
     }
 
     let shutdown = async {

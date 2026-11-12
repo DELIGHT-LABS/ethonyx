@@ -2390,12 +2390,14 @@ async fn binary_exports_traces_and_metrics_and_flushes_on_sigterm() {
                 &upstream.url,
                 "--otel-endpoint",
                 &format!("{}/prefix", collector.url),
+                "--log-level",
+                "warn",
                 "--shutdown-grace",
                 "1",
             ])
             .env("OTEL_METRIC_EXPORT_INTERVAL", "100")
             .env("OTEL_BSP_SCHEDULE_DELAY", "100")
-            .env("RUST_LOG", "info")
+            .env_remove("RUST_LOG")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -4545,4 +4547,203 @@ async fn uppercase_ws_scheme_and_non_origin_targets_work_safely() {
 
     proxy.shutdown().await;
     ws_server.await.unwrap();
+}
+
+#[tokio::test]
+async fn post_accept_permits_allow_two_h2_ws_streams_and_reject_invalid_or_oversized_targets() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn sum_metric_lines(metrics_text: &str, needle: &str) -> u64 {
+        metrics_text
+            .lines()
+            .filter(|l| !l.starts_with('#') && l.contains(needle))
+            .filter_map(|l| l.split_whitespace().last()?.parse::<u64>().ok())
+            .sum()
+    }
+
+    let el = MockServer::start(ok_handler()).await;
+    let ws_upstream = ws_echo_upstream().await;
+    let long_prefix = "k".repeat(62_000);
+    let scoped_el = format!("{}/v3/{long_prefix}", el.url);
+    let scoped_ws = format!("{ws_upstream}/v3/{long_prefix}");
+
+    let proxy = EthonyxHandle::start(&[
+        "--trust-upstream",
+        "--max-connections",
+        "2",
+        "--el-http-url",
+        &scoped_el,
+        "--el-ws-url",
+        &scoped_ws,
+    ])
+    .await;
+
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, TestBody>(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let h2_conn = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let fetch_metrics = |sender: &mut hyper::client::conn::http2::SendRequest<TestBody>| {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://127.0.0.1:{}/metrics", proxy.port))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let fut = sender.send_request(req);
+        async move {
+            let resp = fut.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            String::from_utf8(
+                resp.into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .to_vec(),
+            )
+            .unwrap()
+        }
+    };
+
+    let m0 = fetch_metrics(&mut sender).await;
+    let sat0 = sum_metric_lines(&m0, "ethonyx_connection_limit_saturated_total");
+    let opts0 = sum_metric_lines(&m0, "method=\"OPTIONS\"");
+    let conn0 = sum_metric_lines(&m0, "method=\"CONNECT\"");
+
+    // 1. Rejected targets (`OPTIONS *`, authority `CONNECT`, and CL `CONNECT`) return 400
+    // BEFORE `ethonyx_proxy_requests_total` is recorded!
+    let mut raw_sock = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    raw_sock
+        .write_all(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut raw_resp = Vec::new();
+    raw_sock.read_to_end(&mut raw_resp).await.unwrap();
+    assert!(raw_resp.starts_with(b"HTTP/1.1 400 Bad Request"));
+    drop(raw_sock);
+
+    let mut cl_connect = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!(
+            "http://127.0.0.1:{}/eth/v1/node/health",
+            proxy.port
+        ))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    cl_connect
+        .extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let cl_connect_resp = sender.send_request(cl_connect).await.unwrap();
+    assert_eq!(cl_connect_resp.status(), StatusCode::BAD_REQUEST);
+    drop(cl_connect_resp);
+
+    let m1 = fetch_metrics(&mut sender).await;
+    assert_eq!(
+        sum_metric_lines(&m1, "method=\"OPTIONS\""),
+        opts0,
+        "OPTIONS * must not increment ethonyx_proxy_requests_total"
+    );
+    assert_eq!(
+        sum_metric_lines(&m1, "method=\"CONNECT\""),
+        conn0,
+        "rejected CONNECT must not increment ethonyx_proxy_requests_total"
+    );
+
+    // 2. Oversized rewritten URIs (> u16::MAX after joining scoped upstream prefix)
+    // return 414 URI Too Long instead of 502 Bad Gateway on both HTTP and WS paths.
+    let near_limit_path = format!("/{}", "a".repeat(4_096));
+    let long_http = Request::builder()
+        .method(Method::POST)
+        .uri(&near_limit_path)
+        .body(Full::new(Bytes::from_static(b"{}")))
+        .unwrap();
+    let long_http_resp = sender.send_request(long_http).await.unwrap();
+    assert_eq!(long_http_resp.status(), StatusCode::URI_TOO_LONG);
+    drop(long_http_resp);
+
+    let mut long_ws = Request::builder()
+        .method(Method::CONNECT)
+        .uri(&near_limit_path)
+        .header("sec-websocket-version", "13")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    long_ws
+        .extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let long_ws_resp = sender.send_request(long_ws).await.unwrap();
+    assert_eq!(long_ws_resp.status(), StatusCode::URI_TOO_LONG);
+    drop(long_ws_resp);
+
+    // 3. Under --max-connections 2, post-accept permit acquisition leaves the 2nd
+    // permit free so 1 H2 connection can open TWO concurrent Extended CONNECT WS
+    // streams (`IncludedH2` + `DedicatedH2`) with zero spurious saturation increments,
+    // and rejects the 3rd concurrent stream with 503 (+1 saturation).
+    let make_ext_ws = || {
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("http://127.0.0.1:{}/", proxy.port))
+            .header("sec-websocket-version", "13")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+        req
+    };
+
+    let ws_resp1 = sender.send_request(make_ext_ws()).await.unwrap();
+    assert_eq!(ws_resp1.status(), StatusCode::OK);
+    let up1 = hyper::upgrade::on(ws_resp1).await.unwrap();
+    let mut ws1 = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(up1),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+
+    let ws_resp2 = sender.send_request(make_ext_ws()).await.unwrap();
+    assert_eq!(
+        ws_resp2.status(),
+        StatusCode::OK,
+        "2nd H2 Extended CONNECT stream must acquire the 2nd permit under --max-connections 2"
+    );
+    let up2 = hyper::upgrade::on(ws_resp2).await.unwrap();
+    let mut ws2 = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(up2),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+
+    let m2 = fetch_metrics(&mut sender).await;
+    assert_eq!(
+        sum_metric_lines(&m2, "ethonyx_connection_limit_saturated_total"),
+        sat0,
+        "saturation counter must stay unchanged before actual over-limit contention"
+    );
+
+    let ws_resp3 = sender.send_request(make_ext_ws()).await.unwrap();
+    assert_eq!(ws_resp3.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(ws_resp3);
+
+    let m3 = fetch_metrics(&mut sender).await;
+    assert_eq!(
+        sum_metric_lines(&m3, "ethonyx_connection_limit_saturated_total"),
+        sat0 + 1,
+        "3rd concurrent H2 WS stream under --max-connections 2 must record +1 saturation"
+    );
+
+    let _ = ws1.close(None).await;
+    let _ = ws2.close(None).await;
+    drop((ws1, ws2, sender));
+    h2_conn.abort();
+    let _ = h2_conn.await;
+    proxy.shutdown().await;
 }

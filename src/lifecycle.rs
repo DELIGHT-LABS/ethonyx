@@ -1,8 +1,61 @@
 //! One shutdown deadline and completion barrier for connections and their tasks.
 use std::future::Future;
+use std::pin::Pin;
+use std::task::Context;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, Sleep, sleep_until, timeout_at};
+
+/// Lazily allocated stall/idle timer shared by streaming HTTP bodies and
+/// WebSocket endpoints so immediate operations never allocate a [`Sleep`].
+#[derive(Default)]
+pub(crate) struct LazyDeadline {
+    sleep: Option<Pin<Box<Sleep>>>,
+    armed: bool,
+}
+
+impl LazyDeadline {
+    pub(crate) const fn new() -> Self {
+        Self {
+            sleep: None,
+            armed: false,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Arm (if currently disarmed) for `now + duration` and poll whether the
+    /// deadline has elapsed. Automatically disarms on expiration.
+    pub(crate) fn poll_expired(&mut self, cx: &mut Context<'_>, duration: Duration) -> bool {
+        if !self.armed {
+            let at = Instant::now() + duration;
+            match self.sleep.as_mut() {
+                Some(sleep) => sleep.as_mut().reset(at),
+                None => self.sleep = Some(Box::pin(sleep_until(at))),
+            }
+            self.armed = true;
+        }
+        let expired = self
+            .sleep
+            .as_mut()
+            .expect("sleep initialized when armed")
+            .as_mut()
+            .poll(cx)
+            .is_ready();
+        if expired {
+            self.armed = false;
+        }
+        expired
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_allocated(&self) -> bool {
+        self.sleep.is_some()
+    }
+}
 
 pub(crate) type Shutdown = watch::Receiver<Option<Instant>>;
 
