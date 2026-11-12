@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Release archive naming: `ethonyx-<tag>-<target>.{tar.gz,zip}`
 - Upgrade the Rust toolchain and MSRV to `1.99`, bump `cargo-about` to `0.9.3`, replace legacy `cross` release builds with `taiki-e/setup-cross-toolchain-action`, and update direct and transitive Cargo dependencies (`tokio` `1.54.1`, `aws-lc-rs` `1.19.0`, `rustls-webpki` `0.103.16`, `webpki-roots` `1.0.12`, `webpki-root-certs` `1.0.12`, etc.).
 
+### Fixed
+
+- Track Git worktrees, packed/loose refs, tags, and crate sources in `build.rs` without invalidating Cargo's incremental cache or triggering a post-`describe` index rebuild.
+
 ## [0.2.5] - 2026-10-19
 
 ### Added
