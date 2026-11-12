@@ -1,14 +1,26 @@
-pub struct ActiveConnectionGuard(&'static str);
+use ::metrics::Gauge;
+
+pub(crate) const ACTIVE_CONNECTIONS: &str = "ethonyx_active_connections";
+
+pub(crate) struct ActiveConnectionGuard(Gauge);
 
 impl ActiveConnectionGuard {
-    pub fn new(protocol: &'static str) -> Self {
-        ::metrics::gauge!("ethonyx_active_connections", "protocol" => protocol).increment(1.0);
-        Self(protocol)
+    pub(crate) fn tcp() -> Self {
+        Self::new(::metrics::gauge!(ACTIVE_CONNECTIONS, "protocol" => "tcp"))
+    }
+
+    pub(crate) fn ws() -> Self {
+        Self::new(::metrics::gauge!(ACTIVE_CONNECTIONS, "protocol" => "ws"))
+    }
+
+    fn new(gauge: Gauge) -> Self {
+        gauge.increment(1.0);
+        Self(gauge)
     }
 }
 
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
-        ::metrics::gauge!("ethonyx_active_connections", "protocol" => self.0).decrement(1.0);
+        self.0.decrement(1.0);
     }
 }

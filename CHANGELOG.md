@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Honor explicit `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` (`service.name=...`) overrides instead of overwriting them with the default service name.
 - Track Git worktrees, packed/loose refs, tags, and crate sources in `build.rs` without invalidating Cargo's incremental cache or triggering a post-`describe` index rebuild.
 
 ## [0.2.5] - 2026-10-19
