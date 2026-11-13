@@ -17,6 +17,7 @@ mod otel;
 mod proxy;
 mod rpc;
 mod state;
+mod transport;
 mod upstream;
 mod websocket;
 

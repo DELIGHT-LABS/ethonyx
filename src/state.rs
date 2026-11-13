@@ -5,9 +5,9 @@ use tokio::sync::Semaphore;
 
 use crate::BoxError;
 use crate::config::{Config, RuntimeOpts, SlotClock, ValidatedConfig};
-use crate::health::{HealthSource, HttpTransport};
+use crate::health::HealthSource;
 use crate::metrics::{HealthMetrics, ProxyMetrics};
-use crate::proxy::ProxyClient;
+use crate::transport::{HttpTransport, ProxyClient, build_client, build_connectors};
 use crate::upstream::{HttpUpstream, WsUpstream};
 
 pub(crate) struct HttpTarget {
@@ -54,8 +54,8 @@ impl AppState {
         } = validated;
         let opts = RuntimeOpts::from_config(cfg);
 
-        let (https, ws_tls) = crate::proxy::build_connectors(el_ws.is_tls());
-        let client = crate::proxy::build_client(https.clone());
+        let (https, ws_tls) = build_connectors(el_ws.is_tls());
+        let client = build_client(https.clone());
         let el = HttpTarget {
             transport: HttpTransport::new_el(cfg.trust_upstream, el_http.is_tls(), https),
             upstream: el_http,

@@ -1,8 +1,9 @@
 //! WebSocket handshake and bounded full-duplex single-task relay. HTTP/1 and HTTP/2 share the same dial path.
 use crate::BoxError;
 use crate::lifecycle::LazyDeadline;
-use crate::proxy::{Connection, ResBody, box_full, text_response, uri_too_long_response};
+use crate::proxy::{Connection, text_response, uri_too_long_response};
 use crate::rpc::{MockResult, mock_syncing};
+use crate::transport::{ResBody, box_full};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use http::{Method, Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
