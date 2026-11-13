@@ -9,10 +9,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
-use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioTimer};
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{Instrument, debug, info, trace, warn};
 
@@ -21,71 +19,10 @@ use crate::headers::{sanitize_response_headers, strip_hop_by_hop};
 use crate::health;
 use crate::metrics::{UpstreamLayer, classify_method};
 use crate::state::{AppState, HttpTarget};
+use crate::transport::{ResBody, box_full};
 use crate::websocket::WsMode;
 
-pub(crate) type ResBody = UnsyncBoxBody<Bytes, BoxError>;
-
-pub(crate) type Https = hyper_rustls::HttpsConnector<HttpConnector>;
-pub(crate) type ProxyClient = Client<Https, ResBody>;
-
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
-
-fn build_http_connector() -> HttpConnector {
-    let mut http = HttpConnector::new();
-    http.set_nodelay(true);
-    http.enforce_http(false);
-    http.set_keepalive(Some(Duration::from_secs(60)));
-    http
-}
-
-fn configure_client_builder() -> hyper_util::client::legacy::Builder {
-    let mut builder = Client::builder(TokioExecutor::new());
-    builder
-        .pool_timer(TokioTimer::new())
-        .pool_idle_timeout(Duration::from_secs(60))
-        .timer(TokioTimer::new())
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .http2_keep_alive_timeout(Duration::from_secs(10))
-        .http2_keep_alive_while_idle(false);
-    builder
-}
-
-/// Build the shared WebPKI TLS configuration once so `https://` and `wss://`
-/// upstreams share root certificates while keeping `wss://` ALPN empty (strictly
-/// HTTP/1.1 `Upgrade`) and using [`tokio_tungstenite::Connector::Plain`] on `ws://`.
-pub(crate) fn build_connectors(ws_is_tls: bool) -> (Https, tokio_tungstenite::Connector) {
-    use hyper_rustls::ConfigBuilderExt;
-
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let base_tls = rustls::ClientConfig::builder()
-        .with_webpki_roots()
-        .with_no_client_auth();
-    let ws_tls = if ws_is_tls {
-        tokio_tungstenite::Connector::Rustls(Arc::new(base_tls.clone()))
-    } else {
-        tokio_tungstenite::Connector::Plain
-    };
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(base_tls)
-        .https_or_http()
-        // ALPN advertises ["h2","http/1.1"] for https upstreams -> auto-negotiate
-        // h2 when the upstream offers it; cleartext upstreams stay h1.
-        .enable_all_versions()
-        .wrap_connector(build_http_connector());
-    (https, ws_tls)
-}
-
-pub(crate) fn build_client(https: Https) -> ProxyClient {
-    configure_client_builder().build(https)
-}
-
-/// Cleartext-only HTTP/2 prior-knowledge (`h2c`) client for probed `http://` EL upstreams,
-/// sharing the same `Https` connector type so both clients unify as [`ProxyClient`].
-pub(crate) fn build_h2c_client(https: Https) -> ProxyClient {
-    let mut builder = configure_client_builder();
-    builder.http2_only(true);
-    builder.build(https)
-}
 
 /// Permit bounding concurrent WebSocket relays across both HTTP/1.1 `Upgrade`
 /// and HTTP/2 Extended `CONNECT` streams under `--max-connections`.
@@ -640,10 +577,6 @@ where
     body.map_err(Into::into).boxed_unsync()
 }
 
-pub(crate) fn box_full(body: Full<Bytes>) -> ResBody {
-    body.map_err(|e: Infallible| match e {}).boxed_unsync()
-}
-
 fn json_response(code: StatusCode, body: Bytes) -> Response<ResBody> {
     Response::builder()
         .status(code)
@@ -983,7 +916,7 @@ mod tests {
     #[tokio::test]
     async fn h2_extended_connect_permit_reuses_first_slot_and_caps_concurrent_amplification() {
         use clap::Parser;
-        use tokio::sync::{mpsc, watch};
+        use tokio::sync::mpsc;
 
         let cfg =
             crate::Config::parse_from(["ethonyx", "--trust-upstream", "--max-connections", "2"]);
@@ -992,7 +925,7 @@ mod tests {
             Arc::new(AppState::new(&cfg, validated, false, health::HealthSource::Trusted).unwrap());
         let sem = Arc::clone(&state.conn_limit);
         let tcp_permit = Arc::new(sem.clone().try_acquire_owned().unwrap());
-        let (_shutdown_tx, shutdown_rx) = watch::channel(None);
+        let (_shutdown_tx, shutdown_rx) = crate::lifecycle::channel();
         let (conn_tx, _conn_rx) = mpsc::channel(1);
         let lifecycle = crate::lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
         let conn = Arc::new(Connection::new(
