@@ -53,6 +53,7 @@ const HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(65);
 ///
 /// Preparation is separate from [`Prepared::run`] so a binary can build its
 /// tracing subscriber from [`Prepared::tracer`] before the server starts.
+#[must_use = "Prepared does nothing unless `.run(shutdown).await` is called"]
 pub struct Prepared {
     cfg: Config,
     validated: config::ValidatedConfig,
@@ -79,6 +80,7 @@ impl Prepared {
         })
     }
 
+    /// Borrow the validated [`Config`] (e.g. to configure logging before [`Prepared::run`]).
     pub fn config(&self) -> &Config {
         &self.cfg
     }

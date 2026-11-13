@@ -29,15 +29,6 @@ const TRUSTED_HEALTH_JSON: [[&[u8]; 2]; 2] = [
     [TRUSTED_HEALTH_H2_H1, TRUSTED_HEALTH_H2_H2],
 ];
 
-/// Whether `/healthz` reflects active background probes or `--trust-upstream`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum HealthMode {
-    Probed,
-    #[cfg(test)]
-    Trusted,
-}
-
 /// Source of readiness and health data for `/healthz`, `/readyz`, and `node_health`.
 pub(crate) enum HealthSource {
     /// `--trust-upstream`: no background poller or `watch` channel is allocated.
@@ -227,20 +218,6 @@ impl<D: fmt::Display> Serialize for DisplayJson<D> {
     }
 }
 
-#[cfg(test)]
-impl<D: fmt::Display> fmt::Debug for DisplayJson<D> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "\"{}\"", self.0)
-    }
-}
-
-#[cfg(test)]
-impl<D: fmt::Display> PartialEq<&str> for DisplayJson<D> {
-    fn eq(&self, other: &&str) -> bool {
-        self.0.to_string() == *other
-    }
-}
-
 #[derive(Clone, Copy)]
 struct PrefixedError<'a> {
     prefix: &'static str,
@@ -256,14 +233,17 @@ impl Serialize for PrefixedError<'_> {
 /// Fixed-capacity stack list of borrowed probe errors so `/healthz` serializes
 /// outage reports without per-request `Vec` or `format!` `String` allocations.
 struct ErrorList<'a, const N: usize> {
-    items: [Option<PrefixedError<'a>>; N],
+    items: [PrefixedError<'a>; N],
     len: usize,
 }
 
 impl<const N: usize> Default for ErrorList<'_, N> {
     fn default() -> Self {
         Self {
-            items: [None; N],
+            items: [PrefixedError {
+                prefix: "",
+                err: "",
+            }; N],
             len: 0,
         }
     }
@@ -275,24 +255,16 @@ impl<'a, const N: usize> ErrorList<'a, N> {
     }
 
     fn push(&mut self, prefix: &'static str, err: &'a str) {
-        self.items[self.len] = Some(PrefixedError { prefix, err });
-        self.len += 1;
-    }
-
-    #[cfg(test)]
-    const fn len(&self) -> usize {
-        self.len
+        if let Some(slot) = self.items.get_mut(self.len) {
+            *slot = PrefixedError { prefix, err };
+            self.len += 1;
+        }
     }
 }
 
 impl<const N: usize> Serialize for ErrorList<'_, N> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let mut seq = serializer.serialize_seq(Some(self.len))?;
-        for item in self.items[..self.len].iter().flatten() {
-            seq.serialize_element(item)?;
-        }
-        seq.end()
+        serializer.collect_seq(&self.items[..self.len])
     }
 }
 
@@ -312,7 +284,7 @@ struct Check<D: fmt::Display> {
 /// endpoint **always returns 200** — it reports state, it does not judge it.
 #[derive(Serialize)]
 struct HealthSnapshot<'a> {
-    mode: HealthMode,
+    mode: &'static str,
     el: ElHealth<'a>,
     cl: ClHealth<'a>,
 }
@@ -878,13 +850,12 @@ async fn el_batch_detect(state: &AppState) -> Result<ElBatchResult, HealthError>
         HttpTransport::AdaptiveH2c { mode, client } => {
             let h2c_client: &ProxyClient = client;
             let cur = H2cMode::load(mode);
-            let (first, second, on_first, on_second, report_second_err) = match cur {
+            let (first, second, on_first, on_second) = match cur {
                 H2cMode::Initial | H2cMode::Confirmed => (
                     h2c_client,
                     default_client,
                     H2cMode::Confirmed,
                     H2cMode::H1VerifyOnce,
-                    false,
                 ),
                 // Verify h2c one more time to self-heal if an h2c upstream was
                 // probed mid-bind during startup or restart.
@@ -893,24 +864,24 @@ async fn el_batch_detect(state: &AppState) -> Result<ElBatchResult, HealthError>
                     default_client,
                     H2cMode::Confirmed,
                     H2cMode::H1Confirmed,
-                    true,
                 ),
                 H2cMode::H1Confirmed => (
                     default_client,
                     h2c_client,
                     H2cMode::H1Confirmed,
                     H2cMode::Confirmed,
-                    false,
                 ),
             };
             match el_batch_rpc(state, first).await {
                 Err(first_err) if is_transport(&first_err) => {
                     match el_batch_rpc(state, second).await {
-                        Err(second_err) if is_transport(&second_err) => Err(if report_second_err {
-                            second_err
-                        } else {
-                            first_err
-                        }),
+                        Err(second_err) if is_transport(&second_err) => {
+                            Err(if cur == H2cMode::H1VerifyOnce {
+                                second_err
+                            } else {
+                                first_err
+                            })
+                        }
                         reached => {
                             apply_h2c_transition(mode, cur, on_second);
                             reached
@@ -1205,7 +1176,7 @@ fn build_snapshot<'a>(
     }
 
     HealthSnapshot {
-        mode: HealthMode::Probed,
+        mode: "probed",
         el,
         cl,
     }
@@ -1687,11 +1658,15 @@ mod tests {
         );
     }
 
+    fn assert_check<D: fmt::Display>(c: Check<D>, expected_ok: bool, expected_detail: &str) {
+        assert_eq!(c.ok, expected_ok);
+        assert_eq!(c.detail.0.to_string(), expected_detail);
+    }
+
     #[test]
     fn el_syncing_false_is_synced() {
         let c = eval_el_syncing(&Ok(ElSyncingResult::Synced(false))).into_check();
-        assert!(c.ok);
-        assert_eq!(c.detail, "synced");
+        assert_check(c, true, "synced");
     }
 
     #[test]
@@ -1701,16 +1676,14 @@ mod tests {
             highest_block: 0x20,
         }))
         .into_check();
-        assert!(!c.ok);
-        assert_eq!(c.detail, "syncing (block 16, distance 16)");
+        assert_check(c, false, "syncing (block 16, distance 16)");
     }
 
     #[test]
     fn el_syncing_error_is_prefixed() {
         let r = Err("boom".into());
         let c = eval_el_syncing(&r).into_check();
-        assert!(!c.ok);
-        assert_eq!(c.detail, "eth_syncing: boom");
+        assert_check(c, false, "eth_syncing: boom");
     }
 
     #[test]
@@ -1721,8 +1694,7 @@ mod tests {
             is_syncing: false,
         });
         let c = eval_cl_syncing(&r).into_check();
-        assert!(c.ok);
-        assert_eq!(c.detail, "synced (slot 42, distance 0)");
+        assert_check(c, true, "synced (slot 42, distance 0)");
     }
 
     #[test]
@@ -1733,8 +1705,7 @@ mod tests {
             is_syncing: true,
         });
         let c = eval_cl_syncing(&r).into_check();
-        assert!(!c.ok);
-        assert_eq!(c.detail, "syncing (slot 42, distance 5)");
+        assert_check(c, false, "syncing (slot 42, distance 5)");
     }
 
     #[test]
@@ -1744,8 +1715,7 @@ mod tests {
             timestamp: 0x3e2,
         });
         let c = eval_el_block_fresh(&r, 60, 1000).into_check();
-        assert!(c.ok);
-        assert_eq!(c.detail, "block 5, age 6s");
+        assert_check(c, true, "block 5, age 6s");
     }
 
     #[test]
@@ -1755,8 +1725,7 @@ mod tests {
             timestamp: 0x384,
         });
         let c = eval_el_block_fresh(&r, 60, 1000).into_check();
-        assert!(!c.ok);
-        assert_eq!(c.detail, "block 5 stale: 100s (max 60)");
+        assert_check(c, false, "block 5 stale: 100s (max 60)");
     }
 
     #[test]
@@ -1767,8 +1736,7 @@ mod tests {
             is_syncing: false,
         });
         let c = eval_cl_slot_fresh(&r, SlotClock::new(0, 12), 60, 9_999_999).into_check();
-        assert!(c.ok);
-        assert_eq!(c.detail, "slot 7 (age check disabled)");
+        assert_check(c, true, "slot 7 (age check disabled)");
     }
 
     #[test]
@@ -1779,8 +1747,7 @@ mod tests {
             is_syncing: false,
         });
         let c = eval_cl_slot_fresh(&r, SlotClock::new(1000, 12), 60, 1300).into_check();
-        assert!(!c.ok);
-        assert_eq!(c.detail, "slot 10 stale: 180s (max 60)");
+        assert_check(c, false, "slot 10 stale: 180s (max 60)");
     }
 
     #[test]
@@ -1836,7 +1803,7 @@ mod tests {
         assert_eq!(snap.cl.peers, Some(64));
         assert_eq!(snap.cl.head_slot, Some(10));
         assert_eq!(snap.cl.slot_age_secs, Some(180));
-        assert!(snap.el.errors.is_empty());
+        assert!(snap.cl.errors.is_empty());
     }
 
     #[test]
@@ -1850,9 +1817,7 @@ mod tests {
         assert_eq!(snap.el.syncing, None);
         assert_eq!(snap.el.peers, None);
         assert_eq!(snap.el.block_number, None);
-        assert_eq!(snap.el.errors.len(), 3);
         assert_eq!(snap.cl.head_slot, None);
-        assert_eq!(snap.cl.errors.len(), 2);
         let json = serde_json::to_value(&snap).unwrap();
         assert_eq!(
             json["el"]["errors"],
@@ -1865,6 +1830,16 @@ mod tests {
         assert_eq!(
             json["cl"]["errors"],
             serde_json::json!(["node/syncing: http 404", "node/peer_count: http 404"])
+        );
+
+        // Capacity overflow saturates without panicking under `panic = "abort"`.
+        let mut small = ErrorList::<2>::default();
+        small.push("a", "1");
+        small.push("b", "2");
+        small.push("c", "3");
+        assert_eq!(
+            serde_json::to_value(&small).unwrap(),
+            serde_json::json!(["a: 1", "b: 2"])
         );
     }
 
@@ -1916,7 +1891,7 @@ mod tests {
         cl_transport: &'static str,
     ) -> HealthSnapshot<'static> {
         HealthSnapshot {
-            mode: HealthMode::Trusted,
+            mode: "trusted",
             el: ElHealth {
                 transport: el_transport,
                 ..ElHealth::default()
