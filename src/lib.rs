@@ -179,7 +179,7 @@ where
         let (tx, rx) = watch::channel(Arc::new(health::Probe::pending()));
         (Some(tx), health::HealthSource::Polled(rx))
     };
-    let (shutdown_tx, _) = watch::channel(None);
+    let (shutdown_tx, shutdown_rx) = lifecycle::channel();
 
     let state = Arc::new(AppState::new(&cfg, validated, otel_enabled, health)?);
 
@@ -237,20 +237,20 @@ where
         tokio::spawn(health::poll_loop(
             state.clone(),
             tx,
-            shutdown_tx.subscribe(),
+            shutdown_rx.clone(),
             poll_interval,
         ))
     });
 
     let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let lifecycle = lifecycle::Lifecycle::new(shutdown_tx.subscribe(), conn_tx);
+    let lifecycle = lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
     let accept_handle = tokio::spawn(accept_loop(listeners, state, lifecycle));
 
     shutdown.await;
     info!("shutdown signal received");
 
     let deadline = tokio::time::Instant::now() + shutdown_grace;
-    shutdown_tx.send_replace(Some(deadline));
+    shutdown_tx.send(deadline);
 
     let _ = accept_handle.await;
     if let Some(poller) = poller {
@@ -354,7 +354,7 @@ enum DetectedProto {
 async fn read_initial_preface<I: AsyncRead + Unpin>(
     mut stream: I,
     timeout: Duration,
-    lifecycle: &mut lifecycle::Lifecycle,
+    lifecycle: &lifecycle::Lifecycle,
 ) -> Option<(DetectedProto, PrefixedIo<I>)> {
     let mut buf = [0u8; 64];
     let mut len = 0usize;
@@ -425,7 +425,7 @@ impl ServerBuilders {
 async fn drive_graceful<C>(
     conn: C,
     graceful_shutdown: impl FnOnce(Pin<&mut C>),
-    conn_lifecycle: &mut lifecycle::Lifecycle,
+    conn_lifecycle: &lifecycle::Lifecycle,
     peer: std::net::SocketAddr,
 ) where
     C: Future<Output = hyper::Result<()>>,
@@ -452,7 +452,7 @@ async fn serve_detected<I, B, S>(
     proto: DetectedProto,
     io: TokioIo<PrefixedIo<I>>,
     svc: S,
-    conn_lifecycle: &mut lifecycle::Lifecycle,
+    conn_lifecycle: &lifecycle::Lifecycle,
     peer: std::net::SocketAddr,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -494,13 +494,13 @@ async fn serve_connection(
     stream: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
     state: Arc<AppState>,
-    mut conn_lifecycle: lifecycle::Lifecycle,
+    conn_lifecycle: lifecycle::Lifecycle,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
     builders: Arc<ServerBuilders>,
 ) {
     let _guard = state.metrics.active_tcp();
     let Some((proto, prefixed)) =
-        read_initial_preface(stream, INITIAL_READ_TIMEOUT, &mut conn_lifecycle).await
+        read_initial_preface(stream, INITIAL_READ_TIMEOUT, &conn_lifecycle).await
     else {
         trace!(%peer, "connection closed before protocol preface");
         return;
@@ -513,7 +513,7 @@ async fn serve_connection(
         permit,
     ));
     let svc = service_fn(move |req| Arc::clone(&connection).dispatch(req));
-    serve_detected(&builders, proto, io, svc, &mut conn_lifecycle, peer).await;
+    serve_detected(&builders, proto, io, svc, &conn_lifecycle, peer).await;
 }
 
 pub(crate) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
@@ -532,7 +532,7 @@ pub(crate) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
 async fn accept_loop(
     listeners: Vec<TcpListener>,
     state: Arc<AppState>,
-    mut lifecycle: lifecycle::Lifecycle,
+    lifecycle: lifecycle::Lifecycle,
 ) {
     if listeners.is_empty() {
         return;
@@ -695,15 +695,15 @@ mod tests {
         use std::convert::Infallible;
         use tokio::io::AsyncWriteExt;
 
-        let (_shutdown_tx, shutdown_rx) = watch::channel(None);
+        let (_shutdown_tx, shutdown_rx) = lifecycle::channel();
         let (conn_tx, _conn_rx) = tokio::sync::mpsc::channel(1);
         let lifecycle = lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
 
         // 1. Completely silent 0-byte socket times out at INITIAL_READ_TIMEOUT (15s).
         let (_silent_client, silent_server) = tokio::io::duplex(256);
-        let mut lc1 = lifecycle.clone();
+        let lc1 = lifecycle.clone();
         let silent_task = tokio::spawn(async move {
-            read_initial_preface(silent_server, INITIAL_READ_TIMEOUT, &mut lc1)
+            read_initial_preface(silent_server, INITIAL_READ_TIMEOUT, &lc1)
                 .await
                 .is_none()
         });
@@ -718,9 +718,9 @@ mod tests {
         // hanging forever waiting for the rest of the 24-byte preface.
         let (mut pri_client, pri_server) = tokio::io::duplex(256);
         pri_client.write_all(b"PRI ").await.unwrap();
-        let mut lc2 = lifecycle.clone();
+        let lc2 = lifecycle.clone();
         let pri_task = tokio::spawn(async move {
-            read_initial_preface(pri_server, INITIAL_READ_TIMEOUT, &mut lc2)
+            read_initial_preface(pri_server, INITIAL_READ_TIMEOUT, &lc2)
                 .await
                 .is_none()
         });
@@ -734,8 +734,7 @@ mod tests {
         // 2b. Complete 24-byte HTTP/2 preface is classified as DetectedProto::Http2.
         let (mut h2_client, h2_server) = tokio::io::duplex(256);
         h2_client.write_all(H2_PREFACE).await.unwrap();
-        let mut lc_h2 = lifecycle.clone();
-        let (h2_proto, _) = read_initial_preface(h2_server, INITIAL_READ_TIMEOUT, &mut lc_h2)
+        let (h2_proto, _) = read_initial_preface(h2_server, INITIAL_READ_TIMEOUT, &lifecycle)
             .await
             .expect("HTTP/2 preface");
         assert_eq!(h2_proto, DetectedProto::Http2);
@@ -743,26 +742,18 @@ mod tests {
         // 3. HTTP/1.1 connection completes preface immediately, survives 30s idle (> 15s),
         // and closes after 65s of keep-alive inactivity via `serve_detected`.
         let (mut h1_client, h1_server) = tokio::io::duplex(4096);
-        let mut lc3 = lifecycle.clone();
-        let builders = ServerBuilders::new(lc3.clone());
+        let lc3 = lifecycle.clone();
+        let builders = ServerBuilders::new(lifecycle);
         let peer: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let server_task = tokio::spawn(async move {
-            let (proto, prefixed) = read_initial_preface(h1_server, INITIAL_READ_TIMEOUT, &mut lc3)
+            let (proto, prefixed) = read_initial_preface(h1_server, INITIAL_READ_TIMEOUT, &lc3)
                 .await
                 .expect("HTTP/1.1 preface");
             assert_eq!(proto, DetectedProto::Http1);
             let svc = service_fn(|_req| async {
                 Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
             });
-            serve_detected(
-                &builders,
-                proto,
-                TokioIo::new(prefixed),
-                svc,
-                &mut lc3,
-                peer,
-            )
-            .await;
+            serve_detected(&builders, proto, TokioIo::new(prefixed), svc, &lc3, peer).await;
         });
 
         h1_client

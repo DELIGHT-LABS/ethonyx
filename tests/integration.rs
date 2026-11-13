@@ -4963,3 +4963,170 @@ async fn shutdown_during_initial_health_probe_exits_promptly_without_binding_lis
     assert!(res.is_ok());
     server.abort();
 }
+
+#[tokio::test]
+async fn shutdown_sends_going_away_close_frame_to_active_h1_and_h2_websockets() {
+    use tokio_tungstenite::tungstenite::protocol::{Role, frame::coding::CloseCode};
+
+    let upstream = ws_echo_upstream().await;
+    let mut proxy = EthonyxHandle::start_with_grace(
+        &["--trust-upstream", "--el-ws-url", &upstream],
+        Duration::from_secs(1),
+    )
+    .await;
+
+    // 1. HTTP/1.1 Upgrade WebSocket subscriber.
+    let (mut ws_h1, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .unwrap();
+
+    // 2. HTTP/2 Extended CONNECT WebSocket subscriber.
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let (mut sender, h2_conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, TestBody>(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let h2_driver = tokio::spawn(async move {
+        let _ = h2_conn.await;
+    });
+    let mut req = Request::builder()
+        .method(Method::CONNECT)
+        .uri(proxy.url("/"))
+        .header("sec-websocket-version", "13")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let upgraded = hyper::upgrade::on(resp).await.unwrap();
+    let mut ws_h2 = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(upgraded),
+        Role::Client,
+        None,
+    )
+    .await;
+
+    let started = tokio::time::Instant::now();
+    proxy.shutdown.take().unwrap().send(()).unwrap();
+
+    // Both H1 and H2 relays remain fully operational during the drain window.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ws_h1
+        .send(Message::Text("mid-drain-h1".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ws_h1.next().await.unwrap().unwrap(),
+        Message::Text("mid-drain-h1".into())
+    );
+    ws_h2
+        .send(Message::Text("mid-drain-h2".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ws_h2.next().await.unwrap().unwrap(),
+        Message::Text("mid-drain-h2".into())
+    );
+
+    async fn read_going_away<S>(mut ws: tokio_tungstenite::WebSocketStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("Close frame before timeout")
+            .expect("stream item")
+            .expect("clean Close frame without reset");
+        let Message::Close(Some(frame)) = msg else {
+            panic!("expected Close(Some(..)), got {msg:?}");
+        };
+        assert_eq!(frame.code, CloseCode::Away);
+        assert_eq!(frame.reason.as_str(), "server shutting down");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), ws.next())
+                .await
+                .expect("EOF after Close handshake")
+                .is_none(),
+            "peer must observe clean EOF after Close handshake"
+        );
+    }
+
+    let ((), (), ()) = tokio::join!(
+        read_going_away(ws_h1),
+        read_going_away(ws_h2),
+        proxy.shutdown(),
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(800)
+            && started.elapsed() < Duration::from_millis(1500),
+        "active relays should close just before grace expiry (elapsed = {:?})",
+        started.elapsed()
+    );
+
+    drop(sender);
+    h2_driver.abort();
+    let _ = h2_driver.await;
+}
+
+#[tokio::test]
+async fn query_only_upstream_url_reaches_h2c_and_h1_as_root_path() {
+    for h2 in [true, false] {
+        let handler: MockHandler = Arc::new(|_| {
+            (
+                StatusCode::OK,
+                br#"{"jsonrpc":"2.0","id":7,"result":"0xcafe"}"#.to_vec(),
+            )
+        });
+        let el = if h2 {
+            MockServer::start_h2c(handler).await
+        } else {
+            MockServer::start(handler).await
+        };
+        let cl = MockServer::start(ok_handler()).await;
+        let el_url = format!("{}?key=abc", el.url);
+        let ethonyx =
+            EthonyxHandle::start(&["--el-http-url", &el_url, "--cl-beacon-url", &cl.url]).await;
+
+        let c = client();
+        let (status, _) = post_json_settled(
+            &c,
+            &ethonyx.url("/"),
+            json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 7}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json(
+            &c,
+            &ethonyx.url("/?tag=x"),
+            json!({"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 7}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let received = el.received();
+        let find_req = |needle: &[u8]| {
+            received
+                .iter()
+                .find(|r| r.body.windows(needle.len()).any(|w| w == needle))
+                .expect("EL received forwarded request")
+        };
+        let plain = find_req(b"eth_blockNumber");
+        let with_query = find_req(b"eth_chainId");
+        let expected_version = if h2 {
+            http::Version::HTTP_2
+        } else {
+            http::Version::HTTP_11
+        };
+        assert_eq!(plain.version, expected_version);
+        assert_eq!(plain.uri.path_and_query().unwrap().as_str(), "/?key=abc");
+        assert_eq!(
+            with_query.uri.path_and_query().unwrap().as_str(),
+            "/?key=abc&tag=x"
+        );
+
+        ethonyx.shutdown().await;
+    }
+}

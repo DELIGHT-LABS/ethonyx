@@ -182,19 +182,19 @@ impl<T: fmt::Display> fmt::Display for OptDisplay<T> {
 pub(crate) async fn poll_loop(
     state: Arc<AppState>,
     tx: watch::Sender<Arc<Probe>>,
-    mut shutdown: crate::lifecycle::Shutdown,
+    shutdown: crate::lifecycle::Shutdown,
     interval: Duration,
 ) {
     let mut prev_ready: Option<bool> = None;
     loop {
         tokio::select! {
             biased;
-            _ = crate::lifecycle::deadline(&mut shutdown) => return,
+            _ = crate::lifecycle::deadline(&shutdown) => return,
             _ = tokio::time::sleep(interval) => {}
         }
         let probe = tokio::select! {
             biased;
-            _ = crate::lifecycle::deadline(&mut shutdown) => return,
+            _ = crate::lifecycle::deadline(&shutdown) => return,
             probe = probe_once(&state) => probe,
         };
 

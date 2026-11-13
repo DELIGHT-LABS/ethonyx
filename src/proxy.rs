@@ -916,7 +916,7 @@ mod tests {
     #[tokio::test]
     async fn h2_extended_connect_permit_reuses_first_slot_and_caps_concurrent_amplification() {
         use clap::Parser;
-        use tokio::sync::{mpsc, watch};
+        use tokio::sync::mpsc;
 
         let cfg =
             crate::Config::parse_from(["ethonyx", "--trust-upstream", "--max-connections", "2"]);
@@ -925,7 +925,7 @@ mod tests {
             Arc::new(AppState::new(&cfg, validated, false, health::HealthSource::Trusted).unwrap());
         let sem = Arc::clone(&state.conn_limit);
         let tcp_permit = Arc::new(sem.clone().try_acquire_owned().unwrap());
-        let (_shutdown_tx, shutdown_rx) = watch::channel(None);
+        let (_shutdown_tx, shutdown_rx) = crate::lifecycle::channel();
         let (conn_tx, _conn_rx) = mpsc::channel(1);
         let lifecycle = crate::lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
         let conn = Arc::new(Connection::new(
