@@ -68,6 +68,7 @@ that layer's `errors` array.
 
 | Field                                              | Source                                |
 |----------------------------------------------------|---------------------------------------|
+| `mode` (`"probed"` / `"trusted"`)                  | whether background polling is active or `--trust-upstream` is set |
 | `el.transport` / `cl.transport` (`h2c`/`h2`/`http/1.1`) | upstream HTTP version ethonyx uses |
 | `el.syncing` (`false` = synced)                    | EL `eth_syncing`                      |
 | `el.sync_distance` (while syncing)                 | EL `eth_syncing` highest − current    |
@@ -79,7 +80,8 @@ that layer's `errors` array.
 | `el.errors` / `cl.errors`                          | any upstream call that failed         |
 
 ```json
-{ "el": { "transport": "h2c", "syncing": false, "peers": 23, "block_number": 21000000, "block_age_secs": 5 },
+{ "mode": "probed",
+  "el": { "transport": "h2c", "syncing": false, "peers": 23, "block_number": 21000000, "block_age_secs": 5 },
   "cl": { "transport": "http/1.1", "syncing": false, "sync_distance": 0, "peers": 78, "head_slot": 9412341, "slot_age_secs": 3 } }
 ```
 
@@ -132,11 +134,33 @@ Subprotocol offers from all request header lines are combined, and the selected
 protocol is relayed from the upstream. Unsupported extensions, including
 compression, are not negotiated; unsolicited extension responses are rejected.
 Frames remain limited to 16 MiB and complete messages to 64 MiB, including
-fragmented messages. The
-relay reads in 8 KiB chunks with frame storage that grows for larger frames,
-and uses 16 KiB write buffers; ordinary forwarding needs no additional shared
-sink mutex. Tungstenite
-continues to validate masking, UTF-8, control frames, and upstream handshakes.
+fragmented messages. The single-task non-blocking full-duplex `poll_fn` relay reads
+in 8 KiB chunks with frame storage that grows for larger frames and uses 16 KiB
+write buffers (capped at `64 MiB + 64 KiB` total write buffer and `64 KiB` per
+transport write) with independent directional backpressure and no split-sink lock;
+client `Ping` frames flush their local `Pong` immediately without forwarding
+upstream, upstream `Ping` frames flush their local `Pong` and are additionally
+forwarded to completely idle clients (whose `Pong` is absorbed locally without
+duplication) so front-side L7 load balancers observe keepalive traffic, and
+outbound relay sinks enforce progress-based stall deadlines (`--proxy-timeout`
+for data frames, `5s` when only a control frame flush is pending) that reset once
+at least `4 KiB` of new transport bytes drain after backpressure begins (bounded
+by kernel TCP / HTTP/2 flow-control send windows) while refusing extensions from
+queued trickle frames. Tungstenite continues to validate masking, UTF-8, control
+frames, and upstream handshakes.
+
+Inbound connections are bounded by `--max-connections` (`ETHONYX_MAX_CONNECTIONS`,
+default `4096`, `0` = unlimited) across all `--listen` addresses (including probe
+endpoints), HTTP/1.1, HTTP/2 (`max_concurrent_streams = 256`,
+`keep_alive_interval = 30s`), HTTP/1.1 upgraded WebSockets, and concurrent HTTP/2
+Extended `CONNECT` WebSocket streams (`503 Service Unavailable` when saturated).
+Newly accepted sockets enforce a 15-second initial protocol-preface read timeout
+(evicting silent or partial HTTP/2-preface sockets), followed by a 65-second
+HTTP/1.1 header / keep-alive idle timeout (> standard 60-second LB and client pool
+idle timeouts). Upstream response bodies are guarded by per-chunk idle
+timeouts: `--proxy-timeout` (default `60s`) for standard responses and
+`--sse-idle-timeout` (`ETHONYX_SSE_IDLE_TIMEOUT`, default `900s`, `0` = disabled)
+for `text/event-stream` Beacon event streams.
 
 Shutdown sets one deadline shared by HTTP connections, HTTP/2 request tasks
 and WebSocket relays. Existing work can finish during `--shutdown-grace`; late
@@ -149,14 +173,16 @@ cleartext EL JSON-RPC upstream can't be auto-negotiated, so the health poller
 probes it: it prefers cleartext **h2c** and forwards over HTTP/2 when the upstream
 serves it (geth ≥v1.17, erigon, reth), falling back to HTTP/1.1 otherwise — no
 flag. The verdict starts at h2c and is confirmed by the first poll before traffic
-is served. A running upstream that drops h2c is detected within one poll; one that
-newly adds h2c is picked up on restart (while HTTP/1.1 works it isn't re-probed).
+is served (without logging a false warning against h1-only nodes). A running
+upstream that drops h2c falls back within one poll and performs a one-shot h2c
+re-verification so transient mid-restart fallbacks self-heal automatically, and
+an HTTP/1.1 upstream upgraded to h2c across a restart is promoted automatically.
 The data-plane follows the verdict and never retries across protocols (to avoid
 double-sending a non-idempotent call like `eth_sendRawTransaction`), so while a
 running upstream is switching away from h2c the data-plane can briefly return
-`502`s — up to one poll interval — until the verdict updates. The CL Beacon hop
-stays HTTP/1.1. (The gain is mainly under high request concurrency; for a
-localhost sidecar hop it's modest.)
+`502`s — up to one poll interval — until the verdict updates. `https://` CL and
+EL upstreams also negotiate h2 via ALPN and report the negotiated transport on
+`/healthz`.
 
 ethonyx does **not** terminate TLS — it serves plaintext and leaves TLS to the
 LB / service mesh in front.
@@ -188,8 +214,8 @@ ethonyx \
 ETHONYX_LISTEN=0.0.0.0:8547,127.0.0.1:9547 ethonyx ...
 ```
 
-Each listener runs an independent accept loop on the tokio runtime, so cores
-saturate naturally without cross-listener locks.
+All listeners share a single fair round-robin accept loop and `--max-connections`
+permit pool, so an idle listener never withholds capacity from an active port.
 
 ## Logging
 
@@ -198,15 +224,17 @@ Structured JSON to stdout. Levels follow a sidecar-appropriate discipline:
 | Level   | What                                                                |
 |---------|---------------------------------------------------------------------|
 | `error` | genuine internal faults                                             |
-| `warn`  | readiness became **not-ready** (LB will deroute); `accept()` failed |
+| `warn`  | readiness became **not-ready** (LB will deroute); upstream `502` proxy / WS dial errors; connection-limit saturation; `accept()` failed |
 | `info`  | lifecycle (start w/ version / listen / shutdown), readiness **recovered**, the EL upstream h2c↔h1 switch |
-| `debug` | routine activity: per-request proxy / WS outcomes, each health poll, connection errors |
+| `debug` | routine activity: each health poll, client connection/body read errors, WS disconnects |
 | `trace` | fine-grained internal flow (request routing, connection accept / close) |
 
 `info` is reserved for notable, low-frequency events, so a healthy sidecar is
 nearly silent between state changes — request rates and latencies belong in
-metrics, not one log line per request. Routine upstream / client failures (a 502,
-a dropped WebSocket) are `debug`, not `error` — for a sidecar they are everyday.
+metrics, not one log line per request. Upstream `502` proxy / WebSocket dial
+failures and connection-limit saturation transitions emit `warn` so degraded
+upstream connectivity is visible under the default `info` level, while routine
+client disconnects stay `debug`.
 Readiness *changes* are logged once by the poller (not per probe).
 
 The startup line carries two version fields: `version` (the crate version, e.g.
@@ -249,7 +277,8 @@ RUST_LOG=ethonyx=debug,access_log=info ethonyx ...
 ethonyx exports core application and proxy metrics on `GET /metrics`.
 
 The following metrics are exposed:
-- `ethonyx_active_connections`: Number of currently active client connections (labeled by `protocol` as `tcp` or `ws`).
+- `ethonyx_active_connections`: Number of currently active client connections (labeled by `protocol`: `tcp` tracks open inbound HTTP/1.1 and HTTP/2 TCP sessions until upgrade handoff or socket close, while `ws` tracks active upgraded HTTP/1.1 and HTTP/2 Extended `CONNECT` WebSocket relays).
+- `ethonyx_connection_limit_saturated_total`: Total number of inbound TCP accepts queued or HTTP/2 Extended `CONNECT` WebSocket streams rejected due to `--max-connections` saturation.
 - `ethonyx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`).
 - `ethonyx_proxy_request_duration_seconds`: Latency histogram of upstream proxied requests (labeled by `upstream`).
 - `ethonyx_upstream_peers`: Number of peers reported by upstream nodes (labeled by `layer` as `el` or `cl`).
@@ -276,7 +305,7 @@ ethonyx --otel-endpoint http://localhost:4318 ...
 ```
 
 When enabled:
-- **Distributed Tracing**: Context propagation is hooked into client requests (W3C standard `traceparent` headers are injected into upstream requests).
+- **Distributed Tracing**: Context propagation is hooked into HTTP and WebSocket upstream requests (W3C standard `traceparent` headers are injected after hop-by-hop header sanitization).
 - **Span Attributes**: Upstream requests are instrumented with tracing spans containing method, path, and upstream layer details.
 - **Resource Identity**: `service.name` defaults to `ethonyx` and honors standard `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` overrides.
 
@@ -339,7 +368,7 @@ When running `ethonyx` against a fallback/secondary node or a commercial paid RP
 | `--mock-cl-node-health`                  | `false` | Intercept `GET /eth/v1/node/health` locally with `200 OK`.                  |
 | `--cl-mev-relay-url`                     | `none`  | Optional upstream MEV Relay URL (`ETHONYX_CL_MEV_RELAY_URL`).                |
 
-- **`--trust-upstream`**: When enabled, `ethonyx` trusts the upstream node and skips background EL/CL health polling (consuming zero Compute Units / API credits on commercial providers).
+- **`--trust-upstream`**: When enabled, `ethonyx` trusts the upstream node and skips background EL/CL health polling (consuming zero Compute Units / API credits on commercial providers). `/healthz` reports `"mode": "trusted"` with only the active `transport` per layer (no fabricated peer or block numbers), and `/metrics` omits unpolled upstream gauges.
 - **`--mock-cl-subscriptions`**: Intercepts `POST /eth/v1/validator/prepare_beacon_proposer`, `POST /eth/v1/validator/beacon_committee_subscriptions`, and `POST /eth/v1/validator/sync_committee_subscriptions` requests (sent periodically by SSV Node / Validator Clients) and returns `HTTP 200 OK` (`{"code":200,"message":"success"}`) locally, shielding against 400 errors from commercial providers that block write-only validator APIs.
 - **`--mock-eth-syncing`**: Intercepts `eth_syncing` JSON-RPC calls over HTTP POST and WebSocket frames locally (`result: false`), shielding commercial providers from downstream client sync polls.
 - **`--mock-cl-node-health`**: Intercepts `GET/HEAD /eth/v1/node/health` requests locally and returns `HTTP 200 OK` (Beacon API standard node health), shielding commercial providers from beacon node health probes.

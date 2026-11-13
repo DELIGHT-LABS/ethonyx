@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Added
+
+- Add `--sse-idle-timeout` (`ETHONYX_SSE_IDLE_TIMEOUT`, default `900` seconds, `0` = disabled) to keep long-lived Beacon SSE (`text/event-stream`) subscriptions open across quiet intervals while bounding stalled normal HTTP response bodies by `--proxy-timeout`.
+- Add `--max-connections` (`ETHONYX_MAX_CONNECTIONS`, default `4096`, `0` = unlimited) shared semaphore backpressure across all `--listen` ports, HTTP/1.1, HTTP/2, HTTP/1.1 upgraded WebSockets, and concurrent HTTP/2 Extended `CONNECT` WebSocket streams (with `ethonyx_connection_limit_saturated_total`), plus a `15s` initial protocol-preface read timeout and `65s` HTTP/1.1 header/keep-alive idle timeout.
+- Add `mode` (`"probed"` | `"trusted"`) to `/healthz` (`HealthSnapshot`), reporting honest unpolled state under `--trust-upstream` without fabricated peer counts or gauges.
+- Propagate W3C `traceparent` context on upstream WebSocket handshakes when `otel` is enabled.
+
 ### Changed
 
 - **BREAKING**: Rename the project, crate, binary, and observability surface from `ethryx` to **`ethonyx`**:
@@ -18,9 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - OpenTelemetry default service name, tracer scope, and meter scope: `"ethryx"` → `"ethonyx"`
   - Release archive naming: `ethonyx-<tag>-<target>.{tar.gz,zip}`
 - Upgrade the Rust toolchain and MSRV to `1.99`, bump `cargo-about` to `0.9.3`, replace legacy `cross` release builds with `taiki-e/setup-cross-toolchain-action`, and update direct and transitive Cargo dependencies (`tokio` `1.54.1`, `aws-lc-rs` `1.19.0`, `rustls-webpki` `0.103.16`, `webpki-roots` `1.0.12`, `webpki-root-certs` `1.0.12`, etc.).
+- Unify the CL/EL HTTP proxy pipeline, replace the 2-task split/mutex WebSocket relay with a lock-free single-task full-duplex `poll_fn` state machine, rewrite upstream URIs via zero-copy `Uri::from_parts` and single-allocation `BytesMut` path composition, and scan `eth_syncing` prefilters in a single byte-level pass.
+- Redact credentials, non-root API-key path segments, queries, and fragments from `Config` `Debug` output, startup logs, and validation errors, reject `userinfo@` credentials and malformed/out-of-range ports in upstream and OTel URLs at startup, and return a fixed `"bad gateway"` body on `502` proxy errors (logged at `warn`).
 
 ### Fixed
 
+- Return `503 Service Unavailable` (instead of `206 Partial Content`) from mocked `/eth/v1/node/health` when either upstream layer is unreachable or when `--readyz-strict` detects stale blocks/slots; return `206` only when both layers are reachable and actively syncing.
+- Preserve valid upstream `Content-Length` headers and body `size_hint` on proxied HTTP/1.1 responses instead of unconditionally degrading to `Transfer-Encoding: chunked`, normalize leading-zero `Content-Length` values, strip `Content-Length` on `1xx`/`204`/`205`/`304` and `Transfer-Encoding` responses, sanitize response headers before SSE idle-timeout classification, return `414 URI Too Long` when scoped URI rewriting overflows `http::Uri` limits, and reject non-origin-form (`OPTIONS *`) or non-WebSocket `CONNECT` targets with `400 Bad Request` before proxy metrics/spans.
+- Drain request bodies frame-by-frame without buffering (bounded by 64 MiB and `--proxy-timeout`) on `--mock-cl-subscriptions` endpoints so HTTP/1.1 keep-alive connections remain synchronized across pipelined/sequential requests.
+- Prevent full-duplex WebSocket backpressure deadlocks on pipelined bursts, flush `Pong` replies immediately on hop-by-hop `Ping` frames (forwarding upstream `Ping`s only when the client stream is completely idle while absorbing `Pong`s without duplication), cap WebSocket write buffers and chunk transport writes to `64 KiB` so HTTP/2 Extended `CONNECT` streams track slow-reader progress accurately, share WebPKI TLS roots across HTTP and `wss://` upstreams without advertising `h2` ALPN on WebSocket handshakes, and enforce `4 KiB`-threshold write-progress stall deadlines so slow-but-progressing peers succeed while zero-progress or Slowloris sinks abort without trickle-frame extension.
+- Canonicalize uppercase `WS://` / `WSS://` / `HTTP://` / `HTTPS://` schemes and query-only root URLs (e.g. `wss://host?key=...` → `wss://host/?key=...`) at startup, self-heal confirmed `h2c` EL upstreams across transient mid-restart fallbacks without logging a false downgrade warning at startup against HTTP/1.1-only EL nodes, and record negotiated TLS HTTP/2 (`h2`) versions on `/healthz`.
+- Inject OpenTelemetry `traceparent` headers after `strip_hop_by_hop` so client `Connection: traceparent` headers cannot suppress outgoing trace propagation, export request spans immediately without pinning them to pooled upstream connection driver tasks, ensure OTel providers shut down even on startup/bind errors, race initial health probes against shutdown signals, and validate non-zero timeouts, listener addresses (including IPv6 link-local zone IDs), semaphore bounds, schemes, and authorities at startup before initializing global telemetry/metrics recorders.
 - Honor explicit `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` (`service.name=...`) overrides instead of overwriting them with the default service name.
 - Track Git worktrees, packed/loose refs, tags, and crate sources in `build.rs` without invalidating Cargo's incremental cache or triggering a post-`describe` index rebuild.
 

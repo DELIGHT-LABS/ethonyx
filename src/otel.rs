@@ -3,15 +3,23 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 
 const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");
+const TRACEPARENT: http::HeaderName = http::HeaderName::from_static("traceparent");
+const TRACESTATE: http::HeaderName = http::HeaderName::from_static("tracestate");
 
 struct HeaderMapCarrier<'a>(&'a mut http::HeaderMap);
 
 impl<'a> opentelemetry::propagation::Injector for HeaderMapCarrier<'a> {
     fn set(&mut self, key: &str, value: String) {
-        if let (Ok(name), Ok(val)) = (
-            http::HeaderName::from_bytes(key.as_bytes()),
-            http::HeaderValue::from_str(&value),
-        ) {
+        let name = if key.eq_ignore_ascii_case("traceparent") {
+            TRACEPARENT
+        } else if key.eq_ignore_ascii_case("tracestate") {
+            TRACESTATE
+        } else if let Ok(custom) = http::HeaderName::from_bytes(key.as_bytes()) {
+            custom
+        } else {
+            return;
+        };
+        if let Ok(val) = http::HeaderValue::try_from(value) {
             self.0.insert(name, val);
         }
     }
@@ -21,7 +29,8 @@ struct HeaderMapCarrierRef<'a>(&'a http::HeaderMap);
 
 impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrierRef<'a> {
     fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|v| v.to_str().ok())
+        let val = self.0.get(key)?.to_str().ok()?;
+        (!crate::headers::is_connection_nominated(self.0, key)).then_some(val)
     }
 
     fn keys(&self) -> Vec<&str> {
@@ -29,36 +38,46 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrierRef<'a> {
     }
 }
 
-pub fn propagate_context(headers: &mut http::HeaderMap) {
+/// Link `span` to any non-`Connection`-nominated parent trace context in `headers`.
+/// Must be called BEFORE `span` is first entered so `tracing-opentelemetry` builds
+/// the underlying OTel `Span` with the extracted parent `TraceId`.
+pub(crate) fn attach_parent_context(span: &tracing::Span, headers: &http::HeaderMap) {
+    if span.is_disabled() {
+        return;
+    }
     let parent_cx = global::get_text_map_propagator(|propagator| {
         propagator.extract(&HeaderMapCarrierRef(headers))
     });
+    if opentelemetry::trace::TraceContextExt::has_active_span(&parent_cx) {
+        let _ = tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(span, parent_cx);
+    }
+}
 
+pub(crate) fn propagate_context(headers: &mut http::HeaderMap) {
     let span = tracing::Span::current();
-    let cx = if span.id().is_none() {
-        parent_cx
-    } else {
-        let _ = tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&span, parent_cx);
-        tracing_opentelemetry::OpenTelemetrySpanExt::context(&span)
-    };
-
+    if span.is_disabled() {
+        // When no tracing subscriber/span is active, any non-Connection-nominated
+        // incoming `traceparent` was already preserved intact by `strip_hop_by_hop`.
+        return;
+    }
+    let cx = tracing_opentelemetry::OpenTelemetrySpanExt::context(&span);
     global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&cx, &mut HeaderMapCarrier(headers))
     });
 }
 
-pub struct Telemetry {
+pub(crate) struct Telemetry {
     traces: opentelemetry_sdk::trace::SdkTracerProvider,
     metrics: opentelemetry_sdk::metrics::SdkMeterProvider,
 }
 
 impl Telemetry {
-    pub fn tracer(&self) -> opentelemetry_sdk::trace::SdkTracer {
+    pub(crate) fn tracer(&self) -> opentelemetry_sdk::trace::SdkTracer {
         use opentelemetry::trace::TracerProvider;
         self.traces.tracer(SERVICE_NAME)
     }
 
-    pub async fn shutdown(self) {
+    pub(crate) async fn shutdown(self) {
         // Blocking readers/exporters must be joined outside the async worker.
         let _ = tokio::task::spawn_blocking(move || {
             let _ = self.metrics.shutdown();
@@ -68,26 +87,43 @@ impl Telemetry {
     }
 }
 
-pub async fn start(endpoint: Option<&str>) -> Result<Option<Telemetry>, crate::BoxError> {
-    let Some(endpoint) = endpoint else {
+/// Start the OTLP trace and metric providers for a validated endpoint.
+pub(crate) async fn start(
+    base: Option<crate::upstream::HttpUpstream>,
+) -> Result<Option<Telemetry>, crate::BoxError> {
+    let Some(base) = base else {
         return Ok(None);
     };
-    let endpoint = endpoint.to_owned();
-    tokio::task::spawn_blocking(move || init_otel(&endpoint))
+    tokio::task::spawn_blocking(move || init_otel(&base))
         .await?
         .map(Some)
 }
 
-fn signal_endpoint(endpoint: &str, signal: &str) -> Result<String, crate::BoxError> {
-    let uri: http::Uri = endpoint.parse()?;
-    if !matches!(uri.scheme_str(), Some("http" | "https"))
-        || uri.authority().is_none()
-        || uri.query().is_some()
-        || endpoint.contains('#')
-    {
-        return Err("OTLP endpoint must be an HTTP(S) base URL without a query or fragment".into());
+pub(crate) fn parse_endpoint(
+    endpoint: &str,
+) -> Result<crate::upstream::HttpUpstream, crate::BoxError> {
+    let upstream = crate::upstream::HttpUpstream::parse("--otel-endpoint", endpoint)?;
+    if upstream.uri().query().is_some() {
+        return Err(format!(
+            "invalid --otel-endpoint ({}): OTLP endpoint must be an HTTP(S) base URL without a query or fragment",
+            crate::upstream::RedactedUrl(endpoint)
+        )
+        .into());
     }
-    Ok(format!("{}/v1/{signal}", endpoint.trim_end_matches('/')))
+    Ok(upstream)
+}
+
+fn signal_url(base: &crate::upstream::HttpUpstream, signal: &str) -> String {
+    let uri = base.uri();
+    let scheme = uri.scheme_str().expect("validated scheme");
+    let authority = uri.authority().expect("validated authority");
+    let prefix = uri.path().trim_end_matches('/');
+    format!("{scheme}://{authority}{prefix}/v1/{signal}")
+}
+
+#[cfg(test)]
+fn signal_endpoint(endpoint: &str, signal: &str) -> Result<String, crate::BoxError> {
+    parse_endpoint(endpoint).map(|base| signal_url(&base, signal))
 }
 
 fn build_resource() -> Resource {
@@ -115,14 +151,14 @@ fn build_resource_with(
     builder.build()
 }
 
-fn init_otel(endpoint: &str) -> Result<Telemetry, crate::BoxError> {
+fn init_otel(base: &crate::upstream::HttpUpstream) -> Result<Telemetry, crate::BoxError> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_endpoint(signal_endpoint(endpoint, "traces")?)
+        .with_endpoint(signal_url(base, "traces"))
         .build()?;
     let meter_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
-        .with_endpoint(signal_endpoint(endpoint, "metrics")?)
+        .with_endpoint(signal_url(base, "metrics"))
         .build()?;
 
     let resource = build_resource();
@@ -155,7 +191,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-pub struct OtelRecorder {
+pub(crate) struct OtelRecorder {
     meter: opentelemetry::metrics::Meter,
     counters: RwLock<HashMap<Key, Counter>>,
     gauges: RwLock<HashMap<Key, Gauge>>,
@@ -169,7 +205,7 @@ impl Default for OtelRecorder {
 }
 
 impl OtelRecorder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_meter(global::meter(SERVICE_NAME))
     }
 
@@ -389,11 +425,24 @@ mod tests {
             .build();
         let recorder = OtelRecorder::with_meter(provider.meter(SERVICE_NAME));
 
+        let proxy_metrics = crate::metrics::ProxyMetrics::default();
+        let health_metrics = crate::metrics::HealthMetrics::default();
         let tcp_guard = ::metrics::with_local_recorder(&recorder, || {
-            let tcp = crate::metrics::ActiveConnectionGuard::tcp();
+            let tcp = proxy_metrics.active_tcp();
             // Open and immediately drop a WS connection to verify symmetrical +1 / -1.
-            drop(crate::metrics::ActiveConnectionGuard::ws());
-            ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "el").set(8.0);
+            drop(proxy_metrics.active_ws());
+            health_metrics.record(crate::metrics::HealthSample {
+                el_ok: true,
+                cl_ok: true,
+                el_peers: 8.0,
+                cl_peers: 12.0,
+                el_distance: 0.0,
+                cl_status: Some(crate::metrics::ClSlotSample {
+                    sync_distance: 0,
+                    head_slot: 42,
+                }),
+                el_block: Some(100),
+            });
             tcp
         });
 
@@ -435,7 +484,12 @@ mod tests {
             .find(|(name, _, _)| name == "ethonyx_upstream_peers")
             .expect("upstream_peers exported");
         assert_eq!(peers.1, "gauge");
-        assert_eq!(peers.2, vec![(vec![KeyValue::new("layer", "el")], 8.0)]);
+        assert!(peers.2.contains(&(vec![KeyValue::new("layer", "el")], 8.0)));
+        assert!(
+            peers
+                .2
+                .contains(&(vec![KeyValue::new("layer", "cl")], 12.0))
+        );
     }
 
     #[test]
@@ -467,23 +521,141 @@ mod tests {
         for base in [
             "https://collector:4318/prefix",
             "https://collector:4318/prefix/",
+            "HTTP://collector:4318",
         ] {
+            let expected_scheme = if base.starts_with("HTTP:") {
+                "http://collector:4318"
+            } else {
+                "https://collector:4318/prefix"
+            };
             assert_eq!(
                 signal_endpoint(base, "traces").unwrap(),
-                "https://collector:4318/prefix/v1/traces"
+                format!("{expected_scheme}/v1/traces")
             );
             assert_eq!(
                 signal_endpoint(base, "metrics").unwrap(),
-                "https://collector:4318/prefix/v1/metrics"
+                format!("{expected_scheme}/v1/metrics")
             );
         }
         for invalid in [
             "collector:4318",
             "ftp://collector",
-            "http://collector?x=1",
-            "http://collector/#fragment",
+            "http://user:SECRET@collector:4318",
+            "http://:4318",
+            "http://collector:0",
+            "http://collector:+4318",
+            "http://collector:004318",
+            "http://collector:99999",
+            "http://collector:",
+            "http://collector?x=SECRET",
+            "http://collector/#SECRET",
         ] {
-            assert!(signal_endpoint(invalid, "traces").is_err(), "{invalid}");
+            let err = signal_endpoint(invalid, "traces")
+                .expect_err(invalid)
+                .to_string();
+            assert!(!err.contains("SECRET"), "leaked secret in {err}");
         }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturingSpanExporter(Arc<Mutex<Vec<String>>>);
+
+    impl opentelemetry_sdk::trace::SpanExporter for CapturingSpanExporter {
+        async fn export(&self, batch: Vec<opentelemetry_sdk::trace::SpanData>) -> OTelSdkResult {
+            let mut out = self.0.lock().unwrap();
+            out.extend(batch.into_iter().map(|s| s.name.into_owned()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_client_exports_first_request_span_while_keepalive_socket_stays_open() {
+        use bytes::Bytes;
+        use http::{Method, Request, Response, StatusCode};
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Incoming;
+        use hyper::service::service_fn;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto;
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing::Instrument as _;
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::prelude::*;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let _ = req.into_body().collect().await;
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from_static(b"ok")))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let span_exporter = CapturingSpanExporter::default();
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(span_exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer_provider.tracer(SERVICE_NAME))
+                .with_filter(tracing_subscriber::EnvFilter::new(
+                    "ethonyx=info,access_log=off",
+                )),
+        );
+
+        let (https, _) = crate::proxy::build_connectors(false);
+        let h1_client = crate::proxy::build_client(https.clone());
+        let h2c_client = crate::proxy::build_h2c_client(https);
+        let uri: http::Uri = format!("http://{addr}/").parse().unwrap();
+
+        async {
+            for (name, client) in [("request_h1", &h1_client), ("request_h2c", &h2c_client)] {
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri(uri.clone())
+                    .body(crate::proxy::box_full(Full::new(Bytes::from_static(b"{}"))))
+                    .unwrap();
+                async {
+                    let resp = client.request(req).await.unwrap();
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    let _ = resp.into_body().collect().await.unwrap();
+                }
+                .instrument(tracing::info_span!("request", kind = name))
+                .await;
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        // Both pooled keep-alive connections (HTTP/1.1 and HTTP/2) are STILL open inside
+        // `h1_client` and `h2c_client`. Without `rt-tracing-exec-force`, background pool
+        // driver tasks must NOT retain a clone of Request #1's span!
+        {
+            let exported = span_exporter.0.lock().unwrap();
+            assert_eq!(
+                exported.as_slice(),
+                &["request", "request"],
+                "first request spans must export immediately while pooled connections remain open"
+            );
+        }
+
+        drop((h1_client, h2c_client));
+        server.abort();
+        let _ = tracer_provider.shutdown();
     }
 }
