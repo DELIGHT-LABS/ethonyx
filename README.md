@@ -136,13 +136,18 @@ compression, are not negotiated; unsolicited extension responses are rejected.
 Frames remain limited to 16 MiB and complete messages to 64 MiB, including
 fragmented messages. The single-task non-blocking full-duplex `poll_fn` relay reads
 in 8 KiB chunks with frame storage that grows for larger frames and uses 16 KiB
-write buffers with independent directional backpressure and no split-sink lock;
-hop-by-hop `Ping` frames flush their local `Pong` immediately without forwarding
-`Ping` or duplicating `Pong` across hops, and outbound relay sinks enforce
-progress-based stall deadlines (`--proxy-timeout` for data frames, `5s` when only
-a control reply is pending) that reset on actual socket byte writes while refusing
-extensions from queued trickle frames. Tungstenite continues to validate
-masking, UTF-8, control frames, and upstream handshakes.
+write buffers (capped at `64 MiB + 64 KiB` total write buffer and `64 KiB` per
+transport write) with independent directional backpressure and no split-sink lock;
+client `Ping` frames flush their local `Pong` immediately without forwarding
+upstream, upstream `Ping` frames flush their local `Pong` and are additionally
+forwarded to completely idle clients (whose `Pong` is absorbed locally without
+duplication) so front-side L7 load balancers observe keepalive traffic, and
+outbound relay sinks enforce progress-based stall deadlines (`--proxy-timeout`
+for data frames, `5s` when only a control frame flush is pending) that reset once
+at least `4 KiB` of new transport bytes drain after backpressure begins (bounded
+by kernel TCP / HTTP/2 flow-control send windows) while refusing extensions from
+queued trickle frames. Tungstenite continues to validate masking, UTF-8, control
+frames, and upstream handshakes.
 
 Inbound connections are bounded by `--max-connections` (`ETHONYX_MAX_CONNECTIONS`,
 default `4096`, `0` = unlimited) across all `--listen` addresses (including probe

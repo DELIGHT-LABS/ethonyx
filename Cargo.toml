@@ -13,7 +13,7 @@ categories = ["network-programming"]
 [dependencies]
 clap = { version = "4.6", features = ["derive", "env"] }
 hyper = { version = "1.12", features = ["server", "client", "http1", "http2"] }
-hyper-util = { version = "0.1.21", features = ["client", "client-legacy", "http1", "http2", "server-auto", "tokio", "tracing", "rt-tracing-exec-force"] }
+hyper-util = { version = "0.1.21", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "aws-lc-rs", "webpki-tokio", "tls12"] }
 http = "1.5"
@@ -39,6 +39,7 @@ tracing-opentelemetry = { version = "0.34", optional = true, default-features = 
 otel = ["dep:metrics-util", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [dev-dependencies]
+hyper-util = { version = "0.1.21", features = ["server-auto"] }
 tokio = { version = "1.54.1", features = ["test-util"] }
 
 [profile.release]

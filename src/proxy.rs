@@ -18,8 +18,7 @@ use tracing::{Instrument, debug, info, trace, warn};
 
 use crate::headers::{sanitize_response_headers, strip_hop_by_hop};
 use crate::health;
-use crate::state::AppState;
-use crate::upstream::HttpUpstream;
+use crate::state::{AppState, HttpTarget};
 use crate::websocket::WsMode;
 
 pub use crate::BoxError;
@@ -51,16 +50,20 @@ fn configure_client_builder() -> hyper_util::client::legacy::Builder {
 }
 
 /// Build the shared WebPKI TLS configuration once so `https://` and `wss://`
-/// upstreams share root certificates and TLS session resumption while keeping
-/// `wss://` ALPN empty (strictly HTTP/1.1 `Upgrade`).
-pub(crate) fn build_connectors() -> (Https, tokio_tungstenite::Connector) {
+/// upstreams share root certificates while keeping `wss://` ALPN empty (strictly
+/// HTTP/1.1 `Upgrade`) and using [`tokio_tungstenite::Connector::Plain`] on `ws://`.
+pub(crate) fn build_connectors(ws_is_tls: bool) -> (Https, tokio_tungstenite::Connector) {
     use hyper_rustls::ConfigBuilderExt;
 
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let base_tls = rustls::ClientConfig::builder()
         .with_webpki_roots()
         .with_no_client_auth();
-    let ws_tls = tokio_tungstenite::Connector::Rustls(Arc::new(base_tls.clone()));
+    let ws_tls = if ws_is_tls {
+        tokio_tungstenite::Connector::Rustls(Arc::new(base_tls.clone()))
+    } else {
+        tokio_tungstenite::Connector::Plain
+    };
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(base_tls)
         .https_or_http()
@@ -345,14 +348,6 @@ pub(crate) fn is_cl_path(path: &str) -> bool {
     }
 }
 
-static UNTRACKED_TRANSPORT: health::HttpTransport = health::HttpTransport::CleartextH1;
-
-#[derive(Clone, Copy)]
-struct UpstreamPlan<'a> {
-    upstream: &'a HttpUpstream,
-    transport: &'a health::HttpTransport,
-}
-
 async fn route(
     req: Request<Incoming>,
     connection: &Arc<Connection>,
@@ -392,7 +387,7 @@ async fn proxy_cl(req: Request<Incoming>, state: &AppState) -> Result<Response<R
         ));
     }
     let (mut parts, body) = req.into_parts();
-    let plan = if parts.method == Method::POST
+    let target = if parts.method == Method::POST
         && parts.uri.path() == "/eth/v1/validator/register_validator"
         && let Some(ref mev) = state.cl_mev_relay
     {
@@ -402,17 +397,11 @@ async fn proxy_cl(req: Request<Incoming>, state: &AppState) -> Result<Response<R
             return Ok(uri_too_long_response());
         };
         parts.uri = replaced;
-        UpstreamPlan {
-            upstream: mev,
-            transport: &UNTRACKED_TRANSPORT,
-        }
+        mev
     } else {
-        UpstreamPlan {
-            upstream: &state.cl_beacon,
-            transport: &state.cl_transport,
-        }
+        &state.cl
     };
-    execute_upstream(parts, box_incoming(body), state, plan).await
+    execute_upstream(parts, box_incoming(body), state, target).await
 }
 
 async fn proxy_el(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
@@ -432,11 +421,7 @@ async fn proxy_el(req: Request<Incoming>, state: &AppState) -> Result<Response<R
     };
     // Select at dispatch, after any mock body inspection: local replies need
     // no transport lookup, and forwarded requests follow the latest verdict.
-    let plan = UpstreamPlan {
-        upstream: &state.el_http,
-        transport: &state.el_transport,
-    };
-    execute_upstream(parts, body, state, plan).await
+    execute_upstream(parts, body, state, &state.el).await
 }
 
 #[derive(Clone, Copy)]
@@ -515,9 +500,9 @@ async fn execute_upstream(
     mut parts: http::request::Parts,
     body: ResBody,
     state: &AppState,
-    plan: UpstreamPlan<'_>,
+    target: &HttpTarget,
 ) -> Result<Response<ResBody>, BoxError> {
-    let Ok(rewritten) = plan.upstream.rewrite_uri(parts.uri) else {
+    let Ok(rewritten) = target.upstream.rewrite_uri(parts.uri) else {
         return Ok(uri_too_long_response());
     };
     parts.uri = rewritten;
@@ -534,13 +519,13 @@ async fn execute_upstream(
     // (h1 for cleartext, h2 via ALPN for an https upstream).
     parts.version = Version::HTTP_11;
     let upstream_req = Request::from_parts(parts, body);
-    let client = plan.transport.select_client(&state.client);
+    let client = target.transport.select_client(&state.client);
 
     let resp = tokio::time::timeout(state.cfg.proxy_timeout, client.request(upstream_req))
         .await
         .map_err(|_| -> BoxError { "upstream timeout".into() })??;
 
-    plan.transport.record_version(resp.version());
+    target.transport.record_version(resp.version());
 
     let (mut resp_parts, resp_body) = resp.into_parts();
     sanitize_response_headers(resp_parts.status, &mut resp_parts.headers);

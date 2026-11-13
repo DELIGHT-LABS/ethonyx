@@ -4,8 +4,7 @@ use http::header::{
 };
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
-static HOP_BY_HOP: [HeaderName; 10] = [
-    CONNECTION,
+static HOP_BY_HOP_FIXED: [HeaderName; 9] = [
     HeaderName::from_static("keep-alive"),
     HeaderName::from_static("proxy-connection"),
     PROXY_AUTHENTICATE,
@@ -24,12 +23,13 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
     if headers.is_empty() {
         return;
     }
-    remove_connection_nominated(headers);
-    for name in &HOP_BY_HOP {
+    for name in &HOP_BY_HOP_FIXED {
         headers.remove(name);
     }
     headers.remove(TRANSFER_ENCODING);
     headers.remove(CONTENT_LENGTH);
+    remove_connection_nominated(headers);
+    headers.remove(CONNECTION);
 }
 
 /// Sanitize upstream response headers before returning to the downstream client:
@@ -41,10 +41,11 @@ pub fn sanitize_response_headers(status: StatusCode, headers: &mut HeaderMap) {
         return;
     }
     let had_transfer_encoding = headers.remove(TRANSFER_ENCODING).is_some();
-    remove_connection_nominated(headers);
-    for name in &HOP_BY_HOP {
+    for name in &HOP_BY_HOP_FIXED {
         headers.remove(name);
     }
+    remove_connection_nominated(headers);
+    headers.remove(CONNECTION);
 
     if had_transfer_encoding
         || status.is_informational()
@@ -106,22 +107,22 @@ pub(crate) fn is_connection_nominated(headers: &HeaderMap, target: &str) -> bool
 }
 
 fn remove_connection_nominated(headers: &mut HeaderMap) {
-    // Read every Connection field before removing it: its options nominate
+    // Read every Connection field before removing `CONNECTION`: its options nominate
     // additional headers that must not cross this hop (RFC 9110, section 7.6.1).
+    // Fixed hop-by-hop headers were already removed above, so standard tokens like
+    // `keep-alive`, `te`, and `upgrade` miss `contains_key` without allocating `Vec`.
+    if !headers.contains_key(CONNECTION) {
+        return;
+    }
     let mut nominated = Vec::new();
     for value in headers.get_all(CONNECTION) {
         for raw in value.as_bytes().split(|&b| b == b',') {
             let Ok(token) = std::str::from_utf8(raw.trim_ascii()) else {
                 continue;
             };
-            if token.is_empty()
-                || token.eq_ignore_ascii_case("keep-alive")
-                || token.eq_ignore_ascii_case("upgrade")
-                || token.eq_ignore_ascii_case("connection")
-            {
-                continue;
-            }
-            if headers.contains_key(token)
+            if !token.is_empty()
+                && !token.eq_ignore_ascii_case("connection")
+                && headers.contains_key(token)
                 && let Ok(name) = HeaderName::from_bytes(token.as_bytes())
             {
                 nominated.push(name);
@@ -161,7 +162,8 @@ mod tests {
     fn removes_known_hop_by_hop() {
         let mut m = h(&[
             ("host", "example.com"),
-            ("connection", "keep-alive"),
+            ("connection", "keep-alive, TE"),
+            ("te", "trailers"),
             ("content-length", "42"),
             ("transfer-encoding", "chunked"),
             ("upgrade", "websocket"),
@@ -170,6 +172,7 @@ mod tests {
         strip_hop_by_hop(&mut m);
         assert!(!m.contains_key("host"));
         assert!(!m.contains_key("connection"));
+        assert!(!m.contains_key("te"));
         assert!(!m.contains_key("content-length"));
         assert!(!m.contains_key("transfer-encoding"));
         assert!(!m.contains_key("upgrade"));

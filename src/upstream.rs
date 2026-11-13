@@ -171,12 +171,11 @@ impl Endpoint {
             .map_err(|_| format!("invalid {flag} ({}): malformed URI", RedactedUrl(raw)))?;
 
         let base_path = uri.path();
-        let target = if matches!(base_path, "" | "/") && uri.query().is_none() {
+        let target = if base_path == "/" && uri.query().is_none() {
             BaseTarget::Root
         } else {
-            let root_path = if base_path.is_empty() { "/" } else { base_path };
             BaseTarget::Scoped {
-                join_prefix_len: root_path.trim_end_matches('/').len(),
+                join_prefix_len: base_path.trim_end_matches('/').len(),
             }
         };
 
@@ -204,11 +203,10 @@ impl Endpoint {
             BaseTarget::Root => inbound_pq.unwrap_or_else(|| PathAndQuery::from_static("/")),
             BaseTarget::Scoped { join_prefix_len } => {
                 let base_path = self.uri.path();
-                let root_path = if base_path.is_empty() { "/" } else { base_path };
                 let (head, tail) = if matches!(inbound_path, "" | "/") {
-                    (root_path, "")
+                    (base_path, "")
                 } else {
-                    (&root_path[..join_prefix_len], inbound_path)
+                    (&base_path[..join_prefix_len], inbound_path)
                 };
                 compose_pq(head, tail, self.uri.query(), inbound_query)?
             }
@@ -306,6 +304,10 @@ impl WsUpstream {
             endpoint,
             host_header,
         })
+    }
+
+    pub(crate) const fn is_tls(&self) -> bool {
+        self.endpoint.is_tls
     }
 
     pub(crate) const fn host_header(&self) -> &HeaderValue {

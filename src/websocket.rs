@@ -21,6 +21,8 @@ use tracing::{debug, warn};
 const WS_CLOSE_GRACE: Duration = Duration::from_secs(1);
 const WS_CONTROL_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BATCH_FRAMES: usize = 32;
+const MAX_WRITE_CHUNK: usize = 64 * 1024;
+const MIN_WRITE_PROGRESS_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WsMode {
@@ -198,6 +200,7 @@ fn get_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig 
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .read_buffer_size(8 * 1024)
         .write_buffer_size(16 * 1024)
+        .max_write_buffer_size(64 * 1024 * 1024 + 64 * 1024)
         .max_message_size(Some(64 * 1024 * 1024))
         .max_frame_size(Some(16 * 1024 * 1024))
 }
@@ -235,16 +238,7 @@ pub(crate) async fn upgrade(
             tokio::net::TcpStream::connect((state.el_ws.dial_host(), state.el_ws.dial_port()))
                 .await
                 .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
-        if let Err(e) = tcp.set_nodelay(true) {
-            debug!(error = %e, "failed to set upstream WS TCP_NODELAY");
-        }
-        let sock_ref = socket2::SockRef::from(&tcp);
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(60))
-            .with_interval(Duration::from_secs(10));
-        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-            debug!(error = %e, "failed to set upstream WS TCP keepalive");
-        }
+        crate::configure_tcp_stream(&tcp);
         tokio_tungstenite::client_async_tls_with_config(
             ws_req,
             WriteProgressIo::new(tcp),
@@ -317,20 +311,19 @@ pub(crate) async fn upgrade(
     Ok(response.map(|()| box_full(http_body_util::Full::new(bytes::Bytes::new()))))
 }
 
-/// Tracks whether at least one byte was written to the underlying transport
-/// since the last stall check, distinguishing slow-but-progressing peers from
-/// genuinely stalled (`0`-byte) sockets.
+/// Caps single writes to [`MAX_WRITE_CHUNK`] (so HTTP/2 Extended `CONNECT`'s
+/// `Upgrade` bridge cannot swallow a multi-MiB frame in one `Box<[u8]>` and
+/// starve progress tracking) and accumulates written bytes so slow-progressing
+/// peers (`>= MIN_WRITE_PROGRESS_BYTES` per window) survive while `0`-byte or
+/// sub-threshold Slowloris drains abort on deadline.
 struct WriteProgressIo<I> {
     inner: I,
-    progressed: bool,
+    written: usize,
 }
 
 impl<I> WriteProgressIo<I> {
     const fn new(inner: I) -> Self {
-        Self {
-            inner,
-            progressed: false,
-        }
+        Self { inner, written: 0 }
     }
 }
 
@@ -350,11 +343,10 @@ impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteProgressIo
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = poll
-            && n > 0
-        {
-            self.progressed = true;
+        let capped = &buf[..buf.len().min(MAX_WRITE_CHUNK)];
+        let poll = Pin::new(&mut self.inner).poll_write(cx, capped);
+        if let Poll::Ready(Ok(n)) = poll {
+            self.written = self.written.saturating_add(n);
         }
         poll
     }
@@ -366,43 +358,44 @@ impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteProgressIo
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
-
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<std::io::Result<usize>> {
-        let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
-        if let Poll::Ready(Ok(n)) = poll
-            && n > 0
-        {
-            self.progressed = true;
-        }
-        poll
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
 }
 
 trait HasWriteProgress {
-    fn take_write_progress(&mut self) -> bool;
+    fn take_write_progress(&mut self, min_bytes: usize) -> bool;
+    fn reset_write_progress(&mut self);
 }
 
 impl<I> HasWriteProgress for WriteProgressIo<I> {
-    fn take_write_progress(&mut self) -> bool {
-        std::mem::replace(&mut self.progressed, false)
+    fn take_write_progress(&mut self, min_bytes: usize) -> bool {
+        if self.written >= min_bytes {
+            self.written = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset_write_progress(&mut self) {
+        self.written = 0;
     }
 }
 
 impl<S: HasWriteProgress> HasWriteProgress for tokio_tungstenite::MaybeTlsStream<S> {
-    fn take_write_progress(&mut self) -> bool {
+    fn take_write_progress(&mut self, min_bytes: usize) -> bool {
         match self {
-            Self::Plain(s) => s.take_write_progress(),
-            Self::Rustls(tls) => tls.get_mut().0.take_write_progress(),
+            Self::Plain(s) => s.take_write_progress(min_bytes),
+            Self::Rustls(tls) => tls.get_mut().0.take_write_progress(min_bytes),
             #[allow(unreachable_patterns)]
             _ => false,
+        }
+    }
+
+    fn reset_write_progress(&mut self) {
+        match self {
+            Self::Plain(s) => s.reset_write_progress(),
+            Self::Rustls(tls) => tls.get_mut().0.reset_write_progress(),
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
 }
@@ -431,7 +424,7 @@ enum OutboundState {
     DataActive { queued: Option<Message> },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side {
     Client,
     Upstream,
@@ -448,6 +441,7 @@ enum Stop {
 /// backpressure queue, 1-slot local mock-reply buffer, and progress-based stall timer.
 struct WsEndpoint<S> {
     ws: WebSocketStream<S>,
+    side: Side,
     outbound: OutboundState,
     local_reply: Option<Message>,
     deadline: LazyDeadline,
@@ -458,9 +452,10 @@ impl<S> WsEndpoint<S>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
 {
-    const fn new(ws: WebSocketStream<S>, io_timeout: Duration) -> Self {
+    const fn new(ws: WebSocketStream<S>, side: Side, io_timeout: Duration) -> Self {
         Self {
             ws,
+            side,
             outbound: OutboundState::Idle,
             local_reply: None,
             deadline: LazyDeadline::new(),
@@ -488,15 +483,45 @@ where
         }
     }
 
+    fn try_queue_idle_ping(
+        &mut self,
+        cx: &mut Context<'_>,
+        payload: bytes::Bytes,
+    ) -> Result<(), Stop> {
+        if !matches!(self.outbound, OutboundState::Idle) || self.local_reply.is_some() {
+            return Ok(());
+        }
+        if let Poll::Ready(res) = Pin::new(&mut self.ws).poll_ready(cx) {
+            res.map_err(|_| Stop::Abort)?;
+            Pin::new(&mut self.ws)
+                .start_send(Message::Ping(payload))
+                .map_err(|_| Stop::Abort)?;
+            self.request_control_flush();
+        }
+        Ok(())
+    }
+
     fn check_stall_deadline(
         &mut self,
         cx: &mut Context<'_>,
         timeout: Duration,
     ) -> Result<(), Stop> {
-        if self.ws.get_mut().take_write_progress() {
+        if !self.deadline.is_armed() {
+            // Discard initial buffer-fill bytes written before backpressure began.
+            self.ws.get_mut().reset_write_progress();
+        } else if self
+            .ws
+            .get_mut()
+            .take_write_progress(MIN_WRITE_PROGRESS_BYTES)
+        {
             self.deadline.disarm();
         }
         if self.deadline.poll_expired(cx, timeout) {
+            debug!(
+                side = ?self.side,
+                timeout_secs = timeout.as_secs(),
+                "ws write stalled; aborting relay"
+            );
             Err(Stop::Abort)
         } else {
             Ok(())
@@ -504,7 +529,7 @@ where
     }
 
     fn poll_send_queued(&mut self, cx: &mut Context<'_>) -> Result<(), Stop> {
-        let OutboundState::DataActive { ref mut queued } = self.outbound else {
+        let OutboundState::DataActive { queued } = &mut self.outbound else {
             return Ok(());
         };
         if queued.is_none() {
@@ -512,17 +537,15 @@ where
         }
         match Pin::new(&mut self.ws).poll_ready(cx) {
             Poll::Ready(Ok(())) => {
-                let OutboundState::DataActive { ref mut queued } = self.outbound else {
-                    unreachable!();
-                };
                 let msg = queued.take().expect("queued checked");
                 Pin::new(&mut self.ws)
                     .start_send(msg)
-                    .map_err(|_| Stop::Abort)?;
-                Ok(())
+                    .map_err(|_| Stop::Abort)
             }
             Poll::Ready(Err(_)) => Err(Stop::Abort),
-            Poll::Pending => self.check_stall_deadline(cx, self.io_timeout),
+            // Defer stall-timer evaluation to Step 4 (`poll_flush_and_timer`),
+            // which runs once per turn after both directional pumps finish.
+            Poll::Pending => Ok(()),
         }
     }
 
@@ -552,7 +575,7 @@ where
         match Pin::new(&mut self.ws).poll_flush(cx) {
             Poll::Ready(Ok(())) => {
                 self.outbound = OutboundState::Idle;
-                let _ = self.ws.get_mut().take_write_progress();
+                self.ws.get_mut().reset_write_progress();
                 self.deadline.disarm();
                 Ok(())
             }
@@ -563,24 +586,22 @@ where
 
     async fn drain_pending(&mut self, timeout: Duration) -> bool {
         let was_active = !matches!(self.outbound, OutboundState::Idle);
-        let mut flushed_via_send = false;
-        if let OutboundState::DataActive { ref mut queued } = self.outbound
-            && let Some(msg) = queued.take()
-        {
-            if !send_bounded(&mut self.ws, msg, timeout).await {
-                self.outbound = OutboundState::Idle;
-                return false;
+        let queued = match std::mem::replace(&mut self.outbound, OutboundState::Idle) {
+            OutboundState::DataActive { queued } => queued,
+            OutboundState::Idle | OutboundState::ControlFlush => None,
+        };
+        let reply = self.local_reply.take();
+        if !was_active && queued.is_none() && reply.is_none() {
+            return true;
+        }
+        tokio::time::timeout(timeout, async {
+            for msg in queued.into_iter().chain(reply) {
+                self.ws.feed(msg).await?;
             }
-            flushed_via_send = true;
-        }
-        self.outbound = OutboundState::Idle;
-        if let Some(reply) = self.local_reply.take() {
-            return send_bounded(&mut self.ws, reply, timeout).await;
-        }
-        if was_active && !flushed_via_send {
-            return flush_bounded(&mut self.ws, timeout).await;
-        }
-        true
+            self.ws.flush().await
+        })
+        .await
+        .is_ok_and(|res| res.is_ok())
     }
 }
 
@@ -630,10 +651,17 @@ where
                         dst.enqueue_data(Message::Binary(bin));
                         dst.poll_send_queued(cx)?;
                     }
-                    Message::Ping(_) => {
+                    Message::Ping(payload) => {
                         // Ping/Pong are hop-by-hop control frames: Tungstenite queued
                         // the matching Pong on `src.ws` during `poll_next`.
                         src.request_control_flush();
+                        // Forward upstream keepalive Pings to a completely idle client so
+                        // L7 load balancers / NATs in front of ethonyx observe traffic
+                        // without adding per-connection proxy timers. Client's Pong is
+                        // absorbed locally when it arrives.
+                        if src.side == Side::Upstream {
+                            dst.try_queue_idle_ping(cx, payload)?;
+                        }
                     }
                     Message::Pong(_) | Message::Frame(_) => {}
                     Message::Close(frame) => return Err(Stop::Closed(frame)),
@@ -641,7 +669,7 @@ where
             }
         }
     }
-    Ok(count == MAX_BATCH_FRAMES)
+    Ok(count == MAX_BATCH_FRAMES && dst.can_accept() && src.local_reply.is_none())
 }
 
 async fn finish<A, B>(src: &mut WsEndpoint<A>, other: &mut WsEndpoint<B>, stop: Stop)
@@ -690,8 +718,8 @@ async fn bridge_ws<C, U>(
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress + Send + 'static,
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress + Send + 'static,
 {
-    let mut client = WsEndpoint::new(client_ws, io_timeout);
-    let mut upstream = WsEndpoint::new(upstream_ws, io_timeout);
+    let mut client = WsEndpoint::new(client_ws, Side::Client, io_timeout);
+    let mut upstream = WsEndpoint::new(upstream_ws, Side::Upstream, io_timeout);
 
     let (side, stop) = std::future::poll_fn(|cx| {
         // 1. Advance any already-queued outbound frames first so freed slots are
@@ -1202,17 +1230,19 @@ mod tests {
             "Ping must not shrink active data io_timeout to 5s"
         );
 
-        // Drain slowly: 1 frame every 6s across 8 frames -> t = 56s (5.6x io_timeout!).
-        // Because each read frees bytes in the 4 KiB socket, `WriteProgressIo` observes
-        // real write progress and resets the stall deadline.
+        // Drain slowly: 1 data frame every 6s starting at t = 8s -> t = 50s (5x io_timeout!).
+        // Because each 8 KiB read frees >= MIN_WRITE_PROGRESS_BYTES (4 KiB) in the socket,
+        // `WriteProgressIo` observes real write progress and resets the stall deadline.
         let mut data_received = 0usize;
         let mut saw_pong = false;
         while data_received < 8 || !saw_pong {
-            tokio::time::advance(Duration::from_secs(6)).await;
             match client.next().await.unwrap().unwrap() {
                 Message::Binary(b) => {
                     assert_eq!(b, vec![data_received as u8; 8 * 1024]);
                     data_received += 1;
+                    if data_received < 8 {
+                        tokio::time::advance(Duration::from_secs(6)).await;
+                    }
                 }
                 Message::Pong(p) => {
                     assert_eq!(p, bytes::Bytes::from_static(b"hb-under-load"));
@@ -1229,6 +1259,198 @@ mod tests {
             }
         }
         let _ = upstream.next().await;
+        relay.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_ping_forwards_to_idle_client_without_duplicate_pong_and_skips_busy_client() {
+        // 1. Idle client: upstream Ping is answered locally to upstream AND forwarded
+        // to the idle client; the client's Pong is absorbed without duplicating to upstream.
+        let (mut client, mut upstream, relay) =
+            duplex_bridge(16 * 1024, 16 * 1024, false, Duration::from_secs(5)).await;
+
+        upstream
+            .send(Message::Ping(bytes::Bytes::from_static(b"el-idle-hb")))
+            .await
+            .unwrap();
+        let up_pong = tokio::time::timeout(Duration::from_secs(1), upstream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            up_pong,
+            Message::Pong(bytes::Bytes::from_static(b"el-idle-hb"))
+        );
+
+        let forwarded_ping = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            forwarded_ping,
+            Message::Ping(bytes::Bytes::from_static(b"el-idle-hb"))
+        );
+
+        // Client's tungstenite auto-queued Pong during `client.next()`; flush it and
+        // follow immediately with a data frame to prove upstream never sees a 2nd Pong.
+        client.flush().await.unwrap();
+        client
+            .send(Message::Text("after-pong".into()))
+            .await
+            .unwrap();
+        let next_at_upstream = upstream.next().await.unwrap().unwrap();
+        assert_eq!(next_at_upstream, Message::Text("after-pong".into()));
+
+        client.close(None).await.unwrap();
+        while let Some(Ok(msg)) = client.next().await {
+            if msg.is_close() {
+                break;
+            }
+        }
+        let _ = upstream.next().await;
+        relay.await.unwrap();
+
+        // 2. Busy client (`DataActive`): upstream Ping is still answered to upstream,
+        // but NOT injected onto the already-active client stream.
+        let (mut client, mut upstream, relay) =
+            duplex_bridge(512, 64 * 1024, false, Duration::from_secs(5)).await;
+        for i in 0u8..2 {
+            upstream
+                .send(Message::Binary(bytes::Bytes::from(vec![i; 4096])))
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+
+        upstream
+            .send(Message::Ping(bytes::Bytes::from_static(b"busy-hb")))
+            .await
+            .unwrap();
+        let up_pong = tokio::time::timeout(Duration::from_secs(1), upstream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            up_pong,
+            Message::Pong(bytes::Bytes::from_static(b"busy-hb"))
+        );
+
+        for i in 0u8..2 {
+            let msg = client.next().await.unwrap().unwrap();
+            assert_eq!(msg, Message::Binary(bytes::Bytes::from(vec![i; 4096])));
+        }
+        client.close(None).await.unwrap();
+        while let Some(Ok(msg)) = client.next().await {
+            if msg.is_close() {
+                break;
+            }
+        }
+        let _ = upstream.next().await;
+        relay.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sub_threshold_slowloris_drain_and_stalled_ping_flood_still_abort() {
+        use tokio::io::AsyncReadExt;
+
+        // 1. Sub-4 KiB Slowloris drain (512 B every 4s on 10s io_timeout = 1024 B < 4 KiB)
+        // must NOT disarm the stall deadline and must abort at t = 10s.
+        let (mut raw_client, proxy_client_io) = tokio::io::duplex(4096);
+        let (proxy_upstream_io, upstream_io) = tokio::io::duplex(64 * 1024);
+        let proxy_client = WebSocketStream::from_raw_socket(
+            WriteProgressIo::new(proxy_client_io),
+            Role::Server,
+            Some(get_ws_config()),
+        )
+        .await;
+        let proxy_upstream = WebSocketStream::from_raw_socket(
+            WriteProgressIo::new(proxy_upstream_io),
+            Role::Client,
+            Some(get_ws_config()),
+        )
+        .await;
+        let mut upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
+        let relay = tokio::spawn(bridge_ws(
+            proxy_client,
+            proxy_upstream,
+            false,
+            Duration::from_secs(10),
+        ));
+
+        upstream
+            .send(Message::Binary(bytes::Bytes::from(vec![0xAB; 32 * 1024])))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let mut trickle_buf = [0u8; 512];
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_secs(4)).await;
+            let n = raw_client.read(&mut trickle_buf).await.unwrap();
+            assert_eq!(n, 512);
+            tokio::task::yield_now().await;
+            assert!(!relay.is_finished());
+        }
+
+        // At t = 11s (> 10s, only 3s after last 512 B read), relay aborts!
+        tokio::time::advance(Duration::from_secs(3)).await;
+        relay.await.unwrap();
+
+        // 2. Zero-window client flooding Ping frames: bounded by max_write_buffer_size
+        // and evicted at WS_CONTROL_FLUSH_TIMEOUT (5s).
+        let (attacker_to_proxy, proxy_from_attacker) = tokio::io::duplex(64 * 1024);
+        let (_, attacker_tx) = tokio::io::split(attacker_to_proxy);
+        let (proxy_rx, _) = tokio::io::split(proxy_from_attacker);
+
+        let (proxy_to_attacker, _stalled_attacker) = tokio::io::duplex(64);
+        let (_, proxy_tx) = tokio::io::split(proxy_to_attacker);
+
+        let (_keep_open_tx, attacker_idle) = tokio::io::duplex(64);
+        let (attacker_rx, _) = tokio::io::split(attacker_idle);
+
+        let mut attacker_ws = WebSocketStream::from_raw_socket(
+            tokio::io::join(attacker_rx, attacker_tx),
+            Role::Client,
+            None,
+        )
+        .await;
+        let proxy_client = WebSocketStream::from_raw_socket(
+            WriteProgressIo::new(tokio::io::join(proxy_rx, proxy_tx)),
+            Role::Server,
+            Some(get_ws_config()),
+        )
+        .await;
+        let (proxy_upstream_io, _upstream_io) = tokio::io::duplex(16 * 1024);
+        let proxy_upstream = WebSocketStream::from_raw_socket(
+            WriteProgressIo::new(proxy_upstream_io),
+            Role::Client,
+            Some(get_ws_config()),
+        )
+        .await;
+        let relay = tokio::spawn(bridge_ws(
+            proxy_client,
+            proxy_upstream,
+            false,
+            Duration::from_secs(60),
+        ));
+
+        for _ in 0..32 {
+            attacker_ws
+                .feed(Message::Ping(bytes::Bytes::from(vec![b'p'; 125])))
+                .await
+                .unwrap();
+        }
+        attacker_ws.flush().await.unwrap();
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert!(!relay.is_finished());
+
+        tokio::time::advance(Duration::from_secs(2)).await;
         relay.await.unwrap();
     }
 

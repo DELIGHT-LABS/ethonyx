@@ -248,13 +248,16 @@ impl SlotClock {
     }
 }
 
-pub(crate) struct ValidatedConfig {
-    pub listen: Vec<Box<str>>,
-    pub el_http: HttpUpstream,
-    pub el_ws: WsUpstream,
-    pub cl_beacon: HttpUpstream,
-    pub cl_mev_relay: Option<HttpUpstream>,
-    pub slot_clock: Option<SlotClock>,
+#[doc(hidden)]
+pub struct ValidatedConfig {
+    pub(crate) listen: Vec<Box<str>>,
+    pub(crate) el_http: HttpUpstream,
+    pub(crate) el_ws: WsUpstream,
+    pub(crate) cl_beacon: HttpUpstream,
+    pub(crate) cl_mev_relay: Option<HttpUpstream>,
+    pub(crate) slot_clock: Option<SlotClock>,
+    #[cfg(feature = "otel")]
+    pub(crate) otel_endpoint: Option<HttpUpstream>,
 }
 
 fn validate_listen_addr(raw: &str) -> Result<&str, BoxError> {
@@ -269,7 +272,15 @@ fn validate_listen_addr(raw: &str) -> Result<&str, BoxError> {
         let Some(port_str) = port_part.strip_prefix(':') else {
             return Err(format!("invalid --listen address '{addr}': expected [ipv6]:port").into());
         };
-        if ipv6.parse::<std::net::Ipv6Addr>().is_err() {
+        let (ipv6_addr, zone_ok) =
+            ipv6.split_once('%')
+                .map_or((ipv6, true), |(addr_part, zone)| {
+                    (
+                        addr_part,
+                        !zone.is_empty() && !zone.bytes().any(|b| b.is_ascii_whitespace()),
+                    )
+                });
+        if !zone_ok || ipv6_addr.parse::<std::net::Ipv6Addr>().is_err() {
             return Err(format!("invalid --listen address '{addr}': invalid IPv6 host").into());
         }
         port_str
@@ -325,7 +336,8 @@ impl Config {
         self.parse_validated().map(|_| ())
     }
 
-    pub(crate) fn parse_validated(&self) -> Result<ValidatedConfig, BoxError> {
+    #[doc(hidden)]
+    pub fn parse_validated(&self) -> Result<ValidatedConfig, BoxError> {
         if self.listen.is_empty() {
             return Err("no listen addresses configured".into());
         }
@@ -361,9 +373,11 @@ impl Config {
             .map(|u| HttpUpstream::parse("--cl-mev-relay-url", u))
             .transpose()?;
         #[cfg(feature = "otel")]
-        if let Some(ref ep) = self.otel_endpoint {
-            crate::otel::parse_endpoint(ep)?;
-        }
+        let otel_endpoint = self
+            .otel_endpoint
+            .as_deref()
+            .map(crate::otel::parse_endpoint)
+            .transpose()?;
         Ok(ValidatedConfig {
             listen,
             el_http,
@@ -371,6 +385,8 @@ impl Config {
             cl_beacon,
             cl_mev_relay,
             slot_clock: SlotClock::new(cl_genesis_time, cl_seconds_per_slot),
+            #[cfg(feature = "otel")]
+            otel_endpoint,
         })
     }
 }
@@ -652,7 +668,10 @@ mod tests {
         ]);
         assert!(zero_optional.validate().is_ok());
 
-        let trimmed_listen = parse(&["--listen", " 127.0.0.1:8547 , [::1]:8548 , localhost:0 "]);
+        let trimmed_listen = parse(&[
+            "--listen",
+            " 127.0.0.1:8547 , [::1]:8548 , [fe80::1%lo0]:8549 , [fe80::1%1]:18999 , localhost:0 ",
+        ]);
         let validated = trimmed_listen.parse_validated().unwrap();
         assert_eq!(
             validated
@@ -660,7 +679,13 @@ mod tests {
                 .iter()
                 .map(AsRef::as_ref)
                 .collect::<Vec<_>>(),
-            vec!["127.0.0.1:8547", "[::1]:8548", "localhost:0"]
+            vec![
+                "127.0.0.1:8547",
+                "[::1]:8548",
+                "[fe80::1%lo0]:8549",
+                "[fe80::1%1]:18999",
+                "localhost:0",
+            ]
         );
 
         let max_permits_overflow = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
@@ -671,6 +696,7 @@ mod tests {
             ("--listen", "18823", "--listen"),
             ("--listen", ":8547", "--listen"),
             ("--listen", "[::1:8547", "--listen"),
+            ("--listen", "[fe80::1%]:8547", "--listen"),
             ("--listen", "127.0.0.1:99999", "--listen"),
             ("--listen", "127.0.0.1:+8547", "--listen"),
             ("--listen", "127.0.0.1:0080", "--listen"),

@@ -55,15 +55,22 @@ where
     F: Future<Output = ()> + Send,
 {
     let validated = cfg.parse_validated()?;
+    run_validated(cfg, validated, shutdown).await
+}
+
+#[doc(hidden)]
+pub async fn run_validated<F>(
+    cfg: Config,
+    #[cfg_attr(not(feature = "otel"), allow(unused_mut))] mut validated: config::ValidatedConfig,
+    shutdown: F,
+) -> Result<(), BoxError>
+where
+    F: Future<Output = ()> + Send,
+{
     #[cfg(feature = "otel")]
     {
-        let telemetry = crate::otel::start(cfg.otel_endpoint.as_deref()).await?;
-        let has_telemetry = telemetry.is_some();
-        let res = run_inner(cfg, validated, shutdown, has_telemetry).await;
-        if let Some(tp) = telemetry {
-            tp.shutdown().await;
-        }
-        res
+        let telemetry = crate::otel::start_upstream(validated.otel_endpoint.take()).await?;
+        run_validated_with_telemetry(cfg, validated, shutdown, telemetry).await
     }
     #[cfg(not(feature = "otel"))]
     {
@@ -90,6 +97,20 @@ where
             return Err(e);
         }
     };
+    run_validated_with_telemetry(cfg, validated, shutdown, telemetry).await
+}
+
+#[cfg(feature = "otel")]
+#[doc(hidden)]
+pub async fn run_validated_with_telemetry<F>(
+    cfg: Config,
+    validated: config::ValidatedConfig,
+    shutdown: F,
+    telemetry: Option<otel::Telemetry>,
+) -> Result<(), BoxError>
+where
+    F: Future<Output = ()> + Send,
+{
     let has_telemetry = telemetry.is_some();
     let res = run_inner(cfg, validated, shutdown, has_telemetry).await;
     if let Some(tp) = telemetry {
@@ -163,14 +184,24 @@ where
 
     let state = Arc::new(AppState::new(cfg, validated, otel_enabled, health)?);
 
+    tokio::pin!(shutdown);
+
     let mut initial_degraded = false;
     if let Some(ref tx) = probe_tx {
         // Warm the health cache with one poll before serving, then refresh it in
         // the background so /healthz and /readyz read a snapshot instead of
-        // hitting upstream on every probe.
-        let first_probe = Arc::new(health::probe_once(&state).await);
+        // hitting upstream on every probe. Race `shutdown` so SIGTERM during a
+        // slow or unreachable startup probe exits immediately.
+        let first_probe = tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                info!("shutdown signal received during initial health probe");
+                return Ok(());
+            }
+            probe = health::probe_once(&state) => Arc::new(probe),
+        };
         let eval = health::evaluate_readiness(&state, &first_probe);
-        health::update_metrics(&first_probe, eval);
+        health::update_metrics(&state, &first_probe, eval);
         initial_degraded = first_probe.has_errors();
         let _ = tx.send(first_probe);
     }
@@ -183,17 +214,19 @@ where
     };
     info!(
         el_http = %RedactedUrl(&state.cfg.el_http_url),
-        el_http_proto = %state.el_transport.startup_proto_label(),
+        el_http_proto = %state.el.transport.startup_proto_label(),
         el_ws = %RedactedUrl(&state.cfg.el_ws_url),
         cl_beacon = %RedactedUrl(&state.cfg.cl_beacon_url),
         cl_mev_relay = %upstream::RedactedOptUrl(state.cfg.cl_mev_relay_url.as_deref()),
-        cl_proto = %state.cl_transport.startup_proto_label(),
+        cl_proto = %state.cl.transport.startup_proto_label(),
         "{startup_msg}"
     );
 
     let mut listeners = Vec::with_capacity(listen_addrs.len());
     for addr in &listen_addrs {
-        let listener = TcpListener::bind(&**addr).await?;
+        let listener = TcpListener::bind(&**addr)
+            .await
+            .map_err(|e| format!("failed to bind --listen address '{addr}': {e}"))?;
         info!(listen = %addr, "listening");
         listeners.push(listener);
     }
@@ -367,7 +400,6 @@ async fn read_initial_preface<I: AsyncRead + Unpin>(
 
 /// Pre-configured HTTP/1.1 and HTTP/2 server builders constructed once so
 /// accepted connections share `TokioTimer` handles without per-connection setup.
-#[derive(Clone)]
 struct ServerBuilders {
     http1: http1::Builder,
     http2: http2::Builder<lifecycle::Lifecycle>,
@@ -390,42 +422,14 @@ impl ServerBuilders {
     }
 }
 
-trait GracefulConn: Future<Output = hyper::Result<()>> {
-    fn initiate_graceful_shutdown(self: Pin<&mut Self>);
-}
-
-impl<I, B, S> GracefulConn for http1::UpgradeableConnection<I, S>
-where
-    S: hyper::service::HttpService<hyper::body::Incoming, ResBody = B>,
-    S::Error: Into<BoxError>,
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
-    B: hyper::body::Body + 'static,
-    B::Error: Into<BoxError>,
-{
-    fn initiate_graceful_shutdown(self: Pin<&mut Self>) {
-        self.graceful_shutdown();
-    }
-}
-
-impl<I, B, S, E> GracefulConn for http2::Connection<I, S, E>
-where
-    S: hyper::service::HttpService<hyper::body::Incoming, ResBody = B>,
-    S::Error: Into<BoxError>,
-    I: hyper::rt::Read + hyper::rt::Write + Unpin,
-    B: hyper::body::Body + 'static,
-    B::Error: Into<BoxError>,
-    E: hyper::rt::bounds::Http2ServerConnExec<S::Future, B>,
-{
-    fn initiate_graceful_shutdown(self: Pin<&mut Self>) {
-        self.graceful_shutdown();
-    }
-}
-
-async fn drive_graceful<C: GracefulConn>(
+async fn drive_graceful<C>(
     conn: C,
+    graceful_shutdown: impl FnOnce(Pin<&mut C>),
     conn_lifecycle: &mut lifecycle::Lifecycle,
     peer: std::net::SocketAddr,
-) {
+) where
+    C: Future<Output = hyper::Result<()>>,
+{
     tokio::pin!(conn);
     tokio::select! {
         res = conn.as_mut() => match res {
@@ -433,7 +437,7 @@ async fn drive_graceful<C: GracefulConn>(
             Err(e) => debug!(error = %e, %peer, "connection closed"),
         },
         deadline = conn_lifecycle.deadline() => {
-            conn.as_mut().initiate_graceful_shutdown();
+            graceful_shutdown(conn.as_mut());
             match tokio::time::timeout_at(deadline, conn).await {
                 Ok(Ok(())) => trace!(%peer, "connection closed after shutdown"),
                 Ok(Err(e)) => debug!(error = %e, %peer, "connection closed after shutdown"),
@@ -465,11 +469,23 @@ async fn serve_detected<I, B, S>(
     match proto {
         DetectedProto::Http1 => {
             let conn = builders.http1.serve_connection(io, svc).with_upgrades();
-            drive_graceful(conn, conn_lifecycle, peer).await;
+            drive_graceful(
+                conn,
+                http1::UpgradeableConnection::graceful_shutdown,
+                conn_lifecycle,
+                peer,
+            )
+            .await;
         }
         DetectedProto::Http2 => {
             let conn = builders.http2.serve_connection(io, svc);
-            drive_graceful(conn, conn_lifecycle, peer).await;
+            drive_graceful(
+                conn,
+                http2::Connection::graceful_shutdown,
+                conn_lifecycle,
+                peer,
+            )
+            .await;
         }
     }
 }
@@ -480,7 +496,7 @@ async fn serve_connection(
     state: Arc<AppState>,
     mut conn_lifecycle: lifecycle::Lifecycle,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
-    builders: ServerBuilders,
+    builders: Arc<ServerBuilders>,
 ) {
     let _guard = state.metrics.active_tcp();
     let Some((proto, prefixed)) =
@@ -500,6 +516,19 @@ async fn serve_connection(
     serve_detected(&builders, proto, io, svc, &mut conn_lifecycle, peer).await;
 }
 
+pub(crate) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        debug!(error = %e, "failed to set TCP_NODELAY");
+    }
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(10));
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        debug!(error = %e, "failed to set TCP keepalive");
+    }
+}
+
 async fn accept_loop(
     listeners: Vec<TcpListener>,
     state: Arc<AppState>,
@@ -508,7 +537,7 @@ async fn accept_loop(
     if listeners.is_empty() {
         return;
     }
-    let builders = ServerBuilders::new(lifecycle.clone());
+    let builders = Arc::new(ServerBuilders::new(lifecycle.clone()));
     let mut next_idx = 0usize;
     let mut saturated = false;
     loop {
@@ -557,16 +586,7 @@ async fn accept_loop(
                 }
             }
         };
-        if let Err(e) = stream.set_nodelay(true) {
-            debug!(error = %e, "set_nodelay failed");
-        }
-        let sock_ref = socket2::SockRef::from(&stream);
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(60))
-            .with_interval(Duration::from_secs(10));
-        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-            debug!(error = %e, "failed to set TCP keepalive");
-        }
+        configure_tcp_stream(&stream);
         // Connection lifecycle is fine-grained, high-frequency detail, so
         // it lives at trace (accept/close) and on a dedicated `access_log`
         // target (the negotiated protocol + first request line) rather
@@ -579,7 +599,7 @@ async fn accept_loop(
             Arc::clone(&state),
             lifecycle.clone(),
             permit,
-            builders.clone(),
+            Arc::clone(&builders),
         ));
     }
 }
@@ -595,37 +615,6 @@ fn method_to_static_str(m: &hyper::http::Method) -> &'static str {
         "PATCH" => "PATCH",
         "CONNECT" => "CONNECT",
         "TRACE" => "TRACE",
-        _ => "OTHER",
-    }
-}
-
-fn status_to_static_str(status: u16) -> &'static str {
-    match status {
-        100 => "100",
-        101 => "101",
-        200 => "200",
-        201 => "201",
-        202 => "202",
-        204 => "204",
-        206 => "206",
-        301 => "301",
-        302 => "302",
-        304 => "304",
-        400 => "400",
-        401 => "401",
-        403 => "403",
-        404 => "404",
-        405 => "405",
-        408 => "408",
-        409 => "409",
-        413 => "413",
-        414 => "414",
-        415 => "415",
-        429 => "429",
-        500 => "500",
-        502 => "502",
-        503 => "503",
-        504 => "504",
         _ => "OTHER",
     }
 }
@@ -652,16 +641,20 @@ mod tests {
     }
 
     #[test]
-    fn test_status_to_static_str() {
-        assert_eq!(status_to_static_str(200), "200");
-        assert_eq!(status_to_static_str(404), "404");
-        assert_eq!(status_to_static_str(408), "408");
-        assert_eq!(status_to_static_str(413), "413");
-        assert_eq!(status_to_static_str(414), "414");
-        assert_eq!(status_to_static_str(502), "502");
+    fn test_classify_status() {
+        assert_eq!(metrics::classify_status(101), (Some(0), "101"));
+        assert_eq!(metrics::classify_status(200), (Some(1), "200"));
+        assert_eq!(metrics::classify_status(204), (Some(2), "204"));
+        assert_eq!(metrics::classify_status(400), (Some(3), "400"));
+        assert_eq!(metrics::classify_status(404), (Some(4), "404"));
+        assert_eq!(metrics::classify_status(408), (None, "408"));
+        assert_eq!(metrics::classify_status(413), (Some(5), "413"));
+        assert_eq!(metrics::classify_status(414), (None, "414"));
+        assert_eq!(metrics::classify_status(502), (Some(6), "502"));
+        assert_eq!(metrics::classify_status(503), (Some(7), "503"));
         // Edge case: Custom/unmapped status falls back to OTHER
-        assert_eq!(status_to_static_str(418), "OTHER");
-        assert_eq!(status_to_static_str(307), "OTHER");
+        assert_eq!(metrics::classify_status(418), (None, "OTHER"));
+        assert_eq!(metrics::classify_status(307), (None, "OTHER"));
     }
 
     #[tokio::test(start_paused = true)]

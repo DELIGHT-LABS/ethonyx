@@ -4,10 +4,11 @@ use ethonyx::{BoxError, Config};
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let cfg = Config::parse();
-    cfg.validate()?;
+    #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
+    let mut validated = cfg.parse_validated()?;
 
     #[cfg(feature = "otel")]
-    let telemetry = ethonyx::otel::start(cfg.otel_endpoint.as_deref()).await?;
+    let telemetry = ethonyx::otel::start_validated(&mut validated).await?;
 
     use tracing_subscriber::prelude::*;
 
@@ -56,8 +57,8 @@ async fn main() -> Result<(), BoxError> {
         }
     };
     #[cfg(feature = "otel")]
-    ethonyx::run_with_telemetry(cfg, shutdown, telemetry).await?;
+    ethonyx::run_validated_with_telemetry(cfg, validated, shutdown, telemetry).await?;
     #[cfg(not(feature = "otel"))]
-    ethonyx::run(cfg, shutdown).await?;
+    ethonyx::run_validated(cfg, validated, shutdown).await?;
     Ok(())
 }

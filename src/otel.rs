@@ -92,6 +92,22 @@ pub async fn start(endpoint: Option<&str>) -> Result<Option<Telemetry>, crate::B
         return Ok(None);
     };
     let base = parse_endpoint(endpoint)?;
+    start_upstream(Some(base)).await
+}
+
+#[doc(hidden)]
+pub async fn start_validated(
+    validated: &mut crate::config::ValidatedConfig,
+) -> Result<Option<Telemetry>, crate::BoxError> {
+    start_upstream(validated.otel_endpoint.take()).await
+}
+
+pub(crate) async fn start_upstream(
+    base: Option<crate::upstream::HttpUpstream>,
+) -> Result<Option<Telemetry>, crate::BoxError> {
+    let Some(base) = base else {
+        return Ok(None);
+    };
     tokio::task::spawn_blocking(move || init_otel(&base))
         .await?
         .map(Some)
@@ -424,11 +440,12 @@ mod tests {
         let recorder = OtelRecorder::with_meter(provider.meter(SERVICE_NAME));
 
         let proxy_metrics = crate::metrics::ProxyMetrics::default();
+        let health_metrics = crate::metrics::HealthMetrics::default();
         let tcp_guard = ::metrics::with_local_recorder(&recorder, || {
             let tcp = proxy_metrics.active_tcp();
             // Open and immediately drop a WS connection to verify symmetrical +1 / -1.
             drop(proxy_metrics.active_ws());
-            ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "el").set(8.0);
+            health_metrics.record(true, true, 8.0, 12.0, 0.0, Some((0, 42)), Some(100));
             tcp
         });
 
@@ -470,7 +487,12 @@ mod tests {
             .find(|(name, _, _)| name == "ethonyx_upstream_peers")
             .expect("upstream_peers exported");
         assert_eq!(peers.1, "gauge");
-        assert_eq!(peers.2, vec![(vec![KeyValue::new("layer", "el")], 8.0)]);
+        assert!(peers.2.contains(&(vec![KeyValue::new("layer", "el")], 8.0)));
+        assert!(
+            peers
+                .2
+                .contains(&(vec![KeyValue::new("layer", "cl")], 12.0))
+        );
     }
 
     #[test]
@@ -536,5 +558,107 @@ mod tests {
                 .to_string();
             assert!(!err.contains("SECRET"), "leaked secret in {err}");
         }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturingSpanExporter(Arc<Mutex<Vec<String>>>);
+
+    impl opentelemetry_sdk::trace::SpanExporter for CapturingSpanExporter {
+        async fn export(&self, batch: Vec<opentelemetry_sdk::trace::SpanData>) -> OTelSdkResult {
+            let mut out = self.0.lock().unwrap();
+            out.extend(batch.into_iter().map(|s| s.name.into_owned()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_client_exports_first_request_span_while_keepalive_socket_stays_open() {
+        use bytes::Bytes;
+        use http::{Method, Request, Response, StatusCode};
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Incoming;
+        use hyper::service::service_fn;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto;
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing::Instrument as _;
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::prelude::*;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let _ = req.into_body().collect().await;
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from_static(b"ok")))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let span_exporter = CapturingSpanExporter::default();
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(span_exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer_provider.tracer(SERVICE_NAME))
+                .with_filter(tracing_subscriber::EnvFilter::new(
+                    "ethonyx=info,access_log=off",
+                )),
+        );
+
+        let (https, _) = crate::proxy::build_connectors(false);
+        let h1_client = crate::proxy::build_client(https.clone());
+        let h2c_client = crate::proxy::build_h2c_client(https);
+        let uri: http::Uri = format!("http://{addr}/").parse().unwrap();
+
+        async {
+            for (name, client) in [("request_h1", &h1_client), ("request_h2c", &h2c_client)] {
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri(uri.clone())
+                    .body(crate::proxy::box_full(Full::new(Bytes::from_static(b"{}"))))
+                    .unwrap();
+                async {
+                    let resp = client.request(req).await.unwrap();
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    let _ = resp.into_body().collect().await.unwrap();
+                }
+                .instrument(tracing::info_span!("request", kind = name))
+                .await;
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        // Both pooled keep-alive connections (HTTP/1.1 and HTTP/2) are STILL open inside
+        // `h1_client` and `h2c_client`. Without `rt-tracing-exec-force`, background pool
+        // driver tasks must NOT retain a clone of Request #1's span!
+        {
+            let exported = span_exporter.0.lock().unwrap();
+            assert_eq!(
+                exported.as_slice(),
+                &["request", "request"],
+                "first request spans must export immediately while pooled connections remain open"
+            );
+        }
+
+        drop((h1_client, h2c_client));
+        server.abort();
+        let _ = tracer_provider.shutdown();
     }
 }

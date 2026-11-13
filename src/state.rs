@@ -6,9 +6,14 @@ use tokio::sync::Semaphore;
 use crate::BoxError;
 use crate::config::{Config, SlotClock, ValidatedConfig};
 use crate::health::{HealthSource, HttpTransport};
-use crate::metrics::ProxyMetrics;
+use crate::metrics::{HealthMetrics, ProxyMetrics};
 use crate::proxy::ProxyClient;
 use crate::upstream::{HttpUpstream, WsUpstream};
+
+pub(crate) struct HttpTarget {
+    pub(crate) upstream: HttpUpstream,
+    pub(crate) transport: HttpTransport,
+}
 
 pub struct AppState {
     pub cfg: Config,
@@ -16,12 +21,10 @@ pub struct AppState {
     /// the CL Beacon/MEV hops, and the EL hop unless cleartext `h2c` is active.
     pub client: ProxyClient,
     pub(crate) ws_tls: tokio_tungstenite::Connector,
-    pub(crate) el_transport: HttpTransport,
-    pub(crate) cl_transport: HttpTransport,
-    pub(crate) el_http: HttpUpstream,
+    pub(crate) el: HttpTarget,
     pub(crate) el_ws: WsUpstream,
-    pub(crate) cl_beacon: HttpUpstream,
-    pub(crate) cl_mev_relay: Option<HttpUpstream>,
+    pub(crate) cl: HttpTarget,
+    pub(crate) cl_mev_relay: Option<HttpTarget>,
     pub cl_syncing_uri: Uri,
     pub cl_peer_count_uri: Uri,
     pub(crate) slot_clock: Option<SlotClock>,
@@ -29,6 +32,7 @@ pub struct AppState {
     pub(crate) conn_limit: Arc<Semaphore>,
     pub(crate) health: HealthSource,
     pub(crate) metrics: ProxyMetrics,
+    pub(crate) health_metrics: HealthMetrics,
 }
 
 impl AppState {
@@ -45,15 +49,27 @@ impl AppState {
             cl_beacon,
             cl_mev_relay,
             slot_clock,
+            #[cfg(feature = "otel")]
+                otel_endpoint: _,
         } = validated;
 
-        let (https, ws_tls) = crate::proxy::build_connectors();
+        let (https, ws_tls) = crate::proxy::build_connectors(el_ws.is_tls());
         let client = crate::proxy::build_client(https.clone());
-        let el_transport = HttpTransport::new_el(cfg.trust_upstream, el_http.is_tls(), https);
-        let cl_transport = HttpTransport::new_cl(cl_beacon.is_tls());
+        let el = HttpTarget {
+            transport: HttpTransport::new_el(cfg.trust_upstream, el_http.is_tls(), https),
+            upstream: el_http,
+        };
         let cl_syncing_uri = cl_beacon.rewrite_uri(Uri::from_static("/eth/v1/node/syncing"))?;
         let cl_peer_count_uri =
             cl_beacon.rewrite_uri(Uri::from_static("/eth/v1/node/peer_count"))?;
+        let cl = HttpTarget {
+            transport: HttpTransport::new_cl(cl_beacon.is_tls()),
+            upstream: cl_beacon,
+        };
+        let cl_mev_relay = cl_mev_relay.map(|upstream| HttpTarget {
+            transport: HttpTransport::new_cl(upstream.is_tls()),
+            upstream,
+        });
         let permits = if cfg.max_connections == 0 {
             Semaphore::MAX_PERMITS
         } else {
@@ -65,11 +81,9 @@ impl AppState {
             cfg,
             client,
             ws_tls,
-            el_transport,
-            cl_transport,
-            el_http,
+            el,
             el_ws,
-            cl_beacon,
+            cl,
             cl_mev_relay,
             cl_syncing_uri,
             cl_peer_count_uri,
@@ -78,6 +92,7 @@ impl AppState {
             conn_limit,
             health,
             metrics: ProxyMetrics::default(),
+            health_metrics: HealthMetrics::default(),
         })
     }
 }

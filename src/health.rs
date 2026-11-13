@@ -15,6 +15,14 @@ use crate::proxy::{Https, ProxyClient, ResBody, box_full, build_h2c_client};
 use crate::state::AppState;
 
 const TRUSTED_READY_JSON: &[u8] = br#"{"status":"ready","el_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"},"cl_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"}}"#;
+const TRUSTED_HEALTH_H1_H1: &[u8] =
+    br#"{"mode":"trusted","el":{"transport":"http/1.1"},"cl":{"transport":"http/1.1"}}"#;
+const TRUSTED_HEALTH_H1_H2: &[u8] =
+    br#"{"mode":"trusted","el":{"transport":"http/1.1"},"cl":{"transport":"h2"}}"#;
+const TRUSTED_HEALTH_H2_H1: &[u8] =
+    br#"{"mode":"trusted","el":{"transport":"h2"},"cl":{"transport":"http/1.1"}}"#;
+const TRUSTED_HEALTH_H2_H2: &[u8] =
+    br#"{"mode":"trusted","el":{"transport":"h2"},"cl":{"transport":"h2"}}"#;
 
 /// Whether `/healthz` reflects active background probes or `--trust-upstream`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -379,12 +387,18 @@ pub fn report(state: &AppState, head: bool) -> Response<ResBody> {
     if head {
         return empty_json_response(StatusCode::OK);
     }
-    let snapshot = match &state.health {
-        HealthSource::Trusted => {
-            trusted_snapshot(state.el_transport.label(), state.cl_transport.label())
-        }
+    let el_transport = state.el.transport.label();
+    let cl_transport = state.cl.transport.label();
+    match &state.health {
+        HealthSource::Trusted => match trusted_health_bytes(el_transport, cl_transport) {
+            Some(raw) => raw_json_response(StatusCode::OK, Bytes::from_static(raw)),
+            None => json_response(
+                StatusCode::OK,
+                &trusted_snapshot(el_transport, cl_transport),
+            ),
+        },
         HealthSource::Polled(rx) => {
-            let probe = rx.borrow();
+            let probe = Arc::clone(&rx.borrow());
             let mut snap = build_snapshot(
                 &probe.el_syncing,
                 &probe.el_peers,
@@ -394,12 +408,24 @@ pub fn report(state: &AppState, head: bool) -> Response<ResBody> {
                 state.slot_clock,
                 now_unix(),
             );
-            snap.el.transport = state.el_transport.label();
-            snap.cl.transport = state.cl_transport.label();
-            snap
+            snap.el.transport = el_transport;
+            snap.cl.transport = cl_transport;
+            json_response(StatusCode::OK, &snap)
         }
-    };
-    json_response(StatusCode::OK, &snapshot)
+    }
+}
+
+fn trusted_health_bytes(
+    el_transport: &'static str,
+    cl_transport: &'static str,
+) -> Option<&'static [u8]> {
+    match (el_transport, cl_transport) {
+        ("http/1.1", "http/1.1") => Some(TRUSTED_HEALTH_H1_H1),
+        ("http/1.1", "h2") => Some(TRUSTED_HEALTH_H1_H2),
+        ("h2", "http/1.1") => Some(TRUSTED_HEALTH_H2_H1),
+        ("h2", "h2") => Some(TRUSTED_HEALTH_H2_H2),
+        _ => None,
+    }
 }
 
 fn trusted_snapshot(el_transport: &'static str, cl_transport: &'static str) -> HealthSnapshot {
@@ -438,7 +464,7 @@ pub fn ready(state: &AppState, head: bool) -> Response<ResBody> {
             }
         }
         HealthSource::Polled(rx) => {
-            let probe = rx.borrow();
+            let probe = Arc::clone(&rx.borrow());
             let eval = evaluate_readiness(state, &probe);
             let code = if eval.is_ready() {
                 StatusCode::OK
@@ -696,7 +722,17 @@ pub(crate) async fn probe_once(state: &AppState) -> Probe {
         cl_syncing_status(state),
         cl_peer_count(state),
     );
-    let (el_syncing, el_peers, el_block) = batch.into_probe_results();
+    let (el_syncing, el_peers, el_block) = match batch {
+        Ok(res) => (
+            res.syncing.map_err(HealthError::into_probe_error),
+            res.peers.map_err(HealthError::into_probe_error),
+            res.block.map_err(HealthError::into_probe_error),
+        ),
+        Err(err) => {
+            let shared = err.into_probe_error();
+            (Err(shared.clone()), Err(shared.clone()), Err(shared))
+        }
+    };
     Probe {
         el_syncing,
         el_peers,
@@ -706,7 +742,8 @@ pub(crate) async fn probe_once(state: &AppState) -> Probe {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 enum HealthError {
     Timeout,
     Transport(ProbeError),
@@ -736,110 +773,99 @@ impl std::fmt::Display for HealthError {
     }
 }
 
+#[cfg_attr(test, derive(Debug))]
 struct ElBatchResult {
     syncing: Result<ElSyncingResult, HealthError>,
     peers: Result<u64, HealthError>,
     block: Result<ElBlockResult, HealthError>,
 }
 
-impl ElBatchResult {
-    fn from_error(error: HealthError) -> Self {
-        Self {
-            syncing: Err(error.clone()),
-            peers: Err(error.clone()),
-            block: Err(error),
-        }
-    }
+#[derive(Clone, Copy)]
+enum ModeLog {
+    None,
+    SwitchedToH2c,
+    SwitchedToH1,
+}
 
-    fn into_probe_results(
-        self,
-    ) -> (
-        Result<ElSyncingResult, ProbeError>,
-        Result<u64, ProbeError>,
-        Result<ElBlockResult, ProbeError>,
-    ) {
-        if let (Err(e1), Err(e2), Err(e3)) = (&self.syncing, &self.peers, &self.block)
-            && e1 == e2
-            && e2 == e3
-        {
-            let shared = self.syncing.unwrap_err().into_probe_error();
-            return (Err(shared.clone()), Err(shared.clone()), Err(shared));
+impl ModeLog {
+    fn emit(self) {
+        match self {
+            Self::None => {}
+            Self::SwitchedToH2c => info!("EL JSON-RPC upstream speaks h2c — using HTTP/2"),
+            Self::SwitchedToH1 => {
+                warn!("EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1")
+            }
         }
-        (
-            self.syncing.map_err(HealthError::into_probe_error),
-            self.peers.map_err(HealthError::into_probe_error),
-            self.block.map_err(HealthError::into_probe_error),
-        )
     }
 }
 
 /// Query all three EL JSON-RPC methods in a batch request, maintaining the transport verdict.
-async fn el_batch_detect(state: &AppState) -> ElBatchResult {
+async fn el_batch_detect(state: &AppState) -> Result<ElBatchResult, HealthError> {
     let default_client = &state.client;
-    let result = match &state.el_transport {
+    match &state.el.transport {
         HttpTransport::CleartextH1 | HttpTransport::TlsAuto(_) => {
             el_batch_rpc(state, default_client).await
         }
         HttpTransport::AdaptiveH2c { mode, client } => {
             let h2c_client: &ProxyClient = client;
-            match H2cMode::load(mode) {
-                cur @ (H2cMode::Initial | H2cMode::Confirmed) => {
-                    match el_batch_rpc(state, h2c_client).await {
-                        Err(primary_err) if is_transport(&primary_err) => {
-                            let alt = el_batch_rpc(state, default_client).await;
-                            if matches!(&alt, Err(e) if is_transport(e)) {
-                                Err(primary_err)
+            let cur = H2cMode::load(mode);
+            let (first, second, on_first, on_second) = match cur {
+                H2cMode::Initial => (
+                    h2c_client,
+                    default_client,
+                    (Some(H2cMode::Confirmed), ModeLog::None),
+                    (Some(H2cMode::H1VerifyOnce), ModeLog::None),
+                ),
+                H2cMode::Confirmed => (
+                    h2c_client,
+                    default_client,
+                    (None, ModeLog::None),
+                    (Some(H2cMode::H1VerifyOnce), ModeLog::SwitchedToH1),
+                ),
+                // Verify h2c one more time to self-heal if an h2c upstream was
+                // probed mid-bind during startup or restart.
+                H2cMode::H1VerifyOnce => (
+                    h2c_client,
+                    default_client,
+                    (Some(H2cMode::Confirmed), ModeLog::SwitchedToH2c),
+                    (Some(H2cMode::H1Confirmed), ModeLog::None),
+                ),
+                H2cMode::H1Confirmed => (
+                    default_client,
+                    h2c_client,
+                    (None, ModeLog::None),
+                    (Some(H2cMode::Confirmed), ModeLog::SwitchedToH2c),
+                ),
+            };
+            match el_batch_rpc(state, first).await {
+                Err(first_err) if is_transport(&first_err) => {
+                    match el_batch_rpc(state, second).await {
+                        Err(second_err) if is_transport(&second_err) => {
+                            Err(if cur == H2cMode::H1VerifyOnce {
+                                second_err
                             } else {
-                                mode.store(H2cMode::H1VerifyOnce as u8, Ordering::Relaxed);
-                                if cur == H2cMode::Confirmed {
-                                    warn!(
-                                        "EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1"
-                                    );
-                                }
-                                alt
-                            }
+                                first_err
+                            })
                         }
                         reached => {
-                            if cur == H2cMode::Initial {
-                                mode.store(H2cMode::Confirmed as u8, Ordering::Relaxed);
+                            if let Some(next) = on_second.0 {
+                                mode.store(next as u8, Ordering::Relaxed);
                             }
+                            on_second.1.emit();
                             reached
                         }
                     }
                 }
-                H2cMode::H1VerifyOnce => {
-                    // Verify h2c one more time to self-heal if an h2c upstream was
-                    // probed mid-bind during startup or restart.
-                    let h2_try = el_batch_rpc(state, h2c_client).await;
-                    if !matches!(&h2_try, Err(e) if is_transport(e)) {
-                        mode.store(H2cMode::Confirmed as u8, Ordering::Relaxed);
-                        info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
-                        h2_try
-                    } else {
-                        let h1_try = el_batch_rpc(state, default_client).await;
-                        if !matches!(&h1_try, Err(e) if is_transport(e)) {
-                            mode.store(H2cMode::H1Confirmed as u8, Ordering::Relaxed);
-                        }
-                        h1_try
+                reached => {
+                    if let Some(next) = on_first.0 {
+                        mode.store(next as u8, Ordering::Relaxed);
                     }
+                    on_first.1.emit();
+                    reached
                 }
-                H2cMode::H1Confirmed => match el_batch_rpc(state, default_client).await {
-                    Err(primary_err) if is_transport(&primary_err) => {
-                        let alt = el_batch_rpc(state, h2c_client).await;
-                        if matches!(&alt, Err(e) if is_transport(e)) {
-                            Err(primary_err)
-                        } else {
-                            mode.store(H2cMode::Confirmed as u8, Ordering::Relaxed);
-                            info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
-                            alt
-                        }
-                    }
-                    reached => reached,
-                },
             }
         }
-    };
-    result.unwrap_or_else(ElBatchResult::from_error)
+    }
 }
 
 /// A hard transport/connection failure or a timeout (vs. an HTTP status or decode
@@ -851,17 +877,9 @@ const fn is_transport(e: &HealthError) -> bool {
     matches!(e, HealthError::Transport(_) | HealthError::Timeout)
 }
 
-pub(crate) fn update_metrics(probe: &Probe, eval: ReadinessEval<'_>) {
-    ::metrics::gauge!("ethonyx_upstream_health_status", "layer" => "el")
-        .set(if eval.el_sync_ok() { 1.0 } else { 0.0 });
-    ::metrics::gauge!("ethonyx_upstream_health_status", "layer" => "cl")
-        .set(if eval.cl_sync_ok() { 1.0 } else { 0.0 });
-
-    ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "el")
-        .set(probe.el_peers.as_ref().map_or(0.0, |&p| p as f64));
-    ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "cl")
-        .set(probe.cl_peers.as_ref().map_or(0.0, |&p| p as f64));
-
+pub(crate) fn update_metrics(state: &AppState, probe: &Probe, eval: ReadinessEval<'_>) {
+    let el_peers = probe.el_peers.as_ref().map_or(0.0, |&p| p as f64);
+    let cl_peers = probe.cl_peers.as_ref().map_or(0.0, |&p| p as f64);
     let el_distance = match &probe.el_syncing {
         Ok(ElSyncingResult::Syncing {
             current_block,
@@ -869,19 +887,22 @@ pub(crate) fn update_metrics(probe: &Probe, eval: ReadinessEval<'_>) {
         }) => highest_block.saturating_sub(*current_block) as f64,
         _ => 0.0,
     };
-    ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "el").set(el_distance);
+    let cl_status = probe
+        .cl_status
+        .as_ref()
+        .ok()
+        .map(|s| (s.sync_distance, s.head_slot));
+    let el_block = probe.el_block.as_ref().ok().map(|b| b.number);
 
-    if let Ok(status) = &probe.cl_status {
-        ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "cl")
-            .set(status.sync_distance as f64);
-        ::metrics::gauge!("ethonyx_upstream_slot_number").set(status.head_slot as f64);
-    } else {
-        ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "cl").set(0.0);
-    }
-
-    if let Ok(block) = &probe.el_block {
-        ::metrics::gauge!("ethonyx_upstream_block_number").set(block.number as f64);
-    }
+    state.health_metrics.record(
+        eval.el_sync_ok(),
+        eval.cl_sync_ok(),
+        el_peers,
+        cl_peers,
+        el_distance,
+        cl_status,
+        el_block,
+    );
 }
 
 /// Refresh the shared [`Probe`] until shutdown: poll, then sleep `interval`,
@@ -917,7 +938,7 @@ pub(crate) async fn poll_loop(
         let status = if ready { "ready" } else { "not_ready" };
         debug!(status, "health poll");
 
-        update_metrics(&probe, eval);
+        update_metrics(&state, &probe, eval);
 
         match readiness_transition(prev_ready, ready) {
             Transition::Silent => {}
@@ -1151,11 +1172,11 @@ async fn el_batch_rpc(
 ) -> Result<ElBatchResult, HealthError> {
     let req = Request::builder()
         .method(Method::POST)
-        .uri(state.el_http.uri().clone())
+        .uri(state.el.upstream.uri().clone())
         .header("content-type", "application/json")
         .body(box_full(Full::new(Bytes::from_static(EL_BATCH_REQ))))
         .map_err(|e| HealthError::Transport(Arc::from(format!("build: {e}"))))?;
-    let body = fetch_bytes(state, req, client, &state.el_transport).await?;
+    let body = fetch_bytes(state, req, client, &state.el.transport).await?;
     parse_el_batch(&body)
 }
 
@@ -1310,7 +1331,7 @@ async fn cl_get_json<T: serde::de::DeserializeOwned>(
         .uri(uri.clone())
         .body(box_full(Full::new(Bytes::new())))
         .map_err(|e| Arc::from(e.to_string()))?;
-    let body = fetch_bytes(state, req, &state.client, &state.cl_transport)
+    let body = fetch_bytes(state, req, &state.client, &state.cl.transport)
         .await
         .map_err(HealthError::into_probe_error)?;
     parse_cl_response(&body)
@@ -1411,33 +1432,32 @@ mod tests {
             let (_, probe) = watch::channel(Arc::new(Probe::pending()));
             let mut state =
                 AppState::new(cfg, validated, false, HealthSource::Polled(probe)).unwrap();
-            state.el_transport.set_confirmed_cleartext(prefer_h2);
+            state.el.transport.set_confirmed_cleartext(prefer_h2);
             let result = el_batch_detect(&state).await;
-            assert_eq!(state.el_transport.uses_h2c_client(), expected_h2);
+            assert_eq!(state.el.transport.uses_h2c_client(), expected_h2);
             assert_eq!(attempts[usize::from(prefer_h2)].load(Ordering::Relaxed), 1);
             assert_eq!(
                 attempts[usize::from(!prefer_h2)].load(Ordering::Relaxed),
                 usize::from(!accepted[usize::from(prefer_h2)])
             );
             if !accepted.contains(&true) {
-                let error = result.syncing.unwrap_err();
+                let error = result.unwrap_err();
                 if prefer_h2 {
                     assert_eq!(error, HealthError::Timeout);
                 } else {
                     assert!(matches!(error, HealthError::Transport(_)));
                 }
-                assert_eq!(result.peers.unwrap_err(), error);
-                assert_eq!(result.block.unwrap_err(), error);
             } else if status == 503 {
                 assert_eq!(
-                    result.syncing.unwrap_err(),
+                    result.unwrap_err(),
                     HealthError::HttpStatus(StatusCode::SERVICE_UNAVAILABLE)
                 );
             } else if body == valid {
-                assert_eq!(result.syncing.unwrap(), ElSyncingResult::Synced(false));
-                assert_eq!(result.peers.unwrap(), 0x40);
+                let batch = result.unwrap();
+                assert_eq!(batch.syncing.unwrap(), ElSyncingResult::Synced(false));
+                assert_eq!(batch.peers.unwrap(), 0x40);
             } else {
-                assert!(matches!(result.syncing, Err(HealthError::Decode(_))));
+                assert!(matches!(result.unwrap_err(), HealthError::Decode(_)));
             }
             server.abort();
         }
@@ -1806,16 +1826,26 @@ mod tests {
 
     #[test]
     fn trusted_snapshot_reports_mode_and_omits_unpolled_fields() {
-        let snap = trusted_snapshot("http/1.1", "h2");
-        let v = serde_json::to_value(&snap).unwrap();
-        assert_eq!(
-            v,
-            serde_json::json!({
-                "mode": "trusted",
-                "el": { "transport": "http/1.1" },
-                "cl": { "transport": "h2" },
-            })
-        );
+        for (el, cl) in [
+            ("http/1.1", "http/1.1"),
+            ("http/1.1", "h2"),
+            ("h2", "http/1.1"),
+            ("h2", "h2"),
+        ] {
+            let snap = trusted_snapshot(el, cl);
+            let v = serde_json::to_value(&snap).unwrap();
+            assert_eq!(
+                v,
+                serde_json::json!({
+                    "mode": "trusted",
+                    "el": { "transport": el },
+                    "cl": { "transport": cl },
+                })
+            );
+            let raw = trusted_health_bytes(el, cl).expect("static trusted health json");
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(raw).unwrap(), v);
+        }
+        assert!(trusted_health_bytes("h2c", "http/1.1").is_none());
     }
 
     #[test]
@@ -1983,28 +2013,28 @@ mod tests {
         let state = AppState::new(cfg, validated, false, HealthSource::Polled(probe)).unwrap();
 
         // Case A: h1-only upstream -> Initial -> H1VerifyOnce -> H1Confirmed.
-        assert_eq!(state.el_transport.label(), "h2c");
+        assert_eq!(state.el.transport.label(), "h2c");
         assert_eq!(
-            state.el_transport.startup_proto_label(),
+            state.el.transport.startup_proto_label(),
             "HTTP/2 (h2c, unverified)"
         );
-        assert!(el_batch_detect(&state).await.syncing.is_ok());
-        assert_eq!(state.el_transport.label(), "http/1.1");
-        assert!(el_batch_detect(&state).await.syncing.is_ok());
-        assert_eq!(state.el_transport.label(), "http/1.1");
+        assert!(el_batch_detect(&state).await.unwrap().syncing.is_ok());
+        assert_eq!(state.el.transport.label(), "http/1.1");
+        assert!(el_batch_detect(&state).await.unwrap().syncing.is_ok());
+        assert_eq!(state.el.transport.label(), "http/1.1");
 
         // Case B: simulate a confirmed h2c upstream hitting a transient h2c rejection
         // during restart, then recovering h2c on the verify-once poll.
-        if let HttpTransport::AdaptiveH2c { ref mode, .. } = state.el_transport {
+        if let HttpTransport::AdaptiveH2c { ref mode, .. } = state.el.transport {
             mode.store(H2cMode::Confirmed as u8, Ordering::SeqCst);
         }
-        assert_eq!(state.el_transport.startup_proto_label(), "HTTP/2 (h2c)");
-        assert!(el_batch_detect(&state).await.syncing.is_ok());
-        assert_eq!(state.el_transport.label(), "http/1.1"); // fell back to H1VerifyOnce
+        assert_eq!(state.el.transport.startup_proto_label(), "HTTP/2 (h2c)");
+        assert!(el_batch_detect(&state).await.unwrap().syncing.is_ok());
+        assert_eq!(state.el.transport.label(), "http/1.1"); // fell back to H1VerifyOnce
 
         accept_h2.store(true, Ordering::SeqCst);
-        assert!(el_batch_detect(&state).await.syncing.is_ok());
-        assert_eq!(state.el_transport.label(), "h2c"); // self-healed back to Confirmed!
+        assert!(el_batch_detect(&state).await.unwrap().syncing.is_ok());
+        assert_eq!(state.el.transport.label(), "h2c"); // self-healed back to Confirmed!
 
         server.abort();
     }

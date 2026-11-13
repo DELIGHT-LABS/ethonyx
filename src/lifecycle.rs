@@ -23,6 +23,10 @@ impl LazyDeadline {
         }
     }
 
+    pub(crate) const fn is_armed(&self) -> bool {
+        self.armed
+    }
+
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }

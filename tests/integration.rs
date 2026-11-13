@@ -4747,3 +4747,219 @@ async fn post_accept_permits_allow_two_h2_ws_streams_and_reject_invalid_or_overs
     let _ = h2_conn.await;
     proxy.shutdown().await;
 }
+
+#[tokio::test]
+async fn http2_extended_connect_large_frame_slow_reader_completes_past_proxy_timeout() {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct ThrottledRead<I> {
+        inner: I,
+        chunk_limit: usize,
+        bytes_since_sleep: usize,
+        delay: Duration,
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ThrottledRead<I> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            if let Some(sleep) = this.sleep.as_mut() {
+                if sleep.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                this.sleep = None;
+            }
+            let budget = this.chunk_limit.saturating_sub(this.bytes_since_sleep);
+            let cap = buf.remaining().min(budget.max(1));
+            let mut sub = buf.take(cap);
+            let poll = Pin::new(&mut this.inner).poll_read(cx, &mut sub);
+            if let Poll::Ready(Ok(())) = poll {
+                let n = sub.filled().len();
+                if n > 0 {
+                    buf.advance(n);
+                    this.bytes_since_sleep += n;
+                    if this.bytes_since_sleep >= this.chunk_limit {
+                        this.bytes_since_sleep = 0;
+                        this.sleep = Some(Box::pin(tokio::time::sleep(this.delay)));
+                    }
+                }
+            }
+            poll
+        }
+    }
+
+    impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ThrottledRead<I> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    let payload_len = 1536 * 1024; // 1.5 MiB (24x H2 default 65_535-byte window & 24x 64 KiB cap)
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_url = format!("ws://{}", ws_listener.local_addr().unwrap());
+    let ws_server = tokio::spawn(async move {
+        let (sock, _) = ws_listener.accept().await.unwrap();
+        let mut ws = accept_async(sock).await.unwrap();
+        ws.send(Message::Binary(Bytes::from(vec![0x5A; payload_len])))
+            .await
+            .unwrap();
+        ws.send(Message::Text("tail-after-large-h2-frame".into()))
+            .await
+            .unwrap();
+        while let Some(Ok(msg)) = ws.next().await {
+            if msg.is_close() {
+                break;
+            }
+        }
+    });
+
+    let el = MockServer::start(ok_handler()).await;
+    let proxy = EthonyxHandle::start(&[
+        "--trust-upstream",
+        "--el-http-url",
+        &el.url,
+        "--el-ws-url",
+        &ws_url,
+    ])
+    .await;
+
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .initial_stream_window_size(65_535)
+        .initial_connection_window_size(65_535)
+        .handshake::<_, TestBody>(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let h2_conn = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut req = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{}/", proxy.port))
+        .header("sec-websocket-version", "13")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let upgraded = hyper::upgrade::on(resp).await.unwrap();
+
+    // Throttle reads to 32 KiB every 80ms (~400 KiB/s): 1.5 MiB takes ~3.8s (> 2s --proxy-timeout).
+    let throttled = ThrottledRead {
+        inner: TokioIo::new(upgraded),
+        chunk_limit: 32 * 1024,
+        bytes_since_sleep: 0,
+        delay: Duration::from_millis(80),
+        sleep: None,
+    };
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        throttled,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    let first = ws
+        .next()
+        .await
+        .expect("first frame")
+        .expect("large frame ok");
+    assert!(
+        matches!(&first, Message::Binary(b) if b.len() == payload_len && b.iter().all(|&x| x == 0x5A)),
+        "expected intact {payload_len}-byte binary frame"
+    );
+    let second = ws
+        .next()
+        .await
+        .expect("second frame")
+        .expect("tail frame ok");
+    assert_eq!(second, Message::Text("tail-after-large-h2-frame".into()));
+    assert!(
+        started.elapsed() > Duration::from_millis(2500),
+        "transfer must span past --proxy-timeout 2s (took {:?})",
+        started.elapsed()
+    );
+
+    ws.close(None).await.unwrap();
+    while let Some(Ok(msg)) = ws.next().await {
+        if msg.is_close() {
+            break;
+        }
+    }
+    ws_server.await.unwrap();
+    drop((ws, sender));
+    h2_conn.abort();
+    let _ = h2_conn.await;
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_during_initial_health_probe_exits_promptly_without_binding_listener() {
+    use clap::Parser;
+
+    // Hanging EL + CL TCP listeners that accept and never reply for 30s.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hang_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+
+    let cfg = ethonyx::Config::parse_from([
+        "ethonyx",
+        "--listen",
+        "127.0.0.1:0",
+        "--health-timeout",
+        "30",
+        "--el-http-url",
+        &hang_url,
+        "--cl-beacon-url",
+        &hang_url,
+    ]);
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let run_task = tokio::spawn(async move {
+        ethonyx::run(cfg, async move {
+            let _ = stop_rx.await;
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let _ = stop_tx.send(());
+
+    let res = tokio::time::timeout(Duration::from_secs(1), run_task)
+        .await
+        .expect("shutdown during initial health probe must return within 1s")
+        .unwrap();
+    assert!(res.is_ok());
+    server.abort();
+}
