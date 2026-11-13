@@ -16,16 +16,17 @@ use hyper_util::rt::{TokioExecutor, TokioTimer};
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{Instrument, debug, info, trace, warn};
 
+use crate::BoxError;
 use crate::headers::{sanitize_response_headers, strip_hop_by_hop};
 use crate::health;
+use crate::metrics::{UpstreamLayer, classify_method};
 use crate::state::{AppState, HttpTarget};
 use crate::websocket::WsMode;
 
-pub use crate::BoxError;
-pub type ResBody = UnsyncBoxBody<Bytes, BoxError>;
+pub(crate) type ResBody = UnsyncBoxBody<Bytes, BoxError>;
 
 pub(crate) type Https = hyper_rustls::HttpsConnector<HttpConnector>;
-pub type ProxyClient = Client<Https, ResBody>;
+pub(crate) type ProxyClient = Client<Https, ResBody>;
 
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
@@ -171,8 +172,9 @@ impl Connection {
             }
             Route::Proxy(target) => target,
         };
-        let (upstream_type, upstream_proto) = target.labels();
-        let method_label = crate::method_to_static_str(req.method());
+        let (layer, upstream_proto) = target.layer_and_proto();
+        let upstream_type = layer.as_str();
+        let (method_idx, method_label) = classify_method(req.method());
         let version = req.version();
         let access_ctx = tracing::enabled!(target: "access_log", tracing::Level::INFO)
             .then(|| (req.method().clone(), req.uri().clone()));
@@ -221,7 +223,7 @@ impl Connection {
         }
         self.state
             .metrics
-            .record_request(target == Target::Cl, method_label, status, elapsed);
+            .record_request(layer, method_idx, method_label, status, elapsed);
         Ok(response)
     }
 }
@@ -241,11 +243,11 @@ enum Target {
 }
 
 impl Target {
-    const fn labels(self) -> (&'static str, &'static str) {
+    const fn layer_and_proto(self) -> (UpstreamLayer, &'static str) {
         match self {
-            Self::Cl => ("CL", "HTTP"),
-            Self::El => ("EL", "HTTP"),
-            Self::WebSocket(_) => ("EL", "WS"),
+            Self::Cl => (UpstreamLayer::Cl, "HTTP"),
+            Self::El => (UpstreamLayer::El, "HTTP"),
+            Self::WebSocket(_) => (UpstreamLayer::El, "WS"),
         }
     }
 }
@@ -311,16 +313,13 @@ fn classify_request<B>(req: &Request<B>) -> Route {
         }
     }
     // CL routes take precedence over upgrade headers, as in the forwarding path.
-    if is_cl_path(path) {
-        if req.method() == Method::CONNECT {
-            Route::Reject
-        } else {
-            Route::Proxy(Target::Cl)
-        }
-    } else if let Some(mode) = WsMode::classify(req) {
+    let is_cl = is_cl_path(path);
+    if !is_cl && let Some(mode) = WsMode::classify(req) {
         Route::Proxy(Target::WebSocket(mode))
     } else if req.method() == Method::CONNECT {
         Route::Reject
+    } else if is_cl {
+        Route::Proxy(Target::Cl)
     } else {
         Route::Proxy(Target::El)
     }
@@ -633,7 +632,7 @@ where
     }
 }
 
-pub fn box_incoming<B>(body: B) -> ResBody
+fn box_incoming<B>(body: B) -> ResBody
 where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError>,
@@ -641,7 +640,7 @@ where
     body.map_err(Into::into).boxed_unsync()
 }
 
-pub fn box_full(body: Full<Bytes>) -> ResBody {
+pub(crate) fn box_full(body: Full<Bytes>) -> ResBody {
     body.map_err(|e: Infallible| match e {}).boxed_unsync()
 }
 
@@ -653,7 +652,7 @@ fn json_response(code: StatusCode, body: Bytes) -> Response<ResBody> {
         .unwrap()
 }
 
-pub fn text_response(code: StatusCode, msg: impl Into<Bytes>) -> Response<ResBody> {
+pub(crate) fn text_response(code: StatusCode, msg: impl Into<Bytes>) -> Response<ResBody> {
     Response::builder()
         .status(code)
         .header("content-type", "text/plain; charset=utf-8")
@@ -990,7 +989,7 @@ mod tests {
             crate::Config::parse_from(["ethonyx", "--trust-upstream", "--max-connections", "2"]);
         let validated = cfg.parse_validated().unwrap();
         let state =
-            Arc::new(AppState::new(cfg, validated, false, health::HealthSource::Trusted).unwrap());
+            Arc::new(AppState::new(&cfg, validated, false, health::HealthSource::Trusted).unwrap());
         let sem = Arc::clone(&state.conn_limit);
         let tcp_permit = Arc::new(sem.clone().try_acquire_owned().unwrap());
         let (_shutdown_tx, shutdown_rx) = watch::channel(None);

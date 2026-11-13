@@ -248,9 +248,117 @@ impl SlotClock {
     }
 }
 
-#[doc(hidden)]
-pub struct ValidatedConfig {
-    pub(crate) listen: Vec<Box<str>>,
+/// Parsed `--listen` endpoint preserving unbracketed host/zone strings so
+/// `(host, port)` binds both numeric (`%1`) and named (`%lo0`, `%eth0`) IPv6
+/// link-local scope IDs via OS `getaddrinfo`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ListenAddr {
+    pub(crate) host: Box<str>,
+    pub(crate) port: u16,
+    ipv6: bool,
+}
+
+impl ListenAddr {
+    fn parse(raw: &str) -> Result<Self, BoxError> {
+        let addr = raw.trim();
+        if addr.is_empty() {
+            return Err("no listen addresses configured".into());
+        }
+        let (host, port_str, ipv6) = if let Some(rest) = addr.strip_prefix('[') {
+            let Some((ipv6_host, port_part)) = rest.split_once(']') else {
+                return Err(
+                    format!("invalid --listen address '{addr}': unclosed IPv6 bracket").into(),
+                );
+            };
+            let Some(port_str) = port_part.strip_prefix(':') else {
+                return Err(
+                    format!("invalid --listen address '{addr}': expected [ipv6]:port").into(),
+                );
+            };
+            let valid_ipv6 = match ipv6_host.split_once('%') {
+                Some((addr_part, zone)) => {
+                    !zone.is_empty()
+                        && !zone.bytes().any(|b| b.is_ascii_whitespace())
+                        && addr_part.parse::<std::net::Ipv6Addr>().is_ok()
+                }
+                None => ipv6_host.parse::<std::net::Ipv6Addr>().is_ok(),
+            };
+            if !valid_ipv6 {
+                return Err(format!("invalid --listen address '{addr}': invalid IPv6 host").into());
+            }
+            (ipv6_host, port_str, true)
+        } else {
+            let Some((host, port_str)) = addr.rsplit_once(':') else {
+                return Err(
+                    format!("invalid --listen address '{addr}': expected host:port").into(),
+                );
+            };
+            if host.is_empty()
+                || host.contains(':')
+                || host
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b == b'/' || b == b'@')
+            {
+                return Err(format!("invalid --listen address '{addr}': invalid host").into());
+            }
+            (host, port_str, false)
+        };
+        let Some(port) = parse_canonical_port(port_str, true) else {
+            return Err(format!("invalid --listen address '{addr}': invalid port").into());
+        };
+        Ok(Self {
+            host: Box::from(host),
+            port,
+            ipv6,
+        })
+    }
+}
+
+impl fmt::Display for ListenAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.ipv6 {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// Scalar runtime options retained by [`crate::state::AppState`] after startup
+/// so heap-allocated CLI URL/listen strings in [`Config`] can be freed early.
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeOpts {
+    pub(crate) el_max_block_age_secs: u64,
+    pub(crate) cl_max_slot_age_secs: u64,
+    pub(crate) health_timeout: Duration,
+    pub(crate) proxy_timeout: Duration,
+    pub(crate) sse_idle_timeout: Duration,
+    pub(crate) max_connections: usize,
+    pub(crate) readyz_strict: bool,
+    pub(crate) mock_eth_syncing: bool,
+    pub(crate) mock_cl_subscriptions: bool,
+    pub(crate) mock_cl_node_health: bool,
+}
+
+impl RuntimeOpts {
+    pub(crate) const fn from_config(cfg: &Config) -> Self {
+        Self {
+            el_max_block_age_secs: cfg.el_max_block_age_secs,
+            cl_max_slot_age_secs: cfg.cl_max_slot_age_secs,
+            health_timeout: cfg.health_timeout,
+            proxy_timeout: cfg.proxy_timeout,
+            sse_idle_timeout: cfg.sse_idle_timeout,
+            max_connections: cfg.max_connections,
+            readyz_strict: cfg.readyz_strict,
+            mock_eth_syncing: cfg.mock_eth_syncing,
+            mock_cl_subscriptions: cfg.mock_cl_subscriptions,
+            mock_cl_node_health: cfg.mock_cl_node_health,
+        }
+    }
+}
+
+pub(crate) struct ValidatedConfig {
+    pub(crate) listen: Vec<ListenAddr>,
     pub(crate) el_http: HttpUpstream,
     pub(crate) el_ws: WsUpstream,
     pub(crate) cl_beacon: HttpUpstream,
@@ -258,50 +366,6 @@ pub struct ValidatedConfig {
     pub(crate) slot_clock: Option<SlotClock>,
     #[cfg(feature = "otel")]
     pub(crate) otel_endpoint: Option<HttpUpstream>,
-}
-
-fn validate_listen_addr(raw: &str) -> Result<&str, BoxError> {
-    let addr = raw.trim();
-    if addr.is_empty() {
-        return Err("no listen addresses configured".into());
-    }
-    let port_str = if let Some(rest) = addr.strip_prefix('[') {
-        let Some((ipv6, port_part)) = rest.split_once(']') else {
-            return Err(format!("invalid --listen address '{addr}': unclosed IPv6 bracket").into());
-        };
-        let Some(port_str) = port_part.strip_prefix(':') else {
-            return Err(format!("invalid --listen address '{addr}': expected [ipv6]:port").into());
-        };
-        let (ipv6_addr, zone_ok) =
-            ipv6.split_once('%')
-                .map_or((ipv6, true), |(addr_part, zone)| {
-                    (
-                        addr_part,
-                        !zone.is_empty() && !zone.bytes().any(|b| b.is_ascii_whitespace()),
-                    )
-                });
-        if !zone_ok || ipv6_addr.parse::<std::net::Ipv6Addr>().is_err() {
-            return Err(format!("invalid --listen address '{addr}': invalid IPv6 host").into());
-        }
-        port_str
-    } else {
-        let Some((host, port_str)) = addr.rsplit_once(':') else {
-            return Err(format!("invalid --listen address '{addr}': expected host:port").into());
-        };
-        if host.is_empty()
-            || host.contains(':')
-            || host
-                .bytes()
-                .any(|b| b.is_ascii_whitespace() || b == b'/' || b == b'@')
-        {
-            return Err(format!("invalid --listen address '{addr}': invalid host").into());
-        }
-        port_str
-    };
-    if parse_canonical_port(port_str, true).is_none() {
-        return Err(format!("invalid --listen address '{addr}': invalid port").into());
-    }
-    Ok(addr)
 }
 
 impl Config {
@@ -336,15 +400,14 @@ impl Config {
         self.parse_validated().map(|_| ())
     }
 
-    #[doc(hidden)]
-    pub fn parse_validated(&self) -> Result<ValidatedConfig, BoxError> {
+    pub(crate) fn parse_validated(&self) -> Result<ValidatedConfig, BoxError> {
         if self.listen.is_empty() {
             return Err("no listen addresses configured".into());
         }
         let listen = self
             .listen
             .iter()
-            .map(|raw| validate_listen_addr(raw).map(Box::from))
+            .map(|raw| ListenAddr::parse(raw))
             .collect::<Result<Vec<_>, _>>()?;
         if self.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(format!(
@@ -677,14 +740,14 @@ mod tests {
             validated
                 .listen
                 .iter()
-                .map(AsRef::as_ref)
+                .map(|addr| (&*addr.host, addr.port, addr.to_string()))
                 .collect::<Vec<_>>(),
             vec![
-                "127.0.0.1:8547",
-                "[::1]:8548",
-                "[fe80::1%lo0]:8549",
-                "[fe80::1%1]:18999",
-                "localhost:0",
+                ("127.0.0.1", 8547, "127.0.0.1:8547".to_owned()),
+                ("::1", 8548, "[::1]:8548".to_owned()),
+                ("fe80::1%lo0", 8549, "[fe80::1%lo0]:8549".to_owned()),
+                ("fe80::1%1", 18999, "[fe80::1%1]:18999".to_owned()),
+                ("localhost", 0, "localhost:0".to_owned()),
             ]
         );
 

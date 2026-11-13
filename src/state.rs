@@ -4,7 +4,7 @@ use http::Uri;
 use tokio::sync::Semaphore;
 
 use crate::BoxError;
-use crate::config::{Config, SlotClock, ValidatedConfig};
+use crate::config::{Config, RuntimeOpts, SlotClock, ValidatedConfig};
 use crate::health::{HealthSource, HttpTransport};
 use crate::metrics::{HealthMetrics, ProxyMetrics};
 use crate::proxy::ProxyClient;
@@ -15,20 +15,20 @@ pub(crate) struct HttpTarget {
     pub(crate) transport: HttpTransport,
 }
 
-pub struct AppState {
-    pub cfg: Config,
+pub(crate) struct AppState {
+    pub(crate) cfg: RuntimeOpts,
     /// Default client: HTTP/1.1 for cleartext, h2 via ALPN for `https`. Serves
     /// the CL Beacon/MEV hops, and the EL hop unless cleartext `h2c` is active.
-    pub client: ProxyClient,
+    pub(crate) client: ProxyClient,
     pub(crate) ws_tls: tokio_tungstenite::Connector,
     pub(crate) el: HttpTarget,
     pub(crate) el_ws: WsUpstream,
     pub(crate) cl: HttpTarget,
     pub(crate) cl_mev_relay: Option<HttpTarget>,
-    pub cl_syncing_uri: Uri,
-    pub cl_peer_count_uri: Uri,
+    pub(crate) cl_syncing_uri: Uri,
+    pub(crate) cl_peer_count_uri: Uri,
     pub(crate) slot_clock: Option<SlotClock>,
-    pub otel_enabled: bool,
+    pub(crate) otel_enabled: bool,
     pub(crate) conn_limit: Arc<Semaphore>,
     pub(crate) health: HealthSource,
     pub(crate) metrics: ProxyMetrics,
@@ -37,7 +37,7 @@ pub struct AppState {
 
 impl AppState {
     pub(crate) fn new(
-        cfg: Config,
+        cfg: &Config,
         validated: ValidatedConfig,
         otel_enabled: bool,
         health: HealthSource,
@@ -52,6 +52,7 @@ impl AppState {
             #[cfg(feature = "otel")]
                 otel_endpoint: _,
         } = validated;
+        let opts = RuntimeOpts::from_config(cfg);
 
         let (https, ws_tls) = crate::proxy::build_connectors(el_ws.is_tls());
         let client = crate::proxy::build_client(https.clone());
@@ -70,15 +71,15 @@ impl AppState {
             transport: HttpTransport::new_cl(upstream.is_tls()),
             upstream,
         });
-        let permits = if cfg.max_connections == 0 {
+        let permits = if opts.max_connections == 0 {
             Semaphore::MAX_PERMITS
         } else {
-            cfg.max_connections
+            opts.max_connections
         };
         let conn_limit = Arc::new(Semaphore::new(permits));
 
         Ok(Self {
-            cfg,
+            cfg: opts,
             client,
             ws_tls,
             el,

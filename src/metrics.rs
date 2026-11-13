@@ -21,6 +21,22 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UpstreamLayer {
+    El = 0,
+    Cl = 1,
+}
+
+impl UpstreamLayer {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::El => "EL",
+            Self::Cl => "CL",
+        }
+    }
+}
+
 /// Lazily cached metric handles for hot data-plane paths so steady-state HTTP
 /// and WebSocket traffic performs zero `Vec<Label>` or `Fanout` heap allocations
 /// and zero `RwLock` lookups while keeping unused series unregistered on `/metrics`.
@@ -29,10 +45,9 @@ pub(crate) struct ProxyMetrics {
     active_tcp: OnceLock<Gauge>,
     active_ws: OnceLock<Gauge>,
     saturated: OnceLock<Counter>,
-    el_duration: OnceLock<Histogram>,
-    cl_duration: OnceLock<Histogram>,
-    /// `[upstream: EL=0 | CL=1][method: POST=0 | GET=1][status: 8 hot codes]`
-    requests: [[[OnceLock<Counter>; 8]; 2]; 2],
+    duration: [OnceLock<Histogram>; 2],
+    /// `[upstream: EL=0 | CL=1][method: POST=0 | GET=1 | CONNECT=2 | HEAD=3][status: 8 hot codes]`
+    requests: [[[OnceLock<Counter>; 8]; 4]; 2],
 }
 
 impl ProxyMetrics {
@@ -60,31 +75,26 @@ impl ProxyMetrics {
 
     pub(crate) fn record_request(
         &self,
-        is_cl: bool,
+        layer: UpstreamLayer,
+        method_idx: Option<usize>,
         method_label: &'static str,
         status: u16,
         elapsed: Duration,
     ) {
-        let hist = if is_cl {
-            self.cl_duration.get_or_init(|| {
-                ::metrics::histogram!("ethonyx_proxy_request_duration_seconds", "upstream" => "CL")
+        let l_idx = layer as usize;
+        let upstream_label = layer.as_str();
+        self.duration[l_idx]
+            .get_or_init(|| {
+                ::metrics::histogram!(
+                    "ethonyx_proxy_request_duration_seconds",
+                    "upstream" => upstream_label,
+                )
             })
-        } else {
-            self.el_duration.get_or_init(|| {
-                ::metrics::histogram!("ethonyx_proxy_request_duration_seconds", "upstream" => "EL")
-            })
-        };
-        hist.record(elapsed.as_secs_f64());
+            .record(elapsed.as_secs_f64());
 
-        let upstream_label = if is_cl { "CL" } else { "EL" };
-        let method_idx = match method_label {
-            "POST" => Some(0),
-            "GET" => Some(1),
-            _ => None,
-        };
         let (status_idx, status_label) = classify_status(status);
         if let (Some(m_idx), Some(s_idx)) = (method_idx, status_idx) {
-            self.requests[usize::from(is_cl)][m_idx][s_idx]
+            self.requests[l_idx][m_idx][s_idx]
                 .get_or_init(|| {
                     ::metrics::counter!(
                         "ethonyx_proxy_requests_total",
@@ -103,6 +113,21 @@ impl ProxyMetrics {
             )
             .increment(1);
         }
+    }
+}
+
+pub(crate) fn classify_method(m: &http::Method) -> (Option<usize>, &'static str) {
+    match *m {
+        http::Method::POST => (Some(0), "POST"),
+        http::Method::GET => (Some(1), "GET"),
+        http::Method::CONNECT => (Some(2), "CONNECT"),
+        http::Method::HEAD => (Some(3), "HEAD"),
+        http::Method::PUT => (None, "PUT"),
+        http::Method::DELETE => (None, "DELETE"),
+        http::Method::OPTIONS => (None, "OPTIONS"),
+        http::Method::PATCH => (None, "PATCH"),
+        http::Method::TRACE => (None, "TRACE"),
+        _ => (None, "OTHER"),
     }
 }
 
@@ -137,6 +162,23 @@ pub(crate) const fn classify_status(status: u16) -> (Option<usize>, &'static str
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ClSlotSample {
+    pub(crate) sync_distance: u64,
+    pub(crate) head_slot: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct HealthSample {
+    pub(crate) el_ok: bool,
+    pub(crate) cl_ok: bool,
+    pub(crate) el_peers: f64,
+    pub(crate) cl_peers: f64,
+    pub(crate) el_distance: f64,
+    pub(crate) cl_status: Option<ClSlotSample>,
+    pub(crate) el_block: Option<u64>,
+}
+
 /// Lazily cached gauge handles for background health polling so OTel `Fanout`
 /// never allocates `Vec<Gauge>` / `Arc<FanoutGauge>` or locks registries per poll,
 /// while keeping gauges unregistered under `--trust-upstream`.
@@ -153,48 +195,38 @@ pub(crate) struct HealthMetrics {
 }
 
 impl HealthMetrics {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record(
-        &self,
-        el_ok: bool,
-        cl_ok: bool,
-        el_peers: f64,
-        cl_peers: f64,
-        el_distance: f64,
-        cl_status: Option<(u64, u64)>,
-        el_block: Option<u64>,
-    ) {
+    pub(crate) fn record(&self, sample: HealthSample) {
         self.el_health
             .get_or_init(|| ::metrics::gauge!("ethonyx_upstream_health_status", "layer" => "el"))
-            .set(if el_ok { 1.0 } else { 0.0 });
+            .set(if sample.el_ok { 1.0 } else { 0.0 });
         self.cl_health
             .get_or_init(|| ::metrics::gauge!("ethonyx_upstream_health_status", "layer" => "cl"))
-            .set(if cl_ok { 1.0 } else { 0.0 });
+            .set(if sample.cl_ok { 1.0 } else { 0.0 });
 
         self.el_peers
             .get_or_init(|| ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "el"))
-            .set(el_peers);
+            .set(sample.el_peers);
         self.cl_peers
             .get_or_init(|| ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "cl"))
-            .set(cl_peers);
+            .set(sample.cl_peers);
 
         self.el_distance
             .get_or_init(|| ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "el"))
-            .set(el_distance);
+            .set(sample.el_distance);
 
         let cl_dist_gauge = self
             .cl_distance
             .get_or_init(|| ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "cl"));
-        if let Some((sync_distance, head_slot)) = cl_status {
-            cl_dist_gauge.set(sync_distance as f64);
+        if let Some(cl) = sample.cl_status {
+            cl_dist_gauge.set(cl.sync_distance as f64);
             self.slot_number
                 .get_or_init(|| ::metrics::gauge!("ethonyx_upstream_slot_number"))
-                .set(head_slot as f64);
+                .set(cl.head_slot as f64);
         } else {
             cl_dist_gauge.set(0.0);
         }
 
-        if let Some(block_num) = el_block {
+        if let Some(block_num) = sample.el_block {
             self.block_number
                 .get_or_init(|| ::metrics::gauge!("ethonyx_upstream_block_number"))
                 .set(block_num as f64);

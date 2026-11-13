@@ -19,7 +19,7 @@ static HOP_BY_HOP_FIXED: [HeaderName; 9] = [
 /// Strip hop-by-hop headers, `Connection`-nominated headers, `Host`, and
 /// `Content-Length` from an inbound request before forwarding upstream (where
 /// Hyper recalculates body framing and `Host`/`:authority` from the target URI).
-pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
+pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
     if headers.is_empty() {
         return;
     }
@@ -36,7 +36,7 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
 /// strips hop-by-hop and `Connection`-nominated headers while preserving a valid
 /// `Content-Length` whenever framing is unambiguous (RFC 9110 §8.6, RFC 9112 §6.1–6.2)
 /// so HTTP/1.1 responses do not unnecessarily degrade to `Transfer-Encoding: chunked`.
-pub fn sanitize_response_headers(status: StatusCode, headers: &mut HeaderMap) {
+pub(crate) fn sanitize_response_headers(status: StatusCode, headers: &mut HeaderMap) {
     if headers.is_empty() {
         return;
     }
@@ -120,8 +120,10 @@ fn remove_connection_nominated(headers: &mut HeaderMap) {
             let Ok(token) = std::str::from_utf8(raw.trim_ascii()) else {
                 continue;
             };
-            if !token.is_empty()
-                && !token.eq_ignore_ascii_case("connection")
+            // Skip `"connection"` explicitly because `CONNECTION` is removed right
+            // after this loop, so `Connection: connection` would otherwise hit
+            // `contains_key` and allocate `nominated` unnecessarily.
+            if !token.eq_ignore_ascii_case("connection")
                 && headers.contains_key(token)
                 && let Ok(name) = HeaderName::from_bytes(token.as_bytes())
             {

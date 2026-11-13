@@ -3,12 +3,8 @@ use ethonyx::{BoxError, Config};
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let cfg = Config::parse();
-    #[cfg_attr(not(feature = "otel"), allow(unused_mut))]
-    let mut validated = cfg.parse_validated()?;
-
-    #[cfg(feature = "otel")]
-    let telemetry = ethonyx::otel::start_validated(&mut validated).await?;
+    let app = ethonyx::Prepared::new(Config::parse()).await?;
+    let cfg = app.config();
 
     use tracing_subscriber::prelude::*;
 
@@ -22,7 +18,7 @@ async fn main() -> Result<(), BoxError> {
 
     #[cfg(feature = "otel")]
     {
-        let otel_layer = telemetry.as_ref().map(|telemetry| {
+        let otel_layer = app.tracer().map(|tracer| {
             // Keep OTel request spans active when `--log-level warn` quiets stdout,
             // while still honoring `RUST_LOG` if explicitly provided.
             let otel_filter =
@@ -30,7 +26,7 @@ async fn main() -> Result<(), BoxError> {
                     tracing_subscriber::EnvFilter::new("ethonyx=info,access_log=off")
                 });
             tracing_opentelemetry::layer()
-                .with_tracer(telemetry.tracer())
+                .with_tracer(tracer)
                 .with_filter(otel_filter)
         });
         tracing_subscriber::registry()
@@ -56,9 +52,5 @@ async fn main() -> Result<(), BoxError> {
             let _ = tokio::signal::ctrl_c().await;
         }
     };
-    #[cfg(feature = "otel")]
-    ethonyx::run_validated_with_telemetry(cfg, validated, shutdown, telemetry).await?;
-    #[cfg(not(feature = "otel"))]
-    ethonyx::run_validated(cfg, validated, shutdown).await?;
-    Ok(())
+    app.run(shutdown).await
 }

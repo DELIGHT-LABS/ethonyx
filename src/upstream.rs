@@ -9,7 +9,7 @@ use crate::BoxError;
 /// Formats a URL for logs or diagnostics with credentials, non-root paths,
 /// queries, and fragments redacted so API keys and tokens never leak.
 #[derive(Clone, Copy)]
-pub(crate) struct RedactedUrl<'a>(pub &'a str);
+pub(crate) struct RedactedUrl<'a>(pub(crate) &'a str);
 
 impl fmt::Display for RedactedUrl<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -53,7 +53,7 @@ impl fmt::Debug for RedactedUrl<'_> {
 
 /// Formats an optional URL as [`RedactedUrl`] when `Some`, or `"none"` when `None`.
 #[derive(Clone, Copy)]
-pub(crate) struct RedactedOptUrl<'a>(pub Option<&'a str>);
+pub(crate) struct RedactedOptUrl<'a>(pub(crate) Option<&'a str>);
 
 impl fmt::Display for RedactedOptUrl<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -165,6 +165,17 @@ impl Endpoint {
             return Err(format!("invalid {flag} ({}): missing host", RedactedUrl(raw)).into());
         };
         validate_authority(flag, raw, authority)?;
+
+        // Normalize `https://host?query` (`path_and_query == "?query"`) to `"/?query"` once
+        // at startup so `uri.path_and_query()` always begins with `'/'` (RFC 9112 origin-form).
+        if let Some(pq) = parts.path_and_query.as_ref()
+            && !pq.as_str().starts_with('/')
+        {
+            parts.path_and_query =
+                Some(compose_pq("/", "", pq.query(), None).map_err(|_| {
+                    format!("invalid {flag} ({}): malformed URI", RedactedUrl(raw))
+                })?);
+        }
 
         parts.scheme = Some(scheme);
         let uri = Uri::from_parts(parts)
@@ -577,6 +588,24 @@ mod tests {
                 "/extra?tag=1",
                 None,
                 "/rpc/extra?api_key=secret&tag=1",
+            ),
+            (
+                "https://rpc.example.com?api_key=secret",
+                "/",
+                None,
+                "/?api_key=secret",
+            ),
+            (
+                "https://rpc.example.com?api_key=secret",
+                "/?tag=1",
+                None,
+                "/?api_key=secret&tag=1",
+            ),
+            (
+                "https://rpc.example.com?api_key=secret",
+                "/eth/v1/node/syncing?tag=1",
+                None,
+                "/eth/v1/node/syncing?api_key=secret&tag=1",
             ),
             (
                 "https://relay.example/prefix?api_key=secret",

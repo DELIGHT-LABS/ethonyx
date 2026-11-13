@@ -1,6 +1,7 @@
 //! WebSocket handshake and bounded full-duplex single-task relay. HTTP/1 and HTTP/2 share the same dial path.
+use crate::BoxError;
 use crate::lifecycle::LazyDeadline;
-use crate::proxy::{BoxError, Connection, ResBody, box_full, text_response, uri_too_long_response};
+use crate::proxy::{Connection, ResBody, box_full, text_response, uri_too_long_response};
 use crate::rpc::{MockResult, mock_syncing};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use http::{Method, Request, Response, StatusCode, Version};
@@ -171,11 +172,10 @@ fn normalize_subprotocols(headers: &mut http::HeaderMap) -> Result<(), BoxError>
 
 fn build_ws_request(
     mut req: Request<()>,
+    uri: http::Uri,
     upstream: &crate::upstream::WsUpstream,
     mode: WsMode,
-) -> Result<Request<()>, http::Error> {
-    let inbound_uri = std::mem::take(req.uri_mut());
-    let uri = upstream.rewrite_uri(inbound_uri)?;
+) -> Request<()> {
     req.headers_mut()
         .insert(http::header::HOST, upstream.host_header().clone());
     // RFC 8441 replaces the client's key/accept exchange with :protocol.
@@ -193,10 +193,10 @@ fn build_ws_request(
     // OnUpgrade was taken before consuming the request. Move its headers rather
     // than cloning the map, and reuse the parsed URI for the upstream request.
     req.extensions_mut().clear();
-    Ok(req)
+    req
 }
 
-fn get_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .read_buffer_size(8 * 1024)
         .write_buffer_size(16 * 1024)
@@ -222,8 +222,8 @@ pub(crate) async fn upgrade(
             ));
         }
     };
-    let on_upgrade = hyper::upgrade::on(&mut req);
-    let Ok(ws_req) = build_ws_request(req, &state.el_ws, mode) else {
+    let inbound_uri = std::mem::take(req.uri_mut());
+    let Ok(upstream_uri) = state.el_ws.rewrite_uri(inbound_uri) else {
         return Ok(uri_too_long_response());
     };
     let Some(permit) = connection.acquire_ws_permit(mode) else {
@@ -232,6 +232,8 @@ pub(crate) async fn upgrade(
             "connection limit reached",
         ));
     };
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    let ws_req = build_ws_request(req, upstream_uri, &state.el_ws, mode);
     let io_timeout = state.cfg.proxy_timeout;
     let dial = async {
         let tcp =
@@ -242,7 +244,7 @@ pub(crate) async fn upgrade(
         tokio_tungstenite::client_async_tls_with_config(
             ws_req,
             WriteProgressIo::new(tcp),
-            Some(get_ws_config()),
+            Some(ws_config()),
             Some(state.ws_tls.clone()),
         )
         .await
@@ -300,7 +302,7 @@ pub(crate) async fn upgrade(
                 let client_ws = WebSocketStream::from_raw_socket(
                     WriteProgressIo::new(TokioIo::new(upgraded)),
                     Role::Server,
-                    Some(get_ws_config()),
+                    Some(ws_config()),
                 )
                 .await;
                 bridge_ws(client_ws, upstream_ws, mock_enabled, io_timeout).await;
@@ -385,7 +387,6 @@ impl<S: HasWriteProgress> HasWriteProgress for tokio_tungstenite::MaybeTlsStream
         match self {
             Self::Plain(s) => s.take_write_progress(min_bytes),
             Self::Rustls(tls) => tls.get_mut().0.take_write_progress(min_bytes),
-            #[allow(unreachable_patterns)]
             _ => false,
         }
     }
@@ -394,10 +395,17 @@ impl<S: HasWriteProgress> HasWriteProgress for tokio_tungstenite::MaybeTlsStream
         match self {
             Self::Plain(s) => s.reset_write_progress(),
             Self::Rustls(tls) => tls.get_mut().0.reset_write_progress(),
-            #[allow(unreachable_patterns)]
             _ => {}
         }
     }
+}
+
+/// Relay transport: async IO whose socket-level write progress is observable.
+trait RelayIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress {}
+
+impl<T> RelayIo for T where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress
+{
 }
 
 async fn send_bounded<S>(ws: &mut WebSocketStream<S>, msg: Message, timeout: Duration) -> bool
@@ -424,17 +432,29 @@ enum OutboundState {
     DataActive { queued: Option<Message> },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 enum Side {
     Client,
     Upstream,
 }
 
-enum Stop {
+struct Abort;
+
+enum PeerStop {
     Closed(Option<CloseFrame>),
     Eof,
     Failed,
+}
+
+enum PumpStop {
     Abort,
+    Peer(PeerStop),
+}
+
+impl From<Abort> for PumpStop {
+    fn from(_: Abort) -> Self {
+        Self::Abort
+    }
 }
 
 /// Non-blocking full-duplex WebSocket endpoint state with a 1-slot outbound
@@ -442,25 +462,36 @@ enum Stop {
 struct WsEndpoint<S> {
     ws: WebSocketStream<S>,
     side: Side,
+    intercept_mock: bool,
+    forward_ping: bool,
     outbound: OutboundState,
     local_reply: Option<Message>,
     deadline: LazyDeadline,
     io_timeout: Duration,
 }
 
-impl<S> WsEndpoint<S>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
-{
+impl<S: RelayIo> WsEndpoint<S> {
     const fn new(ws: WebSocketStream<S>, side: Side, io_timeout: Duration) -> Self {
         Self {
             ws,
             side,
+            intercept_mock: false,
+            forward_ping: false,
             outbound: OutboundState::Idle,
             local_reply: None,
             deadline: LazyDeadline::new(),
             io_timeout,
         }
+    }
+
+    const fn with_mock_syncing(mut self, enabled: bool) -> Self {
+        self.intercept_mock = enabled;
+        self
+    }
+
+    const fn with_ping_forwarding(mut self) -> Self {
+        self.forward_ping = true;
+        self
     }
 
     const fn can_accept(&self) -> bool {
@@ -487,15 +518,15 @@ where
         &mut self,
         cx: &mut Context<'_>,
         payload: bytes::Bytes,
-    ) -> Result<(), Stop> {
+    ) -> Result<(), Abort> {
         if !matches!(self.outbound, OutboundState::Idle) || self.local_reply.is_some() {
             return Ok(());
         }
         if let Poll::Ready(res) = Pin::new(&mut self.ws).poll_ready(cx) {
-            res.map_err(|_| Stop::Abort)?;
+            res.map_err(|_| Abort)?;
             Pin::new(&mut self.ws)
                 .start_send(Message::Ping(payload))
-                .map_err(|_| Stop::Abort)?;
+                .map_err(|_| Abort)?;
             self.request_control_flush();
         }
         Ok(())
@@ -505,7 +536,7 @@ where
         &mut self,
         cx: &mut Context<'_>,
         timeout: Duration,
-    ) -> Result<(), Stop> {
+    ) -> Result<(), Abort> {
         if !self.deadline.is_armed() {
             // Discard initial buffer-fill bytes written before backpressure began.
             self.ws.get_mut().reset_write_progress();
@@ -522,13 +553,13 @@ where
                 timeout_secs = timeout.as_secs(),
                 "ws write stalled; aborting relay"
             );
-            Err(Stop::Abort)
+            Err(Abort)
         } else {
             Ok(())
         }
     }
 
-    fn poll_send_queued(&mut self, cx: &mut Context<'_>) -> Result<(), Stop> {
+    fn poll_send_queued(&mut self, cx: &mut Context<'_>) -> Result<(), Abort> {
         let OutboundState::DataActive { queued } = &mut self.outbound else {
             return Ok(());
         };
@@ -538,18 +569,16 @@ where
         match Pin::new(&mut self.ws).poll_ready(cx) {
             Poll::Ready(Ok(())) => {
                 let msg = queued.take().expect("queued checked");
-                Pin::new(&mut self.ws)
-                    .start_send(msg)
-                    .map_err(|_| Stop::Abort)
+                Pin::new(&mut self.ws).start_send(msg).map_err(|_| Abort)
             }
-            Poll::Ready(Err(_)) => Err(Stop::Abort),
+            Poll::Ready(Err(_)) => Err(Abort),
             // Defer stall-timer evaluation to Step 4 (`poll_flush_and_timer`),
             // which runs once per turn after both directional pumps finish.
             Poll::Pending => Ok(()),
         }
     }
 
-    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Result<(), Stop> {
+    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Result<(), Abort> {
         self.poll_send_queued(cx)?;
         if self.can_accept()
             && let Some(reply) = self.local_reply.take()
@@ -560,12 +589,9 @@ where
         Ok(())
     }
 
-    fn poll_flush_and_timer(&mut self, cx: &mut Context<'_>) -> Result<(), Stop> {
+    fn poll_flush_and_timer(&mut self, cx: &mut Context<'_>) -> Result<(), Abort> {
         let timeout = match self.outbound {
-            OutboundState::Idle => {
-                self.deadline.disarm();
-                return Ok(());
-            }
+            OutboundState::Idle => return Ok(()),
             OutboundState::DataActive { queued: Some(_) } => {
                 return self.check_stall_deadline(cx, self.io_timeout);
             }
@@ -579,7 +605,7 @@ where
                 self.deadline.disarm();
                 Ok(())
             }
-            Poll::Ready(Err(_)) => Err(Stop::Abort),
+            Poll::Ready(Err(_)) => Err(Abort),
             Poll::Pending => self.check_stall_deadline(cx, timeout),
         }
     }
@@ -591,7 +617,7 @@ where
             OutboundState::Idle | OutboundState::ControlFlush => None,
         };
         let reply = self.local_reply.take();
-        if !was_active && queued.is_none() && reply.is_none() {
+        if !was_active && reply.is_none() {
             return true;
         }
         tokio::time::timeout(timeout, async {
@@ -609,11 +635,10 @@ fn pump<A, B>(
     cx: &mut Context<'_>,
     src: &mut WsEndpoint<A>,
     dst: &mut WsEndpoint<B>,
-    intercept_mock: bool,
-) -> Result<bool, Stop>
+) -> Result<bool, PumpStop>
 where
-    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
+    A: RelayIo,
+    B: RelayIo,
 {
     let mut count = 0;
     while count < MAX_BATCH_FRAMES {
@@ -622,13 +647,13 @@ where
         }
         match Pin::new(&mut src.ws).poll_next(cx) {
             Poll::Pending => break,
-            Poll::Ready(None) => return Err(Stop::Eof),
-            Poll::Ready(Some(Err(_))) => return Err(Stop::Failed),
+            Poll::Ready(None) => return Err(PumpStop::Peer(PeerStop::Eof)),
+            Poll::Ready(Some(Err(_))) => return Err(PumpStop::Peer(PeerStop::Failed)),
             Poll::Ready(Some(Ok(msg))) => {
                 count += 1;
                 match msg {
                     Message::Text(text) => {
-                        if intercept_mock {
+                        if src.intercept_mock {
                             match mock_syncing(text.as_bytes()) {
                                 MockResult::Silent => continue,
                                 MockResult::Reply(reply) => {
@@ -659,12 +684,12 @@ where
                         // L7 load balancers / NATs in front of ethonyx observe traffic
                         // without adding per-connection proxy timers. Client's Pong is
                         // absorbed locally when it arrives.
-                        if src.side == Side::Upstream {
+                        if src.forward_ping {
                             dst.try_queue_idle_ping(cx, payload)?;
                         }
                     }
                     Message::Pong(_) | Message::Frame(_) => {}
-                    Message::Close(frame) => return Err(Stop::Closed(frame)),
+                    Message::Close(frame) => return Err(PumpStop::Peer(PeerStop::Closed(frame))),
                 }
             }
         }
@@ -672,13 +697,13 @@ where
     Ok(count == MAX_BATCH_FRAMES && dst.can_accept() && src.local_reply.is_none())
 }
 
-async fn finish<A, B>(src: &mut WsEndpoint<A>, other: &mut WsEndpoint<B>, stop: Stop)
+async fn finish<A, B>(src: &mut WsEndpoint<A>, other: &mut WsEndpoint<B>, stop: PeerStop)
 where
-    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress,
+    A: RelayIo,
+    B: RelayIo,
 {
     match stop {
-        Stop::Closed(frame) => {
+        PeerStop::Closed(frame) => {
             // `src` initiated Close, so Tungstenite is now in closing state and
             // rejects new `ws.send(data)` calls with `SendAfterClosing`. Drop
             // unsent frames destined for `src` and flush its Close reply directly.
@@ -698,14 +723,13 @@ where
                 .await;
             }
         }
-        Stop::Eof => {
+        PeerStop::Eof => {
             let _ = other.drain_pending(WS_CLOSE_GRACE).await;
         }
-        Stop::Failed => {
+        PeerStop::Failed => {
             let _ = other.drain_pending(WS_CLOSE_GRACE).await;
             let _ = flush_bounded(&mut src.ws, WS_CLOSE_GRACE).await;
         }
-        Stop::Abort => {}
     }
 }
 
@@ -715,34 +739,38 @@ async fn bridge_ws<C, U>(
     mock_enabled: bool,
     io_timeout: Duration,
 ) where
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress + Send + 'static,
-    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + HasWriteProgress + Send + 'static,
+    C: RelayIo,
+    U: RelayIo,
 {
-    let mut client = WsEndpoint::new(client_ws, Side::Client, io_timeout);
-    let mut upstream = WsEndpoint::new(upstream_ws, Side::Upstream, io_timeout);
+    let mut client =
+        WsEndpoint::new(client_ws, Side::Client, io_timeout).with_mock_syncing(mock_enabled);
+    let mut upstream =
+        WsEndpoint::new(upstream_ws, Side::Upstream, io_timeout).with_ping_forwarding();
 
-    let (side, stop) = std::future::poll_fn(|cx| {
+    let outcome = std::future::poll_fn(|cx| {
         // 1. Advance any already-queued outbound frames first so freed slots are
         // immediately visible to both directional read loops below.
         if upstream.poll_pending(cx).is_err() || client.poll_pending(cx).is_err() {
-            return Poll::Ready((Side::Client, Stop::Abort));
+            return Poll::Ready(None);
         }
 
         // 2. Client -> Upstream (bounded batch per poll turn for scheduler fairness).
-        let c2u_full = match pump(cx, &mut client, &mut upstream, mock_enabled) {
+        let c2u_full = match pump(cx, &mut client, &mut upstream) {
             Ok(full) => full,
-            Err(stop) => return Poll::Ready((Side::Client, stop)),
+            Err(PumpStop::Abort) => return Poll::Ready(None),
+            Err(PumpStop::Peer(stop)) => return Poll::Ready(Some((Side::Client, stop))),
         };
 
         // 3. Upstream -> Client (independent full-duplex progress even when `upstream` sink is full).
-        let u2c_full = match pump(cx, &mut upstream, &mut client, false) {
+        let u2c_full = match pump(cx, &mut upstream, &mut client) {
             Ok(full) => full,
-            Err(stop) => return Poll::Ready((Side::Upstream, stop)),
+            Err(PumpStop::Abort) => return Poll::Ready(None),
+            Err(PumpStop::Peer(stop)) => return Poll::Ready(Some((Side::Upstream, stop))),
         };
 
         // 4. Flush batched outbound frames once per direction & enforce stall deadlines.
         if upstream.poll_flush_and_timer(cx).is_err() || client.poll_flush_and_timer(cx).is_err() {
-            return Poll::Ready((Side::Client, Stop::Abort));
+            return Poll::Ready(None);
         }
 
         if c2u_full || u2c_full {
@@ -752,9 +780,11 @@ async fn bridge_ws<C, U>(
     })
     .await;
 
-    match side {
-        Side::Client => finish(&mut client, &mut upstream, stop).await,
-        Side::Upstream => finish(&mut upstream, &mut client, stop).await,
+    if let Some((side, stop)) = outcome {
+        match side {
+            Side::Client => finish(&mut client, &mut upstream, stop).await,
+            Side::Upstream => finish(&mut upstream, &mut client, stop).await,
+        }
     }
 }
 
@@ -939,7 +969,9 @@ mod tests {
                     StatusCode::OK
                 }
             );
-            let ws_req = build_ws_request(req, &upstream, mode).unwrap();
+            let inbound_uri = std::mem::take(req.uri_mut());
+            let uri = upstream.rewrite_uri(inbound_uri).unwrap();
+            let ws_req = build_ws_request(req, uri, &upstream, mode);
             let h = ws_req.headers();
             assert!(!h.contains_key("x-internal"));
             assert!(!h.contains_key("proxy-authorization"));
@@ -977,13 +1009,13 @@ mod tests {
         let proxy_client = WebSocketStream::from_raw_socket(
             WriteProgressIo::new(proxy_client_io),
             Role::Server,
-            Some(get_ws_config()),
+            Some(ws_config()),
         )
         .await;
         let proxy_upstream = WebSocketStream::from_raw_socket(
             WriteProgressIo::new(proxy_upstream_io),
             Role::Client,
-            Some(get_ws_config()),
+            Some(ws_config()),
         )
         .await;
         let upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
@@ -1363,13 +1395,13 @@ mod tests {
         let proxy_client = WebSocketStream::from_raw_socket(
             WriteProgressIo::new(proxy_client_io),
             Role::Server,
-            Some(get_ws_config()),
+            Some(ws_config()),
         )
         .await;
         let proxy_upstream = WebSocketStream::from_raw_socket(
             WriteProgressIo::new(proxy_upstream_io),
             Role::Client,
-            Some(get_ws_config()),
+            Some(ws_config()),
         )
         .await;
         let mut upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
@@ -1420,14 +1452,14 @@ mod tests {
         let proxy_client = WebSocketStream::from_raw_socket(
             WriteProgressIo::new(tokio::io::join(proxy_rx, proxy_tx)),
             Role::Server,
-            Some(get_ws_config()),
+            Some(ws_config()),
         )
         .await;
         let (proxy_upstream_io, _upstream_io) = tokio::io::duplex(16 * 1024);
         let proxy_upstream = WebSocketStream::from_raw_socket(
             WriteProgressIo::new(proxy_upstream_io),
             Role::Client,
-            Some(get_ws_config()),
+            Some(ws_config()),
         )
         .await;
         let relay = tokio::spawn(bridge_ws(

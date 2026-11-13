@@ -5,6 +5,7 @@
 //! in-process without spawning a subprocess.
 
 #![forbid(unsafe_code)]
+#![warn(unreachable_pub)]
 
 pub mod config;
 mod headers;
@@ -12,7 +13,7 @@ mod health;
 mod lifecycle;
 mod metrics;
 #[cfg(feature = "otel")]
-pub mod otel;
+mod otel;
 mod proxy;
 mod rpc;
 mod state;
@@ -39,7 +40,7 @@ use tracing::{debug, info, trace, warn};
 use crate::state::AppState;
 
 use std::sync::OnceLock;
-pub static PROMETHEUS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+pub(crate) static PROMETHEUS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
     OnceLock::new();
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -48,82 +49,82 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(65);
 
-/// Bind every `cfg.listen` address, serve all routes, and wait for `shutdown`
-/// before draining for `cfg.shutdown_grace` seconds.
+/// A validated configuration plus the telemetry providers started for it.
+///
+/// Preparation is separate from [`Prepared::run`] so a binary can build its
+/// tracing subscriber from [`Prepared::tracer`] before the server starts.
+pub struct Prepared {
+    cfg: Config,
+    validated: config::ValidatedConfig,
+    #[cfg(feature = "otel")]
+    telemetry: Option<otel::Telemetry>,
+}
+
+impl Prepared {
+    /// Validate `cfg` and start the OTLP providers when an endpoint is configured.
+    pub async fn new(cfg: Config) -> Result<Self, BoxError> {
+        #[cfg(not(feature = "otel"))]
+        let validated = cfg.parse_validated()?;
+        #[cfg(feature = "otel")]
+        let (validated, telemetry) = {
+            let mut validated = cfg.parse_validated()?;
+            let telemetry = otel::start(validated.otel_endpoint.take()).await?;
+            (validated, telemetry)
+        };
+        Ok(Self {
+            cfg,
+            validated,
+            #[cfg(feature = "otel")]
+            telemetry,
+        })
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// Tracer for the caller's `tracing-opentelemetry` layer, if telemetry started.
+    #[cfg(feature = "otel")]
+    pub fn tracer(&self) -> Option<opentelemetry_sdk::trace::SdkTracer> {
+        self.telemetry.as_ref().map(otel::Telemetry::tracer)
+    }
+
+    /// Bind every `cfg.listen` address, serve all routes, and wait for `shutdown`
+    /// before draining for `cfg.shutdown_grace` seconds. Telemetry providers are
+    /// shut down whether or not serving succeeded.
+    pub async fn run<F>(self, shutdown: F) -> Result<(), BoxError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        #[cfg(not(feature = "otel"))]
+        {
+            run_inner(self.cfg, self.validated, shutdown, false).await
+        }
+        #[cfg(feature = "otel")]
+        {
+            let otel_enabled = self.telemetry.is_some();
+            let res = run_inner(self.cfg, self.validated, shutdown, otel_enabled).await;
+            if let Some(telemetry) = self.telemetry {
+                telemetry.shutdown().await;
+            }
+            res
+        }
+    }
+}
+
+/// Validate `cfg`, then serve until `shutdown` resolves. See [`Prepared`].
 pub async fn run<F>(cfg: Config, shutdown: F) -> Result<(), BoxError>
 where
     F: Future<Output = ()> + Send,
 {
-    let validated = cfg.parse_validated()?;
-    run_validated(cfg, validated, shutdown).await
-}
-
-#[doc(hidden)]
-pub async fn run_validated<F>(
-    cfg: Config,
-    #[cfg_attr(not(feature = "otel"), allow(unused_mut))] mut validated: config::ValidatedConfig,
-    shutdown: F,
-) -> Result<(), BoxError>
-where
-    F: Future<Output = ()> + Send,
-{
-    #[cfg(feature = "otel")]
-    {
-        let telemetry = crate::otel::start_upstream(validated.otel_endpoint.take()).await?;
-        run_validated_with_telemetry(cfg, validated, shutdown, telemetry).await
-    }
-    #[cfg(not(feature = "otel"))]
-    {
-        run_inner(cfg, validated, shutdown).await
-    }
-}
-
-/// Run with providers initialized before the caller constructs its tracing layer.
-#[cfg(feature = "otel")]
-pub async fn run_with_telemetry<F>(
-    cfg: Config,
-    shutdown: F,
-    telemetry: Option<otel::Telemetry>,
-) -> Result<(), BoxError>
-where
-    F: Future<Output = ()> + Send,
-{
-    let validated = match cfg.parse_validated() {
-        Ok(v) => v,
-        Err(e) => {
-            if let Some(tp) = telemetry {
-                tp.shutdown().await;
-            }
-            return Err(e);
-        }
-    };
-    run_validated_with_telemetry(cfg, validated, shutdown, telemetry).await
-}
-
-#[cfg(feature = "otel")]
-#[doc(hidden)]
-pub async fn run_validated_with_telemetry<F>(
-    cfg: Config,
-    validated: config::ValidatedConfig,
-    shutdown: F,
-    telemetry: Option<otel::Telemetry>,
-) -> Result<(), BoxError>
-where
-    F: Future<Output = ()> + Send,
-{
-    let has_telemetry = telemetry.is_some();
-    let res = run_inner(cfg, validated, shutdown, has_telemetry).await;
-    if let Some(tp) = telemetry {
-        tp.shutdown().await;
-    }
-    res
+    Prepared::new(cfg).await?.run(shutdown).await
 }
 
 async fn run_inner<F>(
     cfg: Config,
     mut validated: config::ValidatedConfig,
     shutdown: F,
-    #[cfg(feature = "otel")] has_telemetry: bool,
+    otel_enabled: bool,
 ) -> Result<(), BoxError>
 where
     F: Future<Output = ()> + Send,
@@ -135,12 +136,7 @@ where
     let prometheus_handle = prometheus_recorder.handle();
 
     #[cfg(feature = "otel")]
-    let otel_enabled = has_telemetry;
-    #[cfg(not(feature = "otel"))]
-    let otel_enabled = false;
-
-    #[cfg(feature = "otel")]
-    let recorder_installed = if has_telemetry {
+    let recorder_installed = if otel_enabled {
         let fanout = metrics_util::layers::FanoutBuilder::default()
             .add_recorder(prometheus_recorder)
             .add_recorder(crate::otel::OtelRecorder::new())
@@ -182,7 +178,7 @@ where
     };
     let (shutdown_tx, _) = watch::channel(None);
 
-    let state = Arc::new(AppState::new(cfg, validated, otel_enabled, health)?);
+    let state = Arc::new(AppState::new(&cfg, validated, otel_enabled, health)?);
 
     tokio::pin!(shutdown);
 
@@ -205,7 +201,7 @@ where
         initial_degraded = first_probe.has_errors();
         let _ = tx.send(first_probe);
     }
-    let startup_msg = if state.cfg.trust_upstream {
+    let startup_msg = if cfg.trust_upstream {
         "upstreams configured (trusted)"
     } else if initial_degraded {
         "upstreams configured (initial probe degraded)"
@@ -213,18 +209,19 @@ where
         "upstreams connected"
     };
     info!(
-        el_http = %RedactedUrl(&state.cfg.el_http_url),
+        el_http = %RedactedUrl(&cfg.el_http_url),
         el_http_proto = %state.el.transport.startup_proto_label(),
-        el_ws = %RedactedUrl(&state.cfg.el_ws_url),
-        cl_beacon = %RedactedUrl(&state.cfg.cl_beacon_url),
-        cl_mev_relay = %upstream::RedactedOptUrl(state.cfg.cl_mev_relay_url.as_deref()),
+        el_ws = %RedactedUrl(&cfg.el_ws_url),
+        cl_beacon = %RedactedUrl(&cfg.cl_beacon_url),
+        cl_mev_relay = %upstream::RedactedOptUrl(cfg.cl_mev_relay_url.as_deref()),
         cl_proto = %state.cl.transport.startup_proto_label(),
         "{startup_msg}"
     );
+    drop(cfg);
 
     let mut listeners = Vec::with_capacity(listen_addrs.len());
-    for addr in &listen_addrs {
-        let listener = TcpListener::bind(&**addr)
+    for addr in listen_addrs {
+        let listener = TcpListener::bind((&*addr.host, addr.port))
             .await
             .map_err(|e| format!("failed to bind --listen address '{addr}': {e}"))?;
         info!(listen = %addr, "listening");
@@ -604,40 +601,70 @@ async fn accept_loop(
     }
 }
 
-fn method_to_static_str(m: &hyper::http::Method) -> &'static str {
-    match m.as_str() {
-        "GET" => "GET",
-        "POST" => "POST",
-        "PUT" => "PUT",
-        "DELETE" => "DELETE",
-        "OPTIONS" => "OPTIONS",
-        "HEAD" => "HEAD",
-        "PATCH" => "PATCH",
-        "CONNECT" => "CONNECT",
-        "TRACE" => "TRACE",
-        _ => "OTHER",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use hyper::http::Method;
 
     #[test]
-    fn test_method_to_static_str() {
-        assert_eq!(method_to_static_str(&Method::GET), "GET");
-        assert_eq!(method_to_static_str(&Method::POST), "POST");
-        assert_eq!(method_to_static_str(&Method::CONNECT), "CONNECT");
+    fn test_classify_method() {
+        assert_eq!(metrics::classify_method(&Method::POST), (Some(0), "POST"));
+        assert_eq!(metrics::classify_method(&Method::GET), (Some(1), "GET"));
         assert_eq!(
-            method_to_static_str(&Method::from_bytes(b"OPTIONS").unwrap()),
-            "OPTIONS"
+            metrics::classify_method(&Method::CONNECT),
+            (Some(2), "CONNECT")
+        );
+        assert_eq!(metrics::classify_method(&Method::HEAD), (Some(3), "HEAD"));
+        assert_eq!(
+            metrics::classify_method(&Method::from_bytes(b"OPTIONS").unwrap()),
+            (None, "OPTIONS")
         );
         // Edge case: Custom method falls back to OTHER
         assert_eq!(
-            method_to_static_str(&Method::from_bytes(b"PURGE").unwrap()),
-            "OTHER"
+            metrics::classify_method(&Method::from_bytes(b"PURGE").unwrap()),
+            (None, "OTHER")
         );
+    }
+
+    #[tokio::test]
+    async fn listen_addr_resolves_numeric_and_named_ipv6_zone_ids() {
+        use clap::Parser;
+        use std::net::SocketAddr;
+
+        #[cfg(target_os = "macos")]
+        let named = "[fe80::1%lo0]:0";
+        #[cfg(target_os = "linux")]
+        let named = "[fe80::1%lo]:0";
+
+        let cfg = Config::parse_from(["ethonyx", "--listen", "[fe80::1%1]:0"]);
+        let validated = cfg.parse_validated().unwrap();
+        let addr = &validated.listen[0];
+        let resolved: Vec<_> = tokio::net::lookup_host((&*addr.host, addr.port))
+            .await
+            .expect("numeric IPv6 zone ID must resolve")
+            .collect();
+        assert!(matches!(resolved.as_slice(), [SocketAddr::V6(v6), ..] if v6.scope_id() == 1));
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let cfg = Config::parse_from(["ethonyx", "--listen", named]);
+            let validated = cfg.parse_validated().unwrap();
+            let addr = &validated.listen[0];
+            let resolved: Vec<_> = tokio::net::lookup_host((&*addr.host, addr.port))
+                .await
+                .expect("named IPv6 zone ID must resolve via OS getaddrinfo")
+                .collect();
+            assert!(matches!(resolved.as_slice(), [SocketAddr::V6(v6), ..] if v6.scope_id() != 0));
+
+            #[cfg(target_os = "macos")]
+            {
+                let listener = TcpListener::bind((&*addr.host, addr.port))
+                    .await
+                    .expect("macOS lo0 must bind [fe80::1%lo0]:0");
+                let local = listener.local_addr().unwrap();
+                assert!(matches!(local, SocketAddr::V6(v6) if v6.scope_id() != 0));
+            }
+        }
     }
 
     #[test]

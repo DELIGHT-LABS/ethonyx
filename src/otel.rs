@@ -3,17 +3,17 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 
 const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");
-static TRACEPARENT: http::HeaderName = http::HeaderName::from_static("traceparent");
-static TRACESTATE: http::HeaderName = http::HeaderName::from_static("tracestate");
+const TRACEPARENT: http::HeaderName = http::HeaderName::from_static("traceparent");
+const TRACESTATE: http::HeaderName = http::HeaderName::from_static("tracestate");
 
 struct HeaderMapCarrier<'a>(&'a mut http::HeaderMap);
 
 impl<'a> opentelemetry::propagation::Injector for HeaderMapCarrier<'a> {
     fn set(&mut self, key: &str, value: String) {
         let name = if key.eq_ignore_ascii_case("traceparent") {
-            TRACEPARENT.clone()
+            TRACEPARENT
         } else if key.eq_ignore_ascii_case("tracestate") {
-            TRACESTATE.clone()
+            TRACESTATE
         } else if let Ok(custom) = http::HeaderName::from_bytes(key.as_bytes()) {
             custom
         } else {
@@ -41,7 +41,7 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrierRef<'a> {
 /// Link `span` to any non-`Connection`-nominated parent trace context in `headers`.
 /// Must be called BEFORE `span` is first entered so `tracing-opentelemetry` builds
 /// the underlying OTel `Span` with the extracted parent `TraceId`.
-pub fn attach_parent_context(span: &tracing::Span, headers: &http::HeaderMap) {
+pub(crate) fn attach_parent_context(span: &tracing::Span, headers: &http::HeaderMap) {
     if span.is_disabled() {
         return;
     }
@@ -53,7 +53,7 @@ pub fn attach_parent_context(span: &tracing::Span, headers: &http::HeaderMap) {
     }
 }
 
-pub fn propagate_context(headers: &mut http::HeaderMap) {
+pub(crate) fn propagate_context(headers: &mut http::HeaderMap) {
     let span = tracing::Span::current();
     if span.is_disabled() {
         // When no tracing subscriber/span is active, any non-Connection-nominated
@@ -66,18 +66,18 @@ pub fn propagate_context(headers: &mut http::HeaderMap) {
     });
 }
 
-pub struct Telemetry {
+pub(crate) struct Telemetry {
     traces: opentelemetry_sdk::trace::SdkTracerProvider,
     metrics: opentelemetry_sdk::metrics::SdkMeterProvider,
 }
 
 impl Telemetry {
-    pub fn tracer(&self) -> opentelemetry_sdk::trace::SdkTracer {
+    pub(crate) fn tracer(&self) -> opentelemetry_sdk::trace::SdkTracer {
         use opentelemetry::trace::TracerProvider;
         self.traces.tracer(SERVICE_NAME)
     }
 
-    pub async fn shutdown(self) {
+    pub(crate) async fn shutdown(self) {
         // Blocking readers/exporters must be joined outside the async worker.
         let _ = tokio::task::spawn_blocking(move || {
             let _ = self.metrics.shutdown();
@@ -87,22 +87,8 @@ impl Telemetry {
     }
 }
 
-pub async fn start(endpoint: Option<&str>) -> Result<Option<Telemetry>, crate::BoxError> {
-    let Some(endpoint) = endpoint else {
-        return Ok(None);
-    };
-    let base = parse_endpoint(endpoint)?;
-    start_upstream(Some(base)).await
-}
-
-#[doc(hidden)]
-pub async fn start_validated(
-    validated: &mut crate::config::ValidatedConfig,
-) -> Result<Option<Telemetry>, crate::BoxError> {
-    start_upstream(validated.otel_endpoint.take()).await
-}
-
-pub(crate) async fn start_upstream(
+/// Start the OTLP trace and metric providers for a validated endpoint.
+pub(crate) async fn start(
     base: Option<crate::upstream::HttpUpstream>,
 ) -> Result<Option<Telemetry>, crate::BoxError> {
     let Some(base) = base else {
@@ -205,7 +191,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-pub struct OtelRecorder {
+pub(crate) struct OtelRecorder {
     meter: opentelemetry::metrics::Meter,
     counters: RwLock<HashMap<Key, Counter>>,
     gauges: RwLock<HashMap<Key, Gauge>>,
@@ -219,7 +205,7 @@ impl Default for OtelRecorder {
 }
 
 impl OtelRecorder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_meter(global::meter(SERVICE_NAME))
     }
 
@@ -445,7 +431,18 @@ mod tests {
             let tcp = proxy_metrics.active_tcp();
             // Open and immediately drop a WS connection to verify symmetrical +1 / -1.
             drop(proxy_metrics.active_ws());
-            health_metrics.record(true, true, 8.0, 12.0, 0.0, Some((0, 42)), Some(100));
+            health_metrics.record(crate::metrics::HealthSample {
+                el_ok: true,
+                cl_ok: true,
+                el_peers: 8.0,
+                cl_peers: 12.0,
+                el_distance: 0.0,
+                cl_status: Some(crate::metrics::ClSlotSample {
+                    sync_distance: 0,
+                    head_slot: 42,
+                }),
+                el_block: Some(100),
+            });
             tcp
         });
 
