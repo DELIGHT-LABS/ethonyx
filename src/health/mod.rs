@@ -2,6 +2,7 @@
 
 mod cl;
 mod el;
+mod fetch;
 mod probe;
 
 pub(crate) use probe::{HealthSource, Probe, poll_loop, probe_once, update_metrics};
@@ -20,7 +21,7 @@ use crate::transport::{ResBody, box_full};
 
 use cl::ClStatus;
 use el::{ElBlockResult, ElSyncingResult};
-use probe::ProbeError;
+use fetch::ProbeError;
 
 const TRUSTED_READY_JSON: &[u8] = br#"{"status":"ready","el_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"},"cl_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"}}"#;
 const TRUSTED_HEALTH_H1_H1: &[u8] =
@@ -280,7 +281,7 @@ fn classify_node_health(ready: bool, readyz_strict: bool, probe: &Probe) -> Stat
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum ElSyncEval<'a> {
+enum ElSyncEval<'a> {
     Synced,
     SyncingBool,
     SyncingProgress { current_block: u64, distance: u64 },
@@ -315,7 +316,7 @@ impl fmt::Display for ElSyncEval<'_> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum ClSyncEval<'a> {
+enum ClSyncEval<'a> {
     Synced { head_slot: u64, sync_distance: u64 },
     Syncing { head_slot: u64, sync_distance: u64 },
     Err(&'a str),
@@ -351,7 +352,7 @@ impl fmt::Display for ClSyncEval<'_> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum FreshEval<'a> {
+enum FreshEval<'a> {
     Fresh {
         kind: &'static str,
         num: u64,
@@ -405,9 +406,9 @@ impl fmt::Display for FreshEval<'_> {
 /// `node_health`, `poll_loop` metrics, and readiness transition logs.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadinessEval<'a> {
-    pub(super) el_sync: ElSyncEval<'a>,
-    pub(super) cl_sync: ClSyncEval<'a>,
-    pub(super) strict: Option<(FreshEval<'a>, FreshEval<'a>)>,
+    el_sync: ElSyncEval<'a>,
+    cl_sync: ClSyncEval<'a>,
+    strict: Option<(FreshEval<'a>, FreshEval<'a>)>,
 }
 
 impl<'a> ReadinessEval<'a> {
@@ -470,13 +471,13 @@ pub(crate) fn evaluate_readiness<'a>(state: &AppState, probe: &'a Probe) -> Read
 /// What [`poll_loop`] should log given the previous and current readiness, so a
 /// sustained state logs once (on transition) rather than once per poll.
 #[derive(Clone, Copy)]
-pub(super) enum Transition {
+enum Transition {
     Silent,
     BecameNotReady,
     Recovered,
 }
 
-pub(super) fn readiness_transition(prev_ready: Option<bool>, ready: bool) -> Transition {
+const fn readiness_transition(prev_ready: Option<bool>, ready: bool) -> Transition {
     match prev_ready {
         Some(p) if p == ready => Transition::Silent,
         None if ready => Transition::Silent, // first poll already healthy: stay quiet

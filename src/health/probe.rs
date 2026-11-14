@@ -1,24 +1,19 @@
-//! Shared health probe cache, background poller, HTTP body fetcher, and JSON object guard.
+//! Shared health probe cache and background poller.
 
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-use http::Request;
-use http_body_util::BodyExt;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::metrics::{ClSlotSample, HealthSample};
 use crate::state::AppState;
-use crate::transport::{HttpTransport, ProxyClient, ResBody};
 
 use super::cl::{ClStatus, cl_peer_count, cl_syncing_status};
 use super::el::{ElBlockResult, ElSyncingResult, el_batch_detect};
+use super::fetch::{HealthError, ProbeError, ProbeTarget};
 use super::{ReadinessEval, Transition, evaluate_readiness, readiness_transition};
-
-pub(crate) type ProbeError = Arc<str>;
 
 /// Source of readiness and health data for `/healthz`, `/readyz`, and `node_health`.
 pub(crate) enum HealthSource {
@@ -62,55 +57,26 @@ impl Probe {
     }
 }
 
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
-pub(super) enum HealthError {
-    Timeout,
-    Transport(ProbeError),
-    HttpStatus(http::StatusCode),
-    Decode(ProbeError),
-    Rpc(ProbeError),
-}
-
-impl HealthError {
-    pub(super) fn into_probe_error(self) -> ProbeError {
-        match self {
-            Self::Timeout => Arc::from("timeout"),
-            other => Arc::from(other.to_string()),
-        }
-    }
-}
-
-impl fmt::Display for HealthError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Timeout => f.write_str("timeout"),
-            Self::Transport(s) => write!(f, "transport: {s}"),
-            Self::HttpStatus(status) => write!(f, "http {status}"),
-            Self::Decode(s) => write!(f, "decode: {s}"),
-            Self::Rpc(s) => write!(f, "rpc error: {s}"),
-        }
-    }
-}
-
-/// A hard transport/connection failure or a timeout (vs. an HTTP status or decode
-/// error) — the only signal that the chosen HTTP version might be wrong for this
-/// upstream. A timeout is included so that if the upstream hangs on the HTTP/2
-/// connection preface, we can fall back to HTTP/1.1 if the alternate client succeeds.
-/// If both timeout, we do not switch.
-pub(super) const fn is_transport(e: &HealthError) -> bool {
-    matches!(e, HealthError::Transport(_) | HealthError::Timeout)
-}
-
 /// Query all five upstream signals once. Each call is bounded by
 /// `--health-timeout`; failures land in the result rather than aborting.
 pub(crate) async fn probe_once(state: &AppState) -> Probe {
+    let timeout = state.cfg.health_timeout;
+    let el = ProbeTarget {
+        client: &state.client,
+        transport: &state.el.transport,
+        timeout,
+    };
+    let cl = ProbeTarget {
+        client: &state.client,
+        transport: &state.cl.transport,
+        timeout,
+    };
     // Independent upstreams share one poll; a slow EL does not delay CL calls.
     // EL still uses one batch request and owns transport detection.
     let (batch, cl_status, cl_peers) = tokio::join!(
-        el_batch_detect(state),
-        cl_syncing_status(state),
-        cl_peer_count(state),
+        el_batch_detect(el, state.el.upstream.uri()),
+        cl_syncing_status(cl, &state.cl_syncing_uri),
+        cl_peer_count(cl, &state.cl_peer_count_uri),
     );
     let (el_syncing, el_peers, el_block) = match batch {
         Ok(res) => (
@@ -185,16 +151,18 @@ pub(crate) async fn poll_loop(
     shutdown: crate::lifecycle::Shutdown,
     interval: Duration,
 ) {
+    let shutdown = crate::lifecycle::deadline(&shutdown);
+    tokio::pin!(shutdown);
     let mut prev_ready: Option<bool> = None;
     loop {
         tokio::select! {
             biased;
-            _ = crate::lifecycle::deadline(&shutdown) => return,
+            _ = &mut shutdown => return,
             _ = tokio::time::sleep(interval) => {}
         }
         let probe = tokio::select! {
             biased;
-            _ = crate::lifecycle::deadline(&shutdown) => return,
+            _ = &mut shutdown => return,
             probe = probe_once(&state) => probe,
         };
 
@@ -227,56 +195,5 @@ pub(crate) async fn poll_loop(
         if tx.send(Arc::new(probe)).is_err() {
             return; // all receivers dropped
         }
-    }
-}
-
-/// Send a prepared probe request with the health-poll timeout, record any TLS
-/// negotiated protocol version as soon as response headers arrive, and return
-/// the body of a successful response.
-pub(super) async fn fetch_bytes(
-    state: &AppState,
-    req: Request<ResBody>,
-    client: &ProxyClient,
-    transport: &HttpTransport,
-) -> Result<Bytes, HealthError> {
-    tokio::time::timeout(state.cfg.health_timeout, async {
-        let resp = client
-            .request(req)
-            .await
-            .map_err(|e| HealthError::Transport(Arc::from(e.to_string())))?;
-        transport.record_version(resp.version());
-        if !resp.status().is_success() {
-            return Err(HealthError::HttpStatus(resp.status()));
-        }
-        http_body_util::Limited::new(resp.into_body(), 10 * 1024 * 1024)
-            .collect()
-            .await
-            .map(|c| c.to_bytes())
-            .map_err(|e| HealthError::Decode(Arc::from(e.to_string())))
-    })
-    .await
-    .map_err(|_| HealthError::Timeout)?
-}
-
-/// Serde's derived struct visitors also accept positional sequences. Enforce
-/// object shape at each upstream boundary while retaining borrowed `RawValue` data.
-pub(super) struct JsonObject<T>(pub(super) T);
-
-impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for JsonObject<T> {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Object<T>(std::marker::PhantomData<T>);
-        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for Object<T> {
-            type Value = JsonObject<T>;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON object")
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                map: A,
-            ) -> Result<Self::Value, A::Error> {
-                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(JsonObject)
-            }
-        }
-        deserializer.deserialize_map(Object(std::marker::PhantomData))
     }
 }

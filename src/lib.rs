@@ -432,10 +432,7 @@ async fn drive_graceful<C>(
 {
     tokio::pin!(conn);
     tokio::select! {
-        res = conn.as_mut() => match res {
-            Ok(()) => trace!(%peer, "connection closed"),
-            Err(e) => debug!(error = %e, %peer, "connection closed"),
-        },
+        biased;
         deadline = conn_lifecycle.deadline() => {
             graceful_shutdown(conn.as_mut());
             match tokio::time::timeout_at(deadline, conn).await {
@@ -444,6 +441,10 @@ async fn drive_graceful<C>(
                 Err(_) => trace!(%peer, "connection drain deadline reached"),
             }
         }
+        res = conn.as_mut() => match res {
+            Ok(()) => trace!(%peer, "connection closed"),
+            Err(e) => debug!(error = %e, %peer, "connection closed"),
+        },
     }
 }
 
@@ -516,19 +517,6 @@ async fn serve_connection(
     serve_detected(&builders, proto, io, svc, &conn_lifecycle, peer).await;
 }
 
-pub(crate) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
-    if let Err(e) = stream.set_nodelay(true) {
-        debug!(error = %e, "failed to set TCP_NODELAY");
-    }
-    let sock_ref = socket2::SockRef::from(stream);
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(60))
-        .with_interval(Duration::from_secs(10));
-    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-        debug!(error = %e, "failed to set TCP keepalive");
-    }
-}
-
 async fn accept_loop(
     listeners: Vec<TcpListener>,
     state: Arc<AppState>,
@@ -538,12 +526,14 @@ async fn accept_loop(
         return;
     }
     let builders = Arc::new(ServerBuilders::new(lifecycle.clone()));
+    let shutdown = lifecycle.deadline();
+    tokio::pin!(shutdown);
     let mut next_idx = 0usize;
     let mut saturated = false;
     loop {
         let (stream, peer) = tokio::select! {
             biased;
-            _ = lifecycle.deadline() => return,
+            _ = &mut shutdown => return,
             accept = accept_round_robin(&listeners, &mut next_idx) => match accept {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -552,7 +542,7 @@ async fn accept_loop(
                     // doesn't busy-spin a core retrying immediately.
                     tokio::select! {
                         biased;
-                        _ = lifecycle.deadline() => return,
+                        _ = &mut shutdown => return,
                         () = tokio::time::sleep(Duration::from_millis(100)) => continue,
                     }
                 }
@@ -578,7 +568,7 @@ async fn accept_loop(
                 }
                 tokio::select! {
                     biased;
-                    _ = lifecycle.deadline() => return,
+                    _ = &mut shutdown => return,
                     res = state.conn_limit.clone().acquire_owned() => match res {
                         Ok(permit) => Arc::new(permit),
                         Err(_) => return,
@@ -586,7 +576,7 @@ async fn accept_loop(
                 }
             }
         };
-        configure_tcp_stream(&stream);
+        transport::configure_tcp_stream(&stream);
         // Connection lifecycle is fine-grained, high-frequency detail, so
         // it lives at trace (accept/close) and on a dedicated `access_log`
         // target (the negotiated protocol + first request line) rather

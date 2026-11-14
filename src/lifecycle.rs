@@ -1,10 +1,7 @@
 //! One shutdown deadline and completion barrier for connections and their tasks.
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -66,7 +63,6 @@ impl LazyDeadline {
 }
 
 struct ShutdownInner {
-    closed: AtomicBool,
     deadline: OnceLock<Instant>,
     notify: Notify,
 }
@@ -75,15 +71,15 @@ pub(crate) struct ShutdownTx(Arc<ShutdownInner>);
 
 impl ShutdownTx {
     pub(crate) fn send(self, at: Instant) {
-        let _ = self.0.deadline.set(at);
-        self.0.closed.store(true, Ordering::SeqCst);
-        self.0.notify.notify_waiters();
+        if self.0.deadline.set(at).is_ok() {
+            self.0.notify.notify_waiters();
+        }
     }
 }
 
 impl Drop for ShutdownTx {
     fn drop(&mut self) {
-        if !self.0.closed.swap(true, Ordering::SeqCst) {
+        if self.0.deadline.get().is_none() && self.0.deadline.set(Instant::now()).is_ok() {
             self.0.notify.notify_waiters();
         }
     }
@@ -93,14 +89,13 @@ impl Drop for ShutdownTx {
 pub(crate) struct Shutdown(Arc<ShutdownInner>);
 
 impl Shutdown {
-    fn resolved_deadline(&self) -> Instant {
-        self.0.deadline.get().copied().unwrap_or_else(Instant::now)
+    pub(crate) fn current_deadline(&self) -> Option<Instant> {
+        self.0.deadline.get().copied()
     }
 }
 
 pub(crate) fn channel() -> (ShutdownTx, Shutdown) {
     let inner = Arc::new(ShutdownInner {
-        closed: AtomicBool::new(false),
         deadline: OnceLock::new(),
         notify: Notify::new(),
     });
@@ -110,19 +105,20 @@ pub(crate) fn channel() -> (ShutdownTx, Shutdown) {
 /// Wait until shutdown is triggered and return the drain deadline.
 ///
 /// Registers the task's [`Waker`] in [`Notify`] at most once per waker so
-/// steady-state polls from `biased` `select!` loops (`Lifecycle::run`,
-/// `bridge_ws`) cost a single atomic load and pointer check instead of
-/// locking `notify.waiters` on every socket wake.
+/// steady-state polls from `biased` `select!` loops (`Lifecycle::bound`,
+/// `drive_graceful`, `bridge_ws`) cost a single atomic load and pointer check
+/// instead of locking `notify.waiters` on every socket wake.
 pub(crate) async fn deadline(shutdown: &Shutdown) -> Instant {
-    if shutdown.0.closed.load(Ordering::SeqCst) {
-        return shutdown.resolved_deadline();
+    let inner = &*shutdown.0;
+    if let Some(&at) = inner.deadline.get() {
+        return at;
     }
-    let notified = shutdown.0.notify.notified();
+    let notified = inner.notify.notified();
     tokio::pin!(notified);
     let mut registered_waker: Option<Waker> = None;
     std::future::poll_fn(|cx| {
-        if shutdown.0.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(shutdown.resolved_deadline());
+        if let Some(&at) = inner.deadline.get() {
+            return Poll::Ready(at);
         }
         if registered_waker
             .as_ref()
@@ -130,10 +126,16 @@ pub(crate) async fn deadline(shutdown: &Shutdown) -> Instant {
         {
             return Poll::Pending;
         }
-        if notified.as_mut().poll(cx).is_ready() || shutdown.0.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(shutdown.resolved_deadline());
+        // `ShutdownTx` stores `deadline` before `notify_waiters()`, so any wake
+        // landing between the check above and registration is observed right below.
+        let _ = notified.as_mut().poll(cx);
+        if let Some(&at) = inner.deadline.get() {
+            return Poll::Ready(at);
         }
-        registered_waker = Some(cx.waker().clone());
+        match &mut registered_waker {
+            Some(w) => w.clone_from(cx.waker()),
+            None => registered_waker = Some(cx.waker().clone()),
+        }
         Poll::Pending
     })
     .await
@@ -146,33 +148,35 @@ pub(crate) struct Lifecycle {
 }
 
 impl Lifecycle {
-    pub(crate) fn new(shutdown: Shutdown, completed: mpsc::Sender<()>) -> Self {
+    pub(crate) const fn new(shutdown: Shutdown, completed: mpsc::Sender<()>) -> Self {
         Self {
             shutdown,
             completed,
         }
     }
 
-    pub(crate) fn shutdown(&self) -> Shutdown {
-        self.shutdown.clone()
+    pub(crate) const fn shutdown(&self) -> &Shutdown {
+        &self.shutdown
     }
 
     pub(crate) async fn deadline(&self) -> Instant {
         deadline(&self.shutdown).await
     }
 
-    pub(crate) async fn run<F: Future>(self, task: F) -> Option<F::Output> {
-        let Self {
-            shutdown,
-            completed: _completed,
-        } = self;
-        // Drop the task (and its sockets) before releasing the completion guard.
+    pub(crate) async fn bound<F: Future>(&self, task: F) -> Option<F::Output> {
         tokio::pin!(task);
         tokio::select! {
             biased;
-            end = deadline(&shutdown) => timeout_at(end, task).await.ok(),
+            end = self.deadline() => timeout_at(end, task).await.ok(),
             value = &mut task => Some(value),
         }
+    }
+
+    pub(crate) async fn run<F: Future>(self, task: F) -> Option<F::Output> {
+        // Drop the task (and its sockets) before releasing the completion guard.
+        let res = self.bound(task).await;
+        drop(self.completed);
+        res
     }
 }
 
@@ -191,7 +195,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::Wake;
 
     #[tokio::test]

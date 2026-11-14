@@ -425,6 +425,17 @@ impl Config {
         if self.proxy_timeout.is_zero() {
             return Err("proxy-timeout must be at least 1 second".into());
         }
+        for (name, dur) in [
+            ("health-poll-interval", self.health_poll_interval),
+            ("health-timeout", self.health_timeout),
+            ("proxy-timeout", self.proxy_timeout),
+            ("sse-idle-timeout", self.sse_idle_timeout),
+            ("shutdown-grace", self.shutdown_grace),
+        ] {
+            if dur > MAX_TIMEOUT {
+                return Err(format!("{name} must be at most {MAX_TIMEOUT_SECS} seconds").into());
+            }
+        }
         let cl_genesis_time = self.resolve_cl_genesis_time()?;
         let cl_seconds_per_slot = self.resolve_cl_seconds_per_slot()?;
         let el_http = HttpUpstream::parse("--el-http-url", &self.el_http_url)?;
@@ -517,10 +528,19 @@ impl fmt::Debug for Config {
     }
 }
 
+/// Upper bound (100 years) for timeout/interval flags so `Instant::now() + value`
+/// cannot overflow on any platform (macOS `u64` ns or Linux `i64` secs).
+const MAX_TIMEOUT_SECS: u64 = 100 * 365 * 24 * 60 * 60;
+const MAX_TIMEOUT: Duration = Duration::from_secs(MAX_TIMEOUT_SECS);
+
 fn parse_secs(s: &str) -> Result<Duration, String> {
-    s.parse::<u64>()
-        .map(Duration::from_secs)
-        .map_err(|e| format!("invalid seconds value: {e}"))
+    let secs = s
+        .parse::<u64>()
+        .map_err(|e| format!("invalid seconds value: {e}"))?;
+    if secs > MAX_TIMEOUT_SECS {
+        return Err(format!("seconds value must be at most {MAX_TIMEOUT_SECS}"));
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 #[cfg(test)]
@@ -793,5 +813,18 @@ mod tests {
                 "expected {expected_substr} in {err}"
             );
         }
+
+        // Upper-bound checks prevent `Instant::now() + duration` panics via both CLI and library Config.
+        assert_eq!(parse_secs(&MAX_TIMEOUT_SECS.to_string()), Ok(MAX_TIMEOUT));
+        assert!(parse_secs(&(MAX_TIMEOUT_SECS + 1).to_string()).is_err());
+        assert!(parse_secs(&u64::MAX.to_string()).is_err());
+        let mut over = parse(&[]);
+        over.shutdown_grace = Duration::MAX;
+        assert!(
+            over.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("shutdown-grace")
+        );
     }
 }

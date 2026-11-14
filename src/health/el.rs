@@ -4,13 +4,12 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{Method, Request};
+use http::{Method, Request, Uri};
 use http_body_util::Full;
 
-use crate::state::AppState;
 use crate::transport::{H2cMode, HttpTransport, ProxyClient, box_full};
 
-use super::probe::{HealthError, JsonObject, fetch_bytes, is_transport};
+use super::fetch::{HealthError, JsonObject, ProbeTarget, is_transport};
 
 const EL_BATCH_REQ: &[u8] = br#"[{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1},{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":2},{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":3}]"#;
 
@@ -74,12 +73,13 @@ pub(super) struct ElBatchResult {
 }
 
 /// Query all three EL JSON-RPC methods in a batch request, maintaining the transport verdict.
-pub(super) async fn el_batch_detect(state: &AppState) -> Result<ElBatchResult, HealthError> {
-    let default_client = &state.client;
-    match &state.el.transport {
-        HttpTransport::CleartextH1 | HttpTransport::TlsAuto(_) => {
-            el_batch_rpc(state, default_client).await
-        }
+pub(super) async fn el_batch_detect(
+    el: ProbeTarget<'_>,
+    uri: &Uri,
+) -> Result<ElBatchResult, HealthError> {
+    let default_client = el.client;
+    match el.transport {
+        HttpTransport::CleartextH1 | HttpTransport::TlsAuto(_) => el_batch_rpc(el, uri).await,
         HttpTransport::AdaptiveH2c { mode, client } => {
             let h2c_client: &ProxyClient = client;
             let cur = H2cMode::load(mode);
@@ -105,9 +105,25 @@ pub(super) async fn el_batch_detect(state: &AppState) -> Result<ElBatchResult, H
                     H2cMode::Confirmed,
                 ),
             };
-            match el_batch_rpc(state, first).await {
+            match el_batch_rpc(
+                ProbeTarget {
+                    client: first,
+                    ..el
+                },
+                uri,
+            )
+            .await
+            {
                 Err(first_err) if is_transport(&first_err) => {
-                    match el_batch_rpc(state, second).await {
+                    match el_batch_rpc(
+                        ProbeTarget {
+                            client: second,
+                            ..el
+                        },
+                        uri,
+                    )
+                    .await
+                    {
                         Err(second_err) if is_transport(&second_err) => {
                             Err(if cur == H2cMode::H1VerifyOnce {
                                 second_err
@@ -130,17 +146,14 @@ pub(super) async fn el_batch_detect(state: &AppState) -> Result<ElBatchResult, H
     }
 }
 
-async fn el_batch_rpc(
-    state: &AppState,
-    client: &ProxyClient,
-) -> Result<ElBatchResult, HealthError> {
+async fn el_batch_rpc(el: ProbeTarget<'_>, uri: &Uri) -> Result<ElBatchResult, HealthError> {
     let req = Request::builder()
         .method(Method::POST)
-        .uri(state.el.upstream.uri().clone())
+        .uri(uri.clone())
         .header("content-type", "application/json")
         .body(box_full(Full::new(Bytes::from_static(EL_BATCH_REQ))))
         .map_err(|e| HealthError::Transport(Arc::from(format!("build: {e}"))))?;
-    let body = fetch_bytes(state, req, client, &state.el.transport).await?;
+    let body = el.fetch_bytes(req).await?;
     parse_el_batch(&body)
 }
 
@@ -238,21 +251,21 @@ fn hex_to_u64(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health::{HealthSource, Probe};
+    use crate::transport::{build_client, build_connectors};
     use http::{Response, StatusCode};
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::sync::watch;
 
     #[tokio::test]
     async fn el_transport_fallback_preserves_verdict_and_error_policy() {
-        use clap::Parser;
         use hyper::body::Incoming;
         use hyper::service::service_fn;
         use hyper_util::rt::{TokioExecutor, TokioIo};
         use hyper_util::server::conn::auto;
 
+        let (https, _) = build_connectors(false);
+        let default_client = build_client(https.clone());
         let valid = br#"[{"id":1,"result":false},{"id":2,"result":"0x40"},{"id":3,"result":{"number":"0x1","timestamp":"0x2"}}]"#;
         // Preferred transport, accepted [h1, h2], response, expected transport.
         for (prefer_h2, accepted, status, body, expected_h2) in [
@@ -270,7 +283,9 @@ mod tests {
             (false, [false, false], 200, valid.as_slice(), false),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
+            let uri: Uri = format!("http://{}/", listener.local_addr().unwrap())
+                .parse()
+                .unwrap();
             let attempts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
             let counts = attempts.clone();
             let server = tokio::spawn(async move {
@@ -305,21 +320,15 @@ mod tests {
                     });
                 }
             });
-            let mut cfg = crate::Config::parse_from([
-                "ethonyx",
-                "--el-http-url",
-                &url,
-                "--cl-beacon-url",
-                &url,
-            ]);
-            cfg.health_timeout = Duration::from_secs(1);
-            let validated = cfg.parse_validated().unwrap();
-            let (_, probe) = watch::channel(Arc::new(Probe::pending()));
-            let mut state =
-                AppState::new(&cfg, validated, false, HealthSource::Polled(probe)).unwrap();
-            state.el.transport.set_confirmed_cleartext(prefer_h2);
-            let result = el_batch_detect(&state).await;
-            assert_eq!(state.el.transport.uses_h2c_client(), expected_h2);
+            let mut transport = HttpTransport::new_el(false, false, https.clone());
+            transport.set_confirmed_cleartext(prefer_h2);
+            let el = ProbeTarget {
+                client: &default_client,
+                transport: &transport,
+                timeout: Duration::from_secs(1),
+            };
+            let result = el_batch_detect(el, &uri).await;
+            assert_eq!(transport.uses_h2c_client(), expected_h2);
             assert_eq!(attempts[usize::from(prefer_h2)].load(Ordering::Relaxed), 1);
             assert_eq!(
                 attempts[usize::from(!prefer_h2)].load(Ordering::Relaxed),
@@ -350,7 +359,6 @@ mod tests {
 
     #[tokio::test]
     async fn el_transport_verify_once_heals_restart_race_and_settles_on_h1_only() {
-        use clap::Parser;
         use hyper::body::Incoming;
         use hyper::service::service_fn;
         use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -361,7 +369,9 @@ mod tests {
         let accept_h2_srv = accept_h2.clone();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let uri: Uri = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
         let server = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -391,36 +401,35 @@ mod tests {
             }
         });
 
-        let mut cfg =
-            crate::Config::parse_from(["ethonyx", "--el-http-url", &url, "--cl-beacon-url", &url]);
-        cfg.health_timeout = Duration::from_secs(1);
-        let validated = cfg.parse_validated().unwrap();
-        let (_, probe) = watch::channel(Arc::new(Probe::pending()));
-        let state = AppState::new(&cfg, validated, false, HealthSource::Polled(probe)).unwrap();
+        let (https, _) = build_connectors(false);
+        let default_client = build_client(https.clone());
+        let transport = HttpTransport::new_el(false, false, https);
+        let el = ProbeTarget {
+            client: &default_client,
+            transport: &transport,
+            timeout: Duration::from_secs(1),
+        };
 
         // Case A: h1-only upstream -> Initial -> H1VerifyOnce -> H1Confirmed.
-        assert_eq!(state.el.transport.label(), "h2c");
-        assert_eq!(
-            state.el.transport.startup_proto_label(),
-            "HTTP/2 (h2c, unverified)"
-        );
-        assert!(el_batch_detect(&state).await.unwrap().syncing.is_ok());
-        assert_eq!(state.el.transport.label(), "http/1.1");
-        assert!(el_batch_detect(&state).await.unwrap().syncing.is_ok());
-        assert_eq!(state.el.transport.label(), "http/1.1");
+        assert_eq!(transport.label(), "h2c");
+        assert_eq!(transport.startup_proto_label(), "HTTP/2 (h2c, unverified)");
+        assert!(el_batch_detect(el, &uri).await.unwrap().syncing.is_ok());
+        assert_eq!(transport.label(), "http/1.1");
+        assert!(el_batch_detect(el, &uri).await.unwrap().syncing.is_ok());
+        assert_eq!(transport.label(), "http/1.1");
 
         // Case B: simulate a confirmed h2c upstream hitting a transient h2c rejection
         // during restart, then recovering h2c on the verify-once poll.
-        if let HttpTransport::AdaptiveH2c { ref mode, .. } = state.el.transport {
+        if let HttpTransport::AdaptiveH2c { ref mode, .. } = transport {
             mode.store(H2cMode::Confirmed as u8, Ordering::SeqCst);
         }
-        assert_eq!(state.el.transport.startup_proto_label(), "HTTP/2 (h2c)");
-        assert!(el_batch_detect(&state).await.unwrap().syncing.is_ok());
-        assert_eq!(state.el.transport.label(), "http/1.1"); // fell back to H1VerifyOnce
+        assert_eq!(transport.startup_proto_label(), "HTTP/2 (h2c)");
+        assert!(el_batch_detect(el, &uri).await.unwrap().syncing.is_ok());
+        assert_eq!(transport.label(), "http/1.1"); // fell back to H1VerifyOnce
 
         accept_h2.store(true, Ordering::SeqCst);
-        assert!(el_batch_detect(&state).await.unwrap().syncing.is_ok());
-        assert_eq!(state.el.transport.label(), "h2c"); // self-healed back to Confirmed!
+        assert!(el_batch_detect(el, &uri).await.unwrap().syncing.is_ok());
+        assert_eq!(transport.label(), "h2c"); // self-healed back to Confirmed!
 
         server.abort();
     }

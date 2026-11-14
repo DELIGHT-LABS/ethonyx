@@ -6,10 +6,9 @@ use bytes::Bytes;
 use http::{Method, Request, Uri};
 use http_body_util::Full;
 
-use crate::state::AppState;
 use crate::transport::box_full;
 
-use super::probe::{HealthError, JsonObject, ProbeError, fetch_bytes};
+use super::fetch::{HealthError, JsonObject, ProbeError, ProbeTarget};
 
 #[derive(Clone, Copy, serde::Deserialize)]
 pub(super) struct ClStatus {
@@ -25,22 +24,25 @@ struct ClEnvelope<T> {
     data: JsonObject<T>,
 }
 
-pub(super) async fn cl_syncing_status(state: &AppState) -> Result<ClStatus, ProbeError> {
-    cl_get_json(state, &state.cl_syncing_uri).await
+pub(super) async fn cl_syncing_status(
+    cl: ProbeTarget<'_>,
+    uri: &Uri,
+) -> Result<ClStatus, ProbeError> {
+    cl_get_json(cl, uri).await
 }
 
-pub(super) async fn cl_peer_count(state: &AppState) -> Result<u64, ProbeError> {
+pub(super) async fn cl_peer_count(cl: ProbeTarget<'_>, uri: &Uri) -> Result<u64, ProbeError> {
     #[derive(serde::Deserialize)]
     struct Peers {
         #[serde(deserialize_with = "decimal_string")]
         connected: u64,
     }
-    let peers: Peers = cl_get_json(state, &state.cl_peer_count_uri).await?;
+    let peers: Peers = cl_get_json(cl, uri).await?;
     Ok(peers.connected)
 }
 
 async fn cl_get_json<T: serde::de::DeserializeOwned>(
-    state: &AppState,
+    cl: ProbeTarget<'_>,
     uri: &Uri,
 ) -> Result<T, ProbeError> {
     let req = Request::builder()
@@ -48,7 +50,8 @@ async fn cl_get_json<T: serde::de::DeserializeOwned>(
         .uri(uri.clone())
         .body(box_full(Full::new(Bytes::new())))
         .map_err(|e| Arc::from(e.to_string()))?;
-    let body = fetch_bytes(state, req, &state.client, &state.cl.transport)
+    let body = cl
+        .fetch_bytes(req)
         .await
         .map_err(HealthError::into_probe_error)?;
     parse_cl_response(&body)

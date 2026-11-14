@@ -332,6 +332,44 @@ impl EthonyxHandle {
             let _ = task.await;
         }
     }
+
+    async fn connect_h2_ws(
+        &self,
+        path: &str,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
+        hyper::client::conn::http2::SendRequest<TestBody>,
+        JoinHandle<()>,
+    ) {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+            .await
+            .unwrap();
+        let (mut sender, h2_conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake::<_, TestBody>(TokioIo::new(tcp))
+            .await
+            .unwrap();
+        let h2_driver = tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri(self.url(path))
+            .header("sec-websocket-version", "13")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let upgraded = hyper::upgrade::on(resp).await.unwrap();
+        let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            TokioIo::new(upgraded),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        (ws, sender, h2_driver)
+    }
 }
 
 fn ok_handler() -> MockHandler {
@@ -2457,22 +2495,46 @@ async fn shutdown_releases_upgraded_websocket_connections() {
             &upstream,
         ])
         .await;
-        let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        let (mut ws_h1, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
             .await
             .unwrap();
-        ws.send(Message::Text("established".into())).await.unwrap();
+        let (mut ws_h2, sender, h2_driver) = proxy.connect_h2_ws("/").await;
+        ws_h1
+            .send(Message::Text("established".into()))
+            .await
+            .unwrap();
         assert_eq!(
-            ws.next().await.unwrap().unwrap(),
+            ws_h1.next().await.unwrap().unwrap(),
             Message::Text("established".into())
         );
-        proxy.shutdown().await;
-        let closed = tokio::time::timeout(Duration::from_secs(1), ws.next())
+        ws_h2
+            .send(Message::Text("established-h2".into()))
             .await
-            .expect("an upgraded socket must not outlive zero-grace shutdown");
-        assert!(matches!(
-            closed,
-            None | Some(Err(_)) | Some(Ok(Message::Close(_)))
-        ));
+            .unwrap();
+        assert_eq!(
+            ws_h2.next().await.unwrap().unwrap(),
+            Message::Text("established-h2".into())
+        );
+        // Zero-grace shutdown must exit promptly without blocking on WS_CLOSE_GRACE (1s).
+        tokio::time::timeout(Duration::from_millis(500), proxy.shutdown())
+            .await
+            .expect("zero-grace shutdown must not block on WS_CLOSE_GRACE");
+        for closed in [
+            tokio::time::timeout(Duration::from_secs(1), ws_h1.next())
+                .await
+                .expect("an upgraded H1 socket must not outlive zero-grace shutdown"),
+            tokio::time::timeout(Duration::from_secs(1), ws_h2.next())
+                .await
+                .expect("an upgraded H2 stream must not outlive zero-grace shutdown"),
+        ] {
+            assert!(matches!(
+                closed,
+                None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+            ));
+        }
+        drop(sender);
+        h2_driver.abort();
+        let _ = h2_driver.await;
     }
 }
 
@@ -4966,7 +5028,7 @@ async fn shutdown_during_initial_health_probe_exits_promptly_without_binding_lis
 
 #[tokio::test]
 async fn shutdown_sends_going_away_close_frame_to_active_h1_and_h2_websockets() {
-    use tokio_tungstenite::tungstenite::protocol::{Role, frame::coding::CloseCode};
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
     let upstream = ws_echo_upstream().await;
     let mut proxy = EthonyxHandle::start_with_grace(
@@ -4981,33 +5043,7 @@ async fn shutdown_sends_going_away_close_frame_to_active_h1_and_h2_websockets() 
         .unwrap();
 
     // 2. HTTP/2 Extended CONNECT WebSocket subscriber.
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
-        .await
-        .unwrap();
-    let (mut sender, h2_conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, TestBody>(TokioIo::new(tcp))
-        .await
-        .unwrap();
-    let h2_driver = tokio::spawn(async move {
-        let _ = h2_conn.await;
-    });
-    let mut req = Request::builder()
-        .method(Method::CONNECT)
-        .uri(proxy.url("/"))
-        .header("sec-websocket-version", "13")
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-    req.extensions_mut()
-        .insert(hyper::ext::Protocol::from_static("websocket"));
-    let resp = sender.send_request(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let upgraded = hyper::upgrade::on(resp).await.unwrap();
-    let mut ws_h2 = tokio_tungstenite::WebSocketStream::from_raw_socket(
-        TokioIo::new(upgraded),
-        Role::Client,
-        None,
-    )
-    .await;
+    let (mut ws_h2, sender, h2_driver) = proxy.connect_h2_ws("/").await;
 
     let started = tokio::time::Instant::now();
     proxy.shutdown.take().unwrap().send(()).unwrap();
