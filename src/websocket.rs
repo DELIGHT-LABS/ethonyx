@@ -818,12 +818,10 @@ async fn bridge_ws<C, U>(
         return;
     };
 
-    if matches!(
-        (&reason, client.has_pending(), upstream.has_pending()),
-        (CloseReason::Peer(Side::Client, PeerStop::Eof), _, false)
-            | (CloseReason::Peer(Side::Upstream, PeerStop::Eof), false, _)
-    ) {
-        return;
+    match &reason {
+        CloseReason::Peer(Side::Client, PeerStop::Eof) if !upstream.has_pending() => return,
+        CloseReason::Peer(Side::Upstream, PeerStop::Eof) if !client.has_pending() => return,
+        _ => {}
     }
 
     // Phase 2: single hard-deadline bound governing all close/drain paths, including

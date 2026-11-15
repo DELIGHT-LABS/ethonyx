@@ -91,11 +91,6 @@ impl ProxyMetrics {
         WsConnectionSlot(gauge)
     }
 
-    #[cfg(all(test, feature = "otel"))]
-    pub(crate) fn active_ws(&self) -> ActiveConnectionGuard {
-        self.ws_slot().activate()
-    }
-
     pub(crate) fn inc_saturated(&self) {
         self.saturated
             .get_or_init(|| ::metrics::counter!("ethonyx_connection_limit_saturated_total"))

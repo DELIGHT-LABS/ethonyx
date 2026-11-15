@@ -430,7 +430,7 @@ mod tests {
         let tcp_guard = ::metrics::with_local_recorder(&recorder, || {
             let tcp = proxy_metrics.active_tcp();
             // Open and immediately drop a WS connection to verify symmetrical +1 / -1.
-            drop(proxy_metrics.active_ws());
+            drop(proxy_metrics.ws_slot().activate());
             health_metrics.record(crate::metrics::HealthSample {
                 el_ok: true,
                 cl_ok: true,
