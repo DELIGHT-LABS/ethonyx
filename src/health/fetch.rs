@@ -8,7 +8,8 @@ use bytes::Bytes;
 use http::Request;
 use http_body_util::BodyExt;
 
-use crate::transport::{HttpTransport, ProxyClient, ResBody};
+use crate::response::ResBody;
+use crate::transport::{HttpTransport, ProxyClient};
 
 pub(crate) type ProbeError = Arc<str>;
 

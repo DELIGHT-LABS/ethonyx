@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{Instrument, debug, info, trace, warn};
@@ -17,16 +17,18 @@ use tracing::{Instrument, debug, info, trace, warn};
 use crate::BoxError;
 use crate::headers::{sanitize_response_headers, strip_hop_by_hop};
 use crate::health;
-use crate::metrics::{UpstreamLayer, classify_method};
+use crate::metrics::{UpstreamLayer, classify_method, render_prometheus};
+use crate::response::{
+    ResBody, empty_body, full_body, raw_json_response, text_response, uri_too_long_response,
+};
 use crate::state::{AppState, HttpTarget};
-use crate::transport::{ResBody, box_full};
 use crate::websocket::WsMode;
 
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 /// Permit bounding concurrent WebSocket relays across both HTTP/1.1 `Upgrade`
 /// and HTTP/2 Extended `CONNECT` streams under `--max-connections`.
-pub(crate) enum WsPermit {
+enum WsPermit {
     Upgraded { _permit: Arc<OwnedSemaphorePermit> },
     IncludedH2(Arc<Connection>),
     DedicatedH2 { _permit: OwnedSemaphorePermit },
@@ -43,8 +45,8 @@ impl Drop for WsPermit {
 /// Connection-owned state. Requests clone one Arc; detached WebSocket relays
 /// and HTTP/2 request tasks also retain the shared lifecycle and connection permit.
 pub(crate) struct Connection {
-    pub(crate) state: Arc<AppState>,
-    pub(crate) lifecycle: crate::lifecycle::Lifecycle,
+    state: Arc<AppState>,
+    lifecycle: crate::lifecycle::Lifecycle,
     peer: SocketAddr,
     permit: Arc<OwnedSemaphorePermit>,
     h2_ws_slot_in_use: AtomicBool,
@@ -71,7 +73,7 @@ impl Connection {
     /// - HTTP/2 Extended `CONNECT` reuses the H2 connection's own permit for its
     ///   first active WS stream, and acquires dedicated permits from `--max-connections`
     ///   for additional concurrent WS streams so multiplex amplification is bounded.
-    pub(crate) fn acquire_ws_permit(self: &Arc<Self>, mode: WsMode) -> Option<WsPermit> {
+    fn acquire_ws_permit(self: &Arc<Self>, mode: WsMode) -> Option<WsPermit> {
         match mode {
             WsMode::Upgrade => Some(WsPermit::Upgraded {
                 _permit: Arc::clone(&self.permit),
@@ -83,7 +85,7 @@ impl Connection {
                     .is_ok()
                 {
                     Some(WsPermit::IncludedH2(Arc::clone(self)))
-                } else if let Ok(_permit) = self.state.conn_limit.clone().try_acquire_owned() {
+                } else if let Ok(_permit) = Arc::clone(&self.state.conn_limit).try_acquire_owned() {
                     Some(WsPermit::DedicatedH2 { _permit })
                 } else {
                     self.state.metrics.inc_saturated();
@@ -213,20 +215,15 @@ impl Probe {
             ),
             Self::Metrics => {
                 let body = if head {
-                    Bytes::new()
+                    empty_body()
                 } else {
-                    Bytes::from(
-                        crate::PROMETHEUS_HANDLE
-                            .get()
-                            .map(|h| h.render())
-                            .unwrap_or_default(),
-                    )
+                    full_body(Bytes::from(render_prometheus()))
                 };
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                    .body(box_full(Full::new(body)))
-                    .unwrap()
+                    .body(body)
+                    .expect("response builder")
             }
         }
     }
@@ -293,7 +290,12 @@ async fn route(
     trace!(method = %req.method(), path = req.uri().path(), "routing request");
     match target {
         Target::Cl => proxy_cl(req, state).await,
-        Target::WebSocket(mode) => crate::websocket::upgrade(req, mode, connection).await,
+        Target::WebSocket(mode) => {
+            crate::websocket::upgrade(req, mode, state, &connection.lifecycle, || {
+                connection.acquire_ws_permit(mode)
+            })
+            .await
+        }
         Target::El => proxy_el(req, state).await,
     }
 }
@@ -317,7 +319,7 @@ async fn proxy_cl(req: Request<Incoming>, state: &AppState) -> Result<Response<R
         if let Err(err) = drain_limited(req.into_body(), state.cfg.proxy_timeout).await {
             return Ok(err.into_response());
         }
-        return Ok(json_response(
+        return Ok(raw_json_response(
             StatusCode::OK,
             Bytes::from_static(b"{\"code\":200,\"message\":\"success\"}"),
         ));
@@ -350,7 +352,7 @@ async fn proxy_el(req: Request<Incoming>, state: &AppState) -> Result<Response<R
         if let Some(mock_res) = try_mock_eth_syncing(&bytes) {
             return Ok(mock_res);
         }
-        (parts, box_full(Full::new(bytes)))
+        (parts, full_body(bytes))
     } else {
         let (parts, body) = req.into_parts();
         (parts, box_incoming(body))
@@ -427,7 +429,7 @@ fn try_mock_eth_syncing(bytes: &[u8]) -> Option<Response<ResBody>> {
         crate::rpc::MockResult::Forward => None,
         crate::rpc::MockResult::Silent => Some(text_response(StatusCode::NO_CONTENT, Bytes::new())),
         crate::rpc::MockResult::Reply(body) => {
-            Some(json_response(StatusCode::OK, Bytes::from(body)))
+            Some(raw_json_response(StatusCode::OK, Bytes::from(body)))
         }
     }
 }
@@ -577,32 +579,10 @@ where
     body.map_err(Into::into).boxed_unsync()
 }
 
-fn json_response(code: StatusCode, body: Bytes) -> Response<ResBody> {
-    Response::builder()
-        .status(code)
-        .header("content-type", "application/json")
-        .body(box_full(Full::new(body)))
-        .unwrap()
-}
-
-pub(crate) fn text_response(code: StatusCode, msg: impl Into<Bytes>) -> Response<ResBody> {
-    Response::builder()
-        .status(code)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(box_full(Full::new(msg.into())))
-        .unwrap()
-}
-
-pub(crate) fn uri_too_long_response() -> Response<ResBody> {
-    text_response(
-        StatusCode::URI_TOO_LONG,
-        Bytes::from_static(b"request URI too long"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::Full;
 
     #[test]
     fn test_is_cl_path() {

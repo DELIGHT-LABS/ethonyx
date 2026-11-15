@@ -89,8 +89,15 @@ impl Drop for ShutdownTx {
 pub(crate) struct Shutdown(Arc<ShutdownInner>);
 
 impl Shutdown {
-    pub(crate) fn current_deadline(&self) -> Option<Instant> {
-        self.0.deadline.get().copied()
+    /// Run `task` until it completes or the drain deadline passes, whichever is
+    /// first. `None` means the deadline cancelled it.
+    pub(crate) async fn bound<F: Future>(&self, task: F) -> Option<F::Output> {
+        tokio::pin!(task);
+        tokio::select! {
+            biased;
+            end = deadline(self) => timeout_at(end, task).await.ok(),
+            value = &mut task => Some(value),
+        }
     }
 }
 
@@ -105,7 +112,7 @@ pub(crate) fn channel() -> (ShutdownTx, Shutdown) {
 /// Wait until shutdown is triggered and return the drain deadline.
 ///
 /// Registers the task's [`Waker`] in [`Notify`] at most once per waker so
-/// steady-state polls from `biased` `select!` loops (`Lifecycle::bound`,
+/// steady-state polls from `biased` `select!` loops (`Shutdown::bound`,
 /// `drive_graceful`, `bridge_ws`) cost a single atomic load and pointer check
 /// instead of locking `notify.waiters` on every socket wake.
 pub(crate) async fn deadline(shutdown: &Shutdown) -> Instant {
@@ -132,10 +139,7 @@ pub(crate) async fn deadline(shutdown: &Shutdown) -> Instant {
         if let Some(&at) = inner.deadline.get() {
             return Poll::Ready(at);
         }
-        match &mut registered_waker {
-            Some(w) => w.clone_from(cx.waker()),
-            None => registered_waker = Some(cx.waker().clone()),
-        }
+        registered_waker = Some(cx.waker().clone());
         Poll::Pending
     })
     .await
@@ -155,28 +159,30 @@ impl Lifecycle {
         }
     }
 
-    pub(crate) const fn shutdown(&self) -> &Shutdown {
-        &self.shutdown
-    }
-
     pub(crate) async fn deadline(&self) -> Instant {
         deadline(&self.shutdown).await
     }
 
-    pub(crate) async fn bound<F: Future>(&self, task: F) -> Option<F::Output> {
-        tokio::pin!(task);
-        tokio::select! {
-            biased;
-            end = self.deadline() => timeout_at(end, task).await.ok(),
-            value = &mut task => Some(value),
-        }
+    /// Run a closure with direct access to [`Shutdown`] while guaranteeing its
+    /// future (and any captured sockets, permits, or metric guards) drops before
+    /// releasing the completion barrier.
+    pub(crate) async fn run_with<F, Fut, T>(self, f: F) -> T
+    where
+        F: FnOnce(Shutdown) -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let Self {
+            shutdown,
+            completed,
+        } = self;
+        let res = f(shutdown).await;
+        drop(completed);
+        res
     }
 
     pub(crate) async fn run<F: Future>(self, task: F) -> Option<F::Output> {
-        // Drop the task (and its sockets) before releasing the completion guard.
-        let res = self.bound(task).await;
-        drop(self.completed);
-        res
+        self.run_with(|shutdown| async move { shutdown.bound(task).await })
+            .await
     }
 }
 

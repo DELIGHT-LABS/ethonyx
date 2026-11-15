@@ -1,26 +1,28 @@
-//! `/healthz`, `/readyz`, and `/eth/v1/node/health` endpoints and readiness evaluation.
+//! `/healthz`, `/readyz`, and `/eth/v1/node/health` HTTP endpoints and JSON views.
 
 mod cl;
 mod el;
+mod eval;
 mod fetch;
 mod probe;
 
-pub(crate) use probe::{HealthSource, Probe, poll_loop, probe_once, update_metrics};
+pub(crate) use eval::{HealthSource, Probe, evaluate_readiness};
+pub(crate) use probe::{poll_loop, probe_once, update_metrics};
 
 use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{Response, StatusCode};
-use http_body_util::Full;
 use serde::Serialize;
 
 use crate::config::SlotClock;
+use crate::response::{ResBody, empty_json_response, raw_json_response};
 use crate::state::AppState;
-use crate::transport::{ResBody, box_full};
 
 use cl::ClStatus;
 use el::{ElBlockResult, ElSyncingResult};
+use eval::{ClSyncEval, ElSyncEval, FreshEval, ReadinessEval, now_unix};
 use fetch::ProbeError;
 
 const TRUSTED_READY_JSON: &[u8] = br#"{"status":"ready","el_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"},"cl_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"}}"#;
@@ -106,6 +108,15 @@ struct Check<D: fmt::Display> {
     detail: DisplayJson<D>,
 }
 
+impl<D: fmt::Display> Check<D> {
+    const fn new(ok: bool, detail: D) -> Self {
+        Self {
+            ok,
+            detail: DisplayJson(detail),
+        }
+    }
+}
+
 /// `/healthz` view: a verdict-free, machine-readable snapshot of current EL + CL
 /// state. Numeric fields carry the live values (peer counts, block / slot age,
 /// sync status) for the consumer to threshold; any upstream failure is recorded
@@ -171,6 +182,26 @@ struct ReadyReport<'a> {
     cl_slot_fresh: Option<Check<FreshEval<'a>>>,
 }
 
+impl<'a> ReadyReport<'a> {
+    const fn from_eval(eval: ReadinessEval<'a>) -> Self {
+        let ready = eval.is_ready();
+        let (el_block_fresh, cl_slot_fresh) = match eval.strict {
+            Some((el_f, cl_f)) => (
+                Some(Check::new(el_f.is_ok(), el_f)),
+                Some(Check::new(cl_f.is_ok(), cl_f)),
+            ),
+            None => (None, None),
+        };
+        Self {
+            status: if ready { "ready" } else { "not_ready" },
+            el_syncing: Check::new(eval.el_sync.is_ok(), eval.el_sync),
+            cl_syncing: Check::new(eval.cl_sync.is_ok(), eval.cl_sync),
+            el_block_fresh,
+            cl_slot_fresh,
+        }
+    }
+}
+
 /// `/healthz` — verdict-free EL + CL snapshot, **always 200**. Serves the latest
 /// background poll (see [`poll_loop`]); block / slot ages are recomputed live per
 /// request. Under `--trust-upstream`, reports `mode: "trusted"` and omits
@@ -203,6 +234,14 @@ pub(crate) fn report(state: &AppState, head: bool) -> Response<ResBody> {
     }
 }
 
+const fn ready_status(ready: bool) -> StatusCode {
+    if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 /// `/readyz` — load-balancer readiness gate. 200 when ready, else 503.
 ///
 /// By default this gates **only on EL + CL sync status**. A node that is caught
@@ -216,27 +255,20 @@ pub(crate) fn report(state: &AppState, head: bool) -> Response<ResBody> {
 /// their thresholds — choose this when serving strictly-at-head data matters
 /// more than fleet availability during a network-wide stall.
 pub(crate) fn ready(state: &AppState, head: bool) -> Response<ResBody> {
-    match &state.health {
-        HealthSource::Trusted => {
-            if head {
-                empty_json_response(StatusCode::OK)
-            } else {
-                raw_json_response(StatusCode::OK, Bytes::from_static(TRUSTED_READY_JSON))
-            }
+    match (&state.health, head) {
+        (HealthSource::Trusted, true) => empty_json_response(StatusCode::OK),
+        (HealthSource::Trusted, false) => {
+            raw_json_response(StatusCode::OK, Bytes::from_static(TRUSTED_READY_JSON))
         }
-        HealthSource::Polled(rx) => {
+        (HealthSource::Polled(rx), true) => {
+            let probe = rx.borrow();
+            let ready = evaluate_readiness(&state.cfg, state.slot_clock, &probe).is_ready();
+            empty_json_response(ready_status(ready))
+        }
+        (HealthSource::Polled(rx), false) => {
             let probe = Arc::clone(&rx.borrow());
-            let eval = evaluate_readiness(state, &probe);
-            let code = if eval.is_ready() {
-                StatusCode::OK
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            };
-            if head {
-                empty_json_response(code)
-            } else {
-                json_response(code, &eval.into_report())
-            }
+            let eval = evaluate_readiness(&state.cfg, state.slot_clock, &probe);
+            json_response(ready_status(eval.is_ready()), &ReadyReport::from_eval(eval))
         }
     }
 }
@@ -254,14 +286,14 @@ pub(crate) fn node_health(state: &AppState) -> Response<ResBody> {
         HealthSource::Trusted => StatusCode::OK,
         HealthSource::Polled(rx) => {
             let probe = rx.borrow();
-            let eval = evaluate_readiness(state, &probe);
+            let eval = evaluate_readiness(&state.cfg, state.slot_clock, &probe);
             classify_node_health(eval.is_ready(), state.cfg.readyz_strict, &probe)
         }
     };
     empty_json_response(code)
 }
 
-fn classify_node_health(ready: bool, readyz_strict: bool, probe: &Probe) -> StatusCode {
+const fn classify_node_health(ready: bool, readyz_strict: bool, probe: &Probe) -> StatusCode {
     if ready {
         return StatusCode::OK;
     }
@@ -280,224 +312,6 @@ fn classify_node_health(ready: bool, readyz_strict: bool, probe: &Probe) -> Stat
     }
 }
 
-#[derive(Clone, Copy)]
-enum ElSyncEval<'a> {
-    Synced,
-    SyncingBool,
-    SyncingProgress { current_block: u64, distance: u64 },
-    Err(&'a str),
-}
-
-impl ElSyncEval<'_> {
-    const fn is_ok(self) -> bool {
-        matches!(self, Self::Synced)
-    }
-
-    const fn into_check(self) -> Check<Self> {
-        Check {
-            ok: self.is_ok(),
-            detail: DisplayJson(self),
-        }
-    }
-}
-
-impl fmt::Display for ElSyncEval<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Synced => f.write_str("synced"),
-            Self::SyncingBool => f.write_str("syncing (true)"),
-            Self::SyncingProgress {
-                current_block,
-                distance,
-            } => write!(f, "syncing (block {current_block}, distance {distance})"),
-            Self::Err(e) => write!(f, "eth_syncing: {e}"),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ClSyncEval<'a> {
-    Synced { head_slot: u64, sync_distance: u64 },
-    Syncing { head_slot: u64, sync_distance: u64 },
-    Err(&'a str),
-}
-
-impl ClSyncEval<'_> {
-    const fn is_ok(self) -> bool {
-        matches!(self, Self::Synced { .. })
-    }
-
-    const fn into_check(self) -> Check<Self> {
-        Check {
-            ok: self.is_ok(),
-            detail: DisplayJson(self),
-        }
-    }
-}
-
-impl fmt::Display for ClSyncEval<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Synced {
-                head_slot,
-                sync_distance,
-            } => write!(f, "synced (slot {head_slot}, distance {sync_distance})"),
-            Self::Syncing {
-                head_slot,
-                sync_distance,
-            } => write!(f, "syncing (slot {head_slot}, distance {sync_distance})"),
-            Self::Err(e) => write!(f, "node/syncing: {e}"),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum FreshEval<'a> {
-    Fresh {
-        kind: &'static str,
-        num: u64,
-        age: u64,
-    },
-    Stale {
-        kind: &'static str,
-        num: u64,
-        age: u64,
-        max_age: u64,
-    },
-    Disabled {
-        head_slot: u64,
-    },
-    Err {
-        prefix: &'static str,
-        err: &'a str,
-    },
-}
-
-impl FreshEval<'_> {
-    const fn is_ok(self) -> bool {
-        matches!(self, Self::Fresh { .. } | Self::Disabled { .. })
-    }
-
-    const fn into_check(self) -> Check<Self> {
-        Check {
-            ok: self.is_ok(),
-            detail: DisplayJson(self),
-        }
-    }
-}
-
-impl fmt::Display for FreshEval<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Fresh { kind, num, age } => write!(f, "{kind} {num}, age {age}s"),
-            Self::Stale {
-                kind,
-                num,
-                age,
-                max_age,
-            } => write!(f, "{kind} {num} stale: {age}s (max {max_age})"),
-            Self::Disabled { head_slot } => write!(f, "slot {head_slot} (age check disabled)"),
-            Self::Err { prefix, err } => write!(f, "{prefix}: {err}"),
-        }
-    }
-}
-
-/// Zero-allocation readiness evaluation shared across `HEAD /readyz`, `GET /readyz`,
-/// `node_health`, `poll_loop` metrics, and readiness transition logs.
-#[derive(Clone, Copy)]
-pub(crate) struct ReadinessEval<'a> {
-    el_sync: ElSyncEval<'a>,
-    cl_sync: ClSyncEval<'a>,
-    strict: Option<(FreshEval<'a>, FreshEval<'a>)>,
-}
-
-impl<'a> ReadinessEval<'a> {
-    pub(crate) const fn el_sync_ok(&self) -> bool {
-        self.el_sync.is_ok()
-    }
-
-    pub(crate) const fn cl_sync_ok(&self) -> bool {
-        self.cl_sync.is_ok()
-    }
-
-    pub(crate) const fn is_ready(&self) -> bool {
-        self.el_sync_ok()
-            && self.cl_sync_ok()
-            && match self.strict {
-                None => true,
-                Some((el_f, cl_f)) => el_f.is_ok() && cl_f.is_ok(),
-            }
-    }
-
-    const fn into_report(self) -> ReadyReport<'a> {
-        let ready = self.is_ready();
-        let (el_block_fresh, cl_slot_fresh) = match self.strict {
-            Some((el_f, cl_f)) => (Some(el_f.into_check()), Some(cl_f.into_check())),
-            None => (None, None),
-        };
-        ReadyReport {
-            status: if ready { "ready" } else { "not_ready" },
-            el_syncing: self.el_sync.into_check(),
-            cl_syncing: self.cl_sync.into_check(),
-            el_block_fresh,
-            cl_slot_fresh,
-        }
-    }
-}
-
-pub(crate) fn evaluate_readiness<'a>(state: &AppState, probe: &'a Probe) -> ReadinessEval<'a> {
-    let el_sync = eval_el_syncing(&probe.el_syncing);
-    let cl_sync = eval_cl_syncing(&probe.cl_status);
-    // `now` is only needed for strict freshness checks; the default sync-only path skips reading the clock.
-    let strict = state.cfg.readyz_strict.then(|| {
-        let now = now_unix();
-        (
-            eval_el_block_fresh(&probe.el_block, state.cfg.el_max_block_age_secs, now),
-            eval_cl_slot_fresh(
-                &probe.cl_status,
-                state.slot_clock,
-                state.cfg.cl_max_slot_age_secs,
-                now,
-            ),
-        )
-    });
-    ReadinessEval {
-        el_sync,
-        cl_sync,
-        strict,
-    }
-}
-
-/// What [`poll_loop`] should log given the previous and current readiness, so a
-/// sustained state logs once (on transition) rather than once per poll.
-#[derive(Clone, Copy)]
-enum Transition {
-    Silent,
-    BecameNotReady,
-    Recovered,
-}
-
-const fn readiness_transition(prev_ready: Option<bool>, ready: bool) -> Transition {
-    match prev_ready {
-        Some(p) if p == ready => Transition::Silent,
-        None if ready => Transition::Silent, // first poll already healthy: stay quiet
-        _ if ready => Transition::Recovered,
-        _ => Transition::BecameNotReady, // first-poll-degraded or ready -> not-ready
-    }
-}
-
-fn empty_json_response(code: StatusCode) -> Response<ResBody> {
-    raw_json_response(code, Bytes::new())
-}
-
-fn raw_json_response(code: StatusCode, body: Bytes) -> Response<ResBody> {
-    Response::builder()
-        .status(code)
-        .header("content-type", "application/json")
-        .body(box_full(Full::new(body)))
-        .expect("response builder")
-}
-
 fn json_response<T: Serialize>(code: StatusCode, body: &T) -> Response<ResBody> {
     let mut buf = Vec::with_capacity(512);
     let body_bytes = if serde_json::to_writer(&mut buf, body).is_ok() {
@@ -506,99 +320,6 @@ fn json_response<T: Serialize>(code: StatusCode, body: &T) -> Response<ResBody> 
         Bytes::from_static(b"{}")
     };
     raw_json_response(code, body_bytes)
-}
-
-fn eval_el_syncing(r: &Result<ElSyncingResult, ProbeError>) -> ElSyncEval<'_> {
-    match r {
-        Ok(ElSyncingResult::Synced(false)) => ElSyncEval::Synced,
-        Ok(ElSyncingResult::Synced(true)) => ElSyncEval::SyncingBool,
-        Ok(ElSyncingResult::Syncing {
-            current_block,
-            highest_block,
-        }) => ElSyncEval::SyncingProgress {
-            current_block: *current_block,
-            distance: highest_block.saturating_sub(*current_block),
-        },
-        Err(e) => ElSyncEval::Err(e),
-    }
-}
-
-fn eval_cl_syncing(r: &Result<ClStatus, ProbeError>) -> ClSyncEval<'_> {
-    match r {
-        Ok(s) if !s.is_syncing => ClSyncEval::Synced {
-            head_slot: s.head_slot,
-            sync_distance: s.sync_distance,
-        },
-        Ok(s) => ClSyncEval::Syncing {
-            head_slot: s.head_slot,
-            sync_distance: s.sync_distance,
-        },
-        Err(e) => ClSyncEval::Err(e),
-    }
-}
-
-fn eval_el_block_fresh(
-    r: &Result<ElBlockResult, ProbeError>,
-    max_age: u64,
-    now: u64,
-) -> FreshEval<'_> {
-    match r {
-        Ok(block) => {
-            let age = now.saturating_sub(block.timestamp);
-            if age <= max_age {
-                FreshEval::Fresh {
-                    kind: "block",
-                    num: block.number,
-                    age,
-                }
-            } else {
-                FreshEval::Stale {
-                    kind: "block",
-                    num: block.number,
-                    age,
-                    max_age,
-                }
-            }
-        }
-        Err(e) => FreshEval::Err {
-            prefix: "eth_getBlockByNumber",
-            err: e,
-        },
-    }
-}
-
-fn eval_cl_slot_fresh(
-    r: &Result<ClStatus, ProbeError>,
-    slot_clock: Option<SlotClock>,
-    max_age: u64,
-    now: u64,
-) -> FreshEval<'_> {
-    match (r, slot_clock) {
-        (Ok(s), None) => FreshEval::Disabled {
-            head_slot: s.head_slot,
-        },
-        (Ok(s), Some(clock)) => {
-            let age = clock.slot_age(s.head_slot, now);
-            if age <= max_age {
-                FreshEval::Fresh {
-                    kind: "slot",
-                    num: s.head_slot,
-                    age,
-                }
-            } else {
-                FreshEval::Stale {
-                    kind: "slot",
-                    num: s.head_slot,
-                    age,
-                    max_age,
-                }
-            }
-        }
-        (Err(e), _) => FreshEval::Err {
-            prefix: "node/syncing",
-            err: e,
-        },
-    }
 }
 
 /// Fold the five upstream probe results into a numeric snapshot. Successful
@@ -660,134 +381,9 @@ fn build_snapshot<'a>(
     }
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn assert_check<D: fmt::Display>(c: Check<D>, expected_ok: bool, expected_detail: &str) {
-        assert_eq!(c.ok, expected_ok);
-        assert_eq!(c.detail.0.to_string(), expected_detail);
-    }
-
-    #[test]
-    fn el_syncing_false_is_synced() {
-        let c = eval_el_syncing(&Ok(ElSyncingResult::Synced(false))).into_check();
-        assert_check(c, true, "synced");
-    }
-
-    #[test]
-    fn el_syncing_object_reports_block_progress() {
-        let c = eval_el_syncing(&Ok(ElSyncingResult::Syncing {
-            current_block: 0x10,
-            highest_block: 0x20,
-        }))
-        .into_check();
-        assert_check(c, false, "syncing (block 16, distance 16)");
-    }
-
-    #[test]
-    fn el_syncing_error_is_prefixed() {
-        let r = Err("boom".into());
-        let c = eval_el_syncing(&r).into_check();
-        assert_check(c, false, "eth_syncing: boom");
-    }
-
-    #[test]
-    fn cl_syncing_synced_is_ok() {
-        let r = Ok(ClStatus {
-            head_slot: 42,
-            sync_distance: 0,
-            is_syncing: false,
-        });
-        let c = eval_cl_syncing(&r).into_check();
-        assert_check(c, true, "synced (slot 42, distance 0)");
-    }
-
-    #[test]
-    fn cl_syncing_in_progress_fails() {
-        let r = Ok(ClStatus {
-            head_slot: 42,
-            sync_distance: 5,
-            is_syncing: true,
-        });
-        let c = eval_cl_syncing(&r).into_check();
-        assert_check(c, false, "syncing (slot 42, distance 5)");
-    }
-
-    #[test]
-    fn el_block_fresh_within_threshold_is_ok() {
-        let r = Ok(ElBlockResult {
-            number: 5,
-            timestamp: 0x3e2,
-        });
-        let c = eval_el_block_fresh(&r, 60, 1000).into_check();
-        assert_check(c, true, "block 5, age 6s");
-    }
-
-    #[test]
-    fn el_block_fresh_past_threshold_is_stale() {
-        let r = Ok(ElBlockResult {
-            number: 5,
-            timestamp: 0x384,
-        });
-        let c = eval_el_block_fresh(&r, 60, 1000).into_check();
-        assert_check(c, false, "block 5 stale: 100s (max 60)");
-    }
-
-    #[test]
-    fn cl_slot_fresh_disabled_when_genesis_zero() {
-        let r = Ok(ClStatus {
-            head_slot: 7,
-            sync_distance: 0,
-            is_syncing: false,
-        });
-        let c = eval_cl_slot_fresh(&r, SlotClock::new(0, 12), 60, 9_999_999).into_check();
-        assert_check(c, true, "slot 7 (age check disabled)");
-    }
-
-    #[test]
-    fn cl_slot_fresh_past_threshold_is_stale() {
-        let r = Ok(ClStatus {
-            head_slot: 10,
-            sync_distance: 0,
-            is_syncing: false,
-        });
-        let c = eval_cl_slot_fresh(&r, SlotClock::new(1000, 12), 60, 1300).into_check();
-        assert_check(c, false, "slot 10 stale: 180s (max 60)");
-    }
-
-    #[test]
-    fn slot_age_computes_wall_clock_age() {
-        let clock = SlotClock::new(1000, 12).unwrap();
-        assert_eq!(clock.slot_age(10, 1300), 180);
-    }
-
-    #[test]
-    fn slot_age_saturates_on_garbage_head_slot() {
-        let clock = SlotClock::new(1_606_824_023, 12).unwrap();
-        assert_eq!(clock.slot_age(u64::MAX, 2_000_000_000), 0);
-    }
-
-    #[test]
-    fn readiness_transitions_log_only_on_change() {
-        use Transition::*;
-        assert!(matches!(readiness_transition(None, false), BecameNotReady));
-        assert!(matches!(readiness_transition(None, true), Silent));
-        assert!(matches!(readiness_transition(Some(true), true), Silent));
-        assert!(matches!(readiness_transition(Some(false), false), Silent));
-        assert!(matches!(
-            readiness_transition(Some(true), false),
-            BecameNotReady
-        ));
-        assert!(matches!(readiness_transition(Some(false), true), Recovered));
-    }
 
     #[test]
     fn snapshot_reports_numeric_values_when_healthy() {

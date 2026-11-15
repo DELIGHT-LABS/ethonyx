@@ -1,16 +1,16 @@
 //! WebSocket handshake and bounded full-duplex single-task relay. HTTP/1 and HTTP/2 share the same dial path.
 use crate::BoxError;
-use crate::lifecycle::{LazyDeadline, Shutdown};
-use crate::proxy::{Connection, text_response, uri_too_long_response};
+use crate::lifecycle::{LazyDeadline, Lifecycle, Shutdown};
+use crate::response::{ResBody, empty_body, text_response, uri_too_long_response};
 use crate::rpc::{MockResult, mock_syncing};
-use crate::transport::{ResBody, box_full, configure_tcp_stream};
+use crate::state::AppState;
+use crate::transport::configure_tcp_stream;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use http::{Method, Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio_tungstenite::WebSocketStream;
@@ -210,12 +210,13 @@ fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
         .max_frame_size(Some(16 * 1024 * 1024))
 }
 
-pub(crate) async fn upgrade(
+pub(crate) async fn upgrade<P: Send + 'static>(
     req: Request<Incoming>,
     mode: WsMode,
-    connection: &Arc<Connection>,
+    state: &AppState,
+    lifecycle: &Lifecycle,
+    acquire_permit: impl FnOnce() -> Option<P>,
 ) -> Result<Response<ResBody>, BoxError> {
-    let state = &connection.state;
     let (parts, _body) = req.into_parts();
     let mut req = Request::from_parts(parts, ());
     let mut response = match mode.response(&mut req, state.otel_enabled) {
@@ -231,7 +232,7 @@ pub(crate) async fn upgrade(
     let Ok(upstream_uri) = state.el_ws.rewrite_uri(inbound_uri) else {
         return Ok(uri_too_long_response());
     };
-    let Some(permit) = connection.acquire_ws_permit(mode) else {
+    let Some(permit) = acquire_permit() else {
         return Ok(text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "connection limit reached",
@@ -296,38 +297,27 @@ pub(crate) async fn upgrade(
             .headers_mut()
             .insert(http::header::SEC_WEBSOCKET_PROTOCOL, protocol);
     }
-    let lifecycle = connection.lifecycle.clone();
+    let lifecycle = lifecycle.clone();
     let mock_enabled = state.cfg.mock_eth_syncing;
-    let state = Arc::clone(state);
-    tokio::spawn(async move {
-        {
-            let _permit = permit;
-            match lifecycle.bound(on_upgrade).await {
-                Some(Ok(upgraded)) => {
-                    let _ws_guard = state.metrics.active_ws();
-                    let client_ws = WebSocketStream::from_raw_socket(
-                        WriteProgressIo::new(TokioIo::new(upgraded)),
-                        Role::Server,
-                        Some(ws_config()),
-                    )
-                    .await;
-                    bridge_ws(
-                        client_ws,
-                        upstream_ws,
-                        mock_enabled,
-                        io_timeout,
-                        Some(lifecycle.shutdown()),
-                    )
-                    .await;
-                }
-                Some(Err(e)) => debug!(error = %e, "client ws upgrade failed"),
-                None => {}
+    let ws_slot = state.metrics.ws_slot();
+    tokio::spawn(lifecycle.run_with(move |shutdown| async move {
+        let _permit = permit;
+        match shutdown.bound(on_upgrade).await {
+            Some(Ok(upgraded)) => {
+                let _ws_guard = ws_slot.activate();
+                let client_ws = WebSocketStream::from_raw_socket(
+                    WriteProgressIo::new(TokioIo::new(upgraded)),
+                    Role::Server,
+                    Some(ws_config()),
+                )
+                .await;
+                bridge_ws(client_ws, upstream_ws, mock_enabled, io_timeout, &shutdown).await;
             }
+            Some(Err(e)) => debug!(error = %e, "client ws upgrade failed"),
+            None => {}
         }
-        // Release the completion barrier only after sockets, metrics guards, and permits drop.
-        drop(lifecycle);
-    });
-    Ok(response.map(|()| box_full(http_body_util::Full::new(bytes::Bytes::new()))))
+    }));
+    Ok(response.map(|()| empty_body()))
 }
 
 /// Caps single writes to [`MAX_WRITE_CHUNK`] (so HTTP/2 Extended `CONNECT`'s
@@ -456,10 +446,9 @@ impl From<Abort> for PumpStop {
     }
 }
 
-enum RelayEnd {
-    Abort,
+enum CloseReason {
     Peer(Side, PeerStop),
-    Shutdown(tokio::time::Instant),
+    Shutdown,
 }
 
 /// Non-blocking full-duplex WebSocket endpoint state with a 1-slot outbound
@@ -636,28 +625,20 @@ impl<S: RelayIo> WsEndpoint<S> {
         self.ws.flush().await.is_ok()
     }
 
-    async fn drain_pending_bounded(&mut self) {
-        if self.has_pending() {
-            let _ = tokio::time::timeout(WS_CLOSE_GRACE, self.flush_pending()).await;
-        }
-    }
-
     /// Drain queued outbound data, transmit `Close(frame)`, await the peer's echoed
     /// `Close` so kernel `SO_RCVBUF` empties without `TCP RST`, and shut down the
     /// transport write half cleanly (`FIN` / H2 `END_STREAM` / TLS `close_notify`)
-    /// within a single [`WS_CLOSE_GRACE`] budget before dropping `self`.
-    async fn close_with_handshake(mut self, frame: Option<CloseFrame>) {
-        let _ = tokio::time::timeout(WS_CLOSE_GRACE, async {
-            if self.flush_pending().await && self.ws.send(Message::Close(frame)).await.is_ok() {
-                while let Some(Ok(msg)) = self.ws.next().await {
-                    if msg.is_close() {
-                        break;
-                    }
+    /// before dropping `self`. Callers bound the overall close phase with a single
+    /// timeout ([`WS_CLOSE_GRACE`] or the shutdown drain deadline).
+    async fn close_handshake(mut self, frame: Option<CloseFrame>) {
+        if self.flush_pending().await && self.ws.send(Message::Close(frame)).await.is_ok() {
+            while let Some(Ok(msg)) = self.ws.next().await {
+                if msg.is_close() {
+                    break;
                 }
-                let _ = tokio::io::AsyncWriteExt::shutdown(self.ws.get_mut()).await;
             }
-        })
-        .await;
+            let _ = tokio::io::AsyncWriteExt::shutdown(self.ws.get_mut()).await;
+        }
     }
 }
 
@@ -732,42 +713,36 @@ where
     A: RelayIo,
     B: RelayIo,
 {
-    match stop {
-        PeerStop::Closed(frame) => {
-            // `src` initiated Close, so Tungstenite is now in closing state and
-            // rejects new `ws.send(data)` calls with `SendAfterClosing`. Drop
-            // unsent frames destined for `src`, flush its Close reply, and close
-            // `src` concurrently with `other`'s handshake.
-            let mut src_ws = src.ws;
-            drop((src.outbound, src.local_reply));
-            let close_src = async move {
-                let _ = tokio::time::timeout(WS_CLOSE_GRACE, async {
+    let _ = tokio::time::timeout(WS_CLOSE_GRACE, async {
+        match stop {
+            PeerStop::Closed(frame) => {
+                // `src` initiated Close, so Tungstenite is now in closing state and
+                // rejects new `ws.send(data)` calls with `SendAfterClosing`. Drop
+                // unsent frames destined for `src`, flush its Close reply, and close
+                // `src` concurrently with `other`'s handshake.
+                let mut src_ws = src.ws;
+                drop((src.outbound, src.local_reply));
+                let close_src = async move {
                     if src_ws.flush().await.is_ok() {
                         let _ = tokio::io::AsyncWriteExt::shutdown(src_ws.get_mut()).await;
                     }
-                })
-                .await;
-            };
-            tokio::join!(close_src, other.close_with_handshake(frame));
+                };
+                tokio::join!(close_src, other.close_handshake(frame));
+            }
+            PeerStop::Eof => {
+                let _ = other.flush_pending().await;
+            }
+            PeerStop::Failed => {
+                let (_, _) = tokio::join!(other.flush_pending(), src.ws.flush());
+            }
         }
-        PeerStop::Eof => {
-            other.drain_pending_bounded().await;
-        }
-        PeerStop::Failed => {
-            let (_, _) = tokio::join!(
-                other.drain_pending_bounded(),
-                tokio::time::timeout(WS_CLOSE_GRACE, src.ws.flush()),
-            );
-        }
-    }
+    })
+    .await;
 }
 
-/// Keep relaying across `--shutdown-grace`, then trigger an active `Close(1001)`
-/// handshake up to [`WS_CLOSE_GRACE`] before the hard drain deadline `end`.
-async fn shutdown_close_at(shutdown: Option<&Shutdown>) -> tokio::time::Instant {
-    let Some(shutdown) = shutdown else {
-        return std::future::pending().await;
-    };
+/// Keep relaying across `--shutdown-grace`, then resolve up to [`WS_CLOSE_GRACE`]
+/// before the hard drain deadline so the relay can initiate a `Close(1001)` handshake.
+async fn shutdown_close_signal(shutdown: &Shutdown) {
     let end = crate::lifecycle::deadline(shutdown).await;
     let now = tokio::time::Instant::now();
     let remaining = end.saturating_duration_since(now);
@@ -775,7 +750,6 @@ async fn shutdown_close_at(shutdown: Option<&Shutdown>) -> tokio::time::Instant 
     if !delay.is_zero() {
         tokio::time::sleep_until(now + delay).await;
     }
-    end
 }
 
 async fn bridge_ws<C, U>(
@@ -783,7 +757,7 @@ async fn bridge_ws<C, U>(
     upstream_ws: WebSocketStream<U>,
     mock_enabled: bool,
     io_timeout: Duration,
-    shutdown: Option<&Shutdown>,
+    shutdown: &Shutdown,
 ) where
     C: RelayIo,
     U: RelayIo,
@@ -792,72 +766,82 @@ async fn bridge_ws<C, U>(
         WsEndpoint::new(client_ws, Side::Client, io_timeout).with_mock_syncing(mock_enabled);
     let mut upstream =
         WsEndpoint::new(upstream_ws, Side::Upstream, io_timeout).with_ping_forwarding();
-    let close_signal = shutdown_close_at(shutdown);
-    tokio::pin!(close_signal);
 
-    let end = std::future::poll_fn(|cx| {
-        if let Poll::Ready(at) = close_signal.as_mut().poll(cx) {
-            return Poll::Ready(RelayEnd::Shutdown(at));
-        }
+    // Phase 1: full-duplex relay with a single steady-state `Notify` registration.
+    let Some(reason) = ({
+        let close_signal = shutdown_close_signal(shutdown);
+        tokio::pin!(close_signal);
 
-        // 1. Advance any already-queued outbound frames first so freed slots are
-        // immediately visible to both directional read loops below.
-        if upstream.poll_pending(cx).is_err() || client.poll_pending(cx).is_err() {
-            return Poll::Ready(RelayEnd::Abort);
-        }
+        std::future::poll_fn(|cx| {
+            if close_signal.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Some(CloseReason::Shutdown));
+            }
 
-        // 2. Client -> Upstream (bounded batch per poll turn for scheduler fairness).
-        let c2u_full = match pump(cx, &mut client, &mut upstream) {
-            Ok(full) => full,
-            Err(PumpStop::Abort) => return Poll::Ready(RelayEnd::Abort),
-            Err(PumpStop::Peer(stop)) => return Poll::Ready(RelayEnd::Peer(Side::Client, stop)),
-        };
+            // 1. Advance any already-queued outbound frames first so freed slots are
+            // immediately visible to both directional read loops below.
+            if upstream.poll_pending(cx).is_err() || client.poll_pending(cx).is_err() {
+                return Poll::Ready(None);
+            }
 
-        // 3. Upstream -> Client (independent full-duplex progress even when `upstream` sink is full).
-        let u2c_full = match pump(cx, &mut upstream, &mut client) {
-            Ok(full) => full,
-            Err(PumpStop::Abort) => return Poll::Ready(RelayEnd::Abort),
-            Err(PumpStop::Peer(stop)) => return Poll::Ready(RelayEnd::Peer(Side::Upstream, stop)),
-        };
-
-        // 4. Flush batched outbound frames once per direction & enforce stall deadlines.
-        if upstream.poll_flush_and_timer(cx).is_err() || client.poll_flush_and_timer(cx).is_err() {
-            return Poll::Ready(RelayEnd::Abort);
-        }
-
-        if c2u_full || u2c_full {
-            cx.waker().wake_by_ref();
-        }
-        Poll::Pending
-    })
-    .await;
-
-    match end {
-        RelayEnd::Abort => {}
-        RelayEnd::Peer(side, stop) => {
-            let finish_fut = async {
-                match side {
-                    Side::Client => finish(client, upstream, stop).await,
-                    Side::Upstream => finish(upstream, client, stop).await,
+            // 2. Client -> Upstream (bounded batch per poll turn for scheduler fairness).
+            let c2u_full = match pump(cx, &mut client, &mut upstream) {
+                Ok(full) => full,
+                Err(PumpStop::Abort) => return Poll::Ready(None),
+                Err(PumpStop::Peer(stop)) => {
+                    return Poll::Ready(Some(CloseReason::Peer(Side::Client, stop)));
                 }
             };
-            match shutdown.and_then(Shutdown::current_deadline) {
-                Some(at) => {
-                    let _ = tokio::time::timeout_at(at, finish_fut).await;
+
+            // 3. Upstream -> Client (independent full-duplex progress even when `upstream` sink is full).
+            let u2c_full = match pump(cx, &mut upstream, &mut client) {
+                Ok(full) => full,
+                Err(PumpStop::Abort) => return Poll::Ready(None),
+                Err(PumpStop::Peer(stop)) => {
+                    return Poll::Ready(Some(CloseReason::Peer(Side::Upstream, stop)));
                 }
-                None => finish_fut.await,
+            };
+
+            // 4. Flush batched outbound frames once per direction & enforce stall deadlines.
+            if upstream.poll_flush_and_timer(cx).is_err()
+                || client.poll_flush_and_timer(cx).is_err()
+            {
+                return Poll::Ready(None);
             }
-        }
-        RelayEnd::Shutdown(at) => {
-            let _ = tokio::time::timeout_at(at, async {
-                tokio::join!(
-                    client.close_with_handshake(Some(GOING_AWAY_FRAME)),
-                    upstream.close_with_handshake(Some(GOING_AWAY_FRAME)),
-                );
-            })
-            .await;
-        }
+
+            if c2u_full || u2c_full {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        })
+        .await
+    }) else {
+        return;
+    };
+
+    if matches!(
+        (&reason, client.has_pending(), upstream.has_pending()),
+        (CloseReason::Peer(Side::Client, PeerStop::Eof), _, false)
+            | (CloseReason::Peer(Side::Upstream, PeerStop::Eof), false, _)
+    ) {
+        return;
     }
+
+    // Phase 2: single hard-deadline bound governing all close/drain paths, including
+    // a shutdown signal that arrives while a peer-initiated close is already running.
+    let _ = shutdown
+        .bound(async {
+            match reason {
+                CloseReason::Peer(Side::Client, stop) => finish(client, upstream, stop).await,
+                CloseReason::Peer(Side::Upstream, stop) => finish(upstream, client, stop).await,
+                CloseReason::Shutdown => {
+                    tokio::join!(
+                        client.close_handshake(Some(GOING_AWAY_FRAME)),
+                        upstream.close_handshake(Some(GOING_AWAY_FRAME)),
+                    );
+                }
+            }
+        })
+        .await;
 }
 
 #[cfg(test)]
@@ -1065,6 +1049,29 @@ mod tests {
         }
     }
 
+    fn spawn_bridge<C, U>(
+        proxy_client: WebSocketStream<C>,
+        proxy_upstream: WebSocketStream<U>,
+        mock_enabled: bool,
+        io_timeout: Duration,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        C: RelayIo + Send + 'static,
+        U: RelayIo + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let (_tx, shutdown) = crate::lifecycle::channel();
+            bridge_ws(
+                proxy_client,
+                proxy_upstream,
+                mock_enabled,
+                io_timeout,
+                &shutdown,
+            )
+            .await;
+        })
+    }
+
     async fn duplex_bridge(
         c2p_cap: usize,
         p2u_cap: usize,
@@ -1091,13 +1098,7 @@ mod tests {
         )
         .await;
         let upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
-        let relay = tokio::spawn(bridge_ws(
-            proxy_client,
-            proxy_upstream,
-            mock_enabled,
-            io_timeout,
-            None,
-        ));
+        let relay = spawn_bridge(proxy_client, proxy_upstream, mock_enabled, io_timeout);
         (client, upstream, relay)
     }
 
@@ -1478,13 +1479,7 @@ mod tests {
         )
         .await;
         let mut upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
-        let relay = tokio::spawn(bridge_ws(
-            proxy_client,
-            proxy_upstream,
-            false,
-            Duration::from_secs(10),
-            None,
-        ));
+        let relay = spawn_bridge(proxy_client, proxy_upstream, false, Duration::from_secs(10));
 
         upstream
             .send(Message::Binary(bytes::Bytes::from(vec![0xAB; 32 * 1024])))
@@ -1536,13 +1531,7 @@ mod tests {
             Some(ws_config()),
         )
         .await;
-        let relay = tokio::spawn(bridge_ws(
-            proxy_client,
-            proxy_upstream,
-            false,
-            Duration::from_secs(60),
-            None,
-        ));
+        let relay = spawn_bridge(proxy_client, proxy_upstream, false, Duration::from_secs(60));
 
         for _ in 0..32 {
             attacker_ws
@@ -1653,7 +1642,7 @@ mod tests {
                 proxy_upstream,
                 false,
                 Duration::from_secs(60),
-                Some(&rx),
+                &rx,
             )
             .await;
         });
@@ -1707,7 +1696,7 @@ mod tests {
                 proxy_upstream,
                 false,
                 Duration::from_secs(60),
-                Some(&rx),
+                &rx,
             )
             .await;
         });
@@ -1750,9 +1739,64 @@ mod tests {
             proxy_upstream,
             false,
             Duration::from_secs(60),
-            Some(&rx),
+            &rx,
         )
         .await;
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_deadline_bounds_an_in_progress_peer_close() {
+        let (client_io, proxy_client_io) = tokio::io::duplex(16 * 1024);
+        let (proxy_upstream_io, _stalled_upstream_io) = tokio::io::duplex(16 * 1024);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let proxy_client = WebSocketStream::from_raw_socket(
+            WriteProgressIo::new(proxy_client_io),
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+        let proxy_upstream = WebSocketStream::from_raw_socket(
+            WriteProgressIo::new(proxy_upstream_io),
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+
+        let (tx, rx) = crate::lifecycle::channel();
+        let relay = tokio::spawn(async move {
+            bridge_ws(
+                proxy_client,
+                proxy_upstream,
+                false,
+                Duration::from_secs(60),
+                &rx,
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+
+        // Client initiates a clean Close while upstream never echoes Close, parking
+        // `bridge_ws` inside Phase 2 (`finish` -> `WS_CLOSE_GRACE` = 1s).
+        client.close(None).await.unwrap();
+        let echo = client.next().await.expect("Close echo").expect("clean");
+        assert!(echo.is_close(), "expected Close echo, got {echo:?}");
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !relay.is_finished(),
+            "peer close must still be waiting on stalled upstream before shutdown"
+        );
+
+        // Zero-grace shutdown arriving mid-`finish` must preempt the remaining 900ms immediately.
+        let shutdown_at = tokio::time::Instant::now();
+        tx.send(shutdown_at);
+        relay.await.unwrap();
+        assert_eq!(
+            shutdown_at.elapsed(),
+            Duration::ZERO,
+            "shutdown deadline must preempt an in-progress peer close immediately"
+        );
     }
 }

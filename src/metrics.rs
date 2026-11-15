@@ -6,6 +6,19 @@ use ::metrics::{Counter, Gauge, Histogram};
 #[cfg(feature = "otel")]
 pub(crate) const ACTIVE_CONNECTIONS: &str = "ethonyx_active_connections";
 
+static PROMETHEUS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+
+pub(crate) fn install_prometheus_handle(handle: metrics_exporter_prometheus::PrometheusHandle) {
+    let _ = PROMETHEUS_HANDLE.set(handle);
+}
+
+pub(crate) fn render_prometheus() -> String {
+    PROMETHEUS_HANDLE
+        .get()
+        .map(metrics_exporter_prometheus::PrometheusHandle::render)
+        .unwrap_or_default()
+}
+
 pub(crate) struct ActiveConnectionGuard(Gauge);
 
 impl ActiveConnectionGuard {
@@ -18,6 +31,17 @@ impl ActiveConnectionGuard {
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         self.0.decrement(1.0);
+    }
+}
+
+/// Deferred WebSocket gauge handle captured before `tokio::spawn` so upgraded
+/// sessions activate the `ws` gauge only after `on_upgrade` succeeds without
+/// retaining `Arc<AppState>` across the relay's lifetime.
+pub(crate) struct WsConnectionSlot(Gauge);
+
+impl WsConnectionSlot {
+    pub(crate) fn activate(self) -> ActiveConnectionGuard {
+        ActiveConnectionGuard::new(self.0)
     }
 }
 
@@ -59,12 +83,17 @@ impl ProxyMetrics {
         ActiveConnectionGuard::new(gauge)
     }
 
-    pub(crate) fn active_ws(&self) -> ActiveConnectionGuard {
+    pub(crate) fn ws_slot(&self) -> WsConnectionSlot {
         let gauge = self
             .active_ws
             .get_or_init(|| ::metrics::gauge!("ethonyx_active_connections", "protocol" => "ws"))
             .clone();
-        ActiveConnectionGuard::new(gauge)
+        WsConnectionSlot(gauge)
+    }
+
+    #[cfg(all(test, feature = "otel"))]
+    pub(crate) fn active_ws(&self) -> ActiveConnectionGuard {
+        self.ws_slot().activate()
     }
 
     pub(crate) fn inc_saturated(&self) {

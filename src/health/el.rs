@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{Method, Request, Uri};
-use http_body_util::Full;
 
-use crate::transport::{H2cMode, HttpTransport, ProxyClient, box_full};
+use crate::response::full_body;
+use crate::transport::{H2cMode, HttpTransport, ProxyClient};
 
 use super::fetch::{HealthError, JsonObject, ProbeTarget, is_transport};
 
@@ -151,7 +151,7 @@ async fn el_batch_rpc(el: ProbeTarget<'_>, uri: &Uri) -> Result<ElBatchResult, H
         .method(Method::POST)
         .uri(uri.clone())
         .header("content-type", "application/json")
-        .body(box_full(Full::new(Bytes::from_static(EL_BATCH_REQ))))
+        .body(full_body(Bytes::from_static(EL_BATCH_REQ)))
         .map_err(|e| HealthError::Transport(Arc::from(format!("build: {e}"))))?;
     let body = el.fetch_bytes(req).await?;
     parse_el_batch(&body)
@@ -253,7 +253,7 @@ mod tests {
     use super::*;
     use crate::transport::{build_client, build_connectors};
     use http::{Response, StatusCode};
-    use http_body_util::BodyExt;
+    use http_body_util::{BodyExt, Full};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 

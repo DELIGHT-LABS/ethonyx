@@ -1,4 +1,4 @@
-//! Shared health probe cache and background poller.
+//! Background upstream health probing, Prometheus/OTel gauge recording, and readiness transition logging.
 
 use std::fmt;
 use std::sync::Arc;
@@ -10,52 +10,12 @@ use tracing::{debug, info, warn};
 use crate::metrics::{ClSlotSample, HealthSample};
 use crate::state::AppState;
 
-use super::cl::{ClStatus, cl_peer_count, cl_syncing_status};
-use super::el::{ElBlockResult, ElSyncingResult, el_batch_detect};
-use super::fetch::{HealthError, ProbeError, ProbeTarget};
-use super::{ReadinessEval, Transition, evaluate_readiness, readiness_transition};
-
-/// Source of readiness and health data for `/healthz`, `/readyz`, and `node_health`.
-pub(crate) enum HealthSource {
-    /// `--trust-upstream`: no background poller or `watch` channel is allocated.
-    Trusted,
-    /// Active background polling feeding snapshots via `watch`.
-    Polled(watch::Receiver<Arc<Probe>>),
-}
-
-/// The five upstream probe results captured by one poll, shared with the request
-/// handlers via a `watch` channel. `/healthz` and `/readyz` read the latest one
-/// instead of querying upstream per request, so upstream load is decoupled from
-/// probe rate. Stored as raw results so block / slot ages can be recomputed live.
-#[derive(Clone)]
-pub(crate) struct Probe {
-    pub(super) el_syncing: Result<ElSyncingResult, ProbeError>,
-    pub(super) el_peers: Result<u64, ProbeError>,
-    pub(super) el_block: Result<ElBlockResult, ProbeError>,
-    pub(super) cl_status: Result<ClStatus, ProbeError>,
-    pub(super) cl_peers: Result<u64, ProbeError>,
-}
-
-impl Probe {
-    pub(crate) fn pending() -> Self {
-        let pending: ProbeError = Arc::from("initial poll pending");
-        Self {
-            el_syncing: Err(pending.clone()),
-            el_peers: Err(pending.clone()),
-            el_block: Err(pending.clone()),
-            cl_status: Err(pending.clone()),
-            cl_peers: Err(pending),
-        }
-    }
-
-    pub(crate) const fn has_errors(&self) -> bool {
-        self.el_syncing.is_err()
-            || self.el_peers.is_err()
-            || self.el_block.is_err()
-            || self.cl_status.is_err()
-            || self.cl_peers.is_err()
-    }
-}
+use super::cl::{cl_peer_count, cl_syncing_status};
+use super::el::el_batch_detect;
+use super::eval::{
+    ElSyncEval, Probe, ReadinessEval, Transition, evaluate_readiness, readiness_transition,
+};
+use super::fetch::{HealthError, ProbeTarget};
 
 /// Query all five upstream signals once. Each call is bounded by
 /// `--health-timeout`; failures land in the result rather than aborting.
@@ -101,11 +61,8 @@ pub(crate) async fn probe_once(state: &AppState) -> Probe {
 pub(crate) fn update_metrics(state: &AppState, probe: &Probe, eval: ReadinessEval<'_>) {
     let el_peers = probe.el_peers.as_ref().map_or(0.0, |&p| p as f64);
     let cl_peers = probe.cl_peers.as_ref().map_or(0.0, |&p| p as f64);
-    let el_distance = match &probe.el_syncing {
-        Ok(ElSyncingResult::Syncing {
-            current_block,
-            highest_block,
-        }) => highest_block.saturating_sub(*current_block) as f64,
+    let el_distance = match eval.el_sync {
+        ElSyncEval::SyncingProgress { distance, .. } => distance as f64,
         _ => 0.0,
     };
     let cl_status = probe.cl_status.as_ref().ok().map(|s| ClSlotSample {
@@ -166,7 +123,7 @@ pub(crate) async fn poll_loop(
             probe = probe_once(&state) => probe,
         };
 
-        let eval = evaluate_readiness(&state, &probe);
+        let eval = evaluate_readiness(&state.cfg, state.slot_clock, &probe);
         let ready = eval.is_ready();
         let status = if ready { "ready" } else { "not_ready" };
         debug!(status, "health poll");
@@ -177,10 +134,7 @@ pub(crate) async fn poll_loop(
             Transition::Silent => {}
             Transition::Recovered => info!("readiness recovered"),
             Transition::BecameNotReady => {
-                let (el_block, cl_slot) = match eval.strict {
-                    Some((el_f, cl_f)) => (Some(el_f), Some(cl_f)),
-                    None => (None, None),
-                };
+                let (el_block, cl_slot) = eval.strict.unzip();
                 warn!(
                     el_syncing = %eval.el_sync,
                     cl_syncing = %eval.cl_sync,

@@ -15,6 +15,7 @@ mod metrics;
 #[cfg(feature = "otel")]
 mod otel;
 mod proxy;
+mod response;
 mod rpc;
 mod state;
 mod transport;
@@ -39,10 +40,6 @@ use tokio::sync::{TryAcquireError, watch};
 use tracing::{debug, info, trace, warn};
 
 use crate::state::AppState;
-
-use std::sync::OnceLock;
-pub(crate) static PROMETHEUS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
-    OnceLock::new();
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -152,7 +149,7 @@ where
     let recorder_installed = ::metrics::set_global_recorder(prometheus_recorder).is_ok();
 
     if recorder_installed {
-        let _ = PROMETHEUS_HANDLE.set(prometheus_handle.clone());
+        metrics::install_prometheus_handle(prometheus_handle.clone());
         // The recorder is process-global: only its successful installer starts
         // upkeep, and it remains available across individual run() calls.
         tokio::spawn(async move {
@@ -199,7 +196,7 @@ where
             }
             probe = health::probe_once(&state) => Arc::new(probe),
         };
-        let eval = health::evaluate_readiness(&state, &first_probe);
+        let eval = health::evaluate_readiness(&state.cfg, state.slot_clock, &first_probe);
         health::update_metrics(&state, &first_probe, eval);
         initial_degraded = first_probe.has_errors();
         let _ = tx.send(first_probe);

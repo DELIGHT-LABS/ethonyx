@@ -2,11 +2,9 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use http::{Method, Request, Uri};
-use http_body_util::Full;
 
-use crate::transport::box_full;
+use crate::response::empty_body;
 
 use super::fetch::{HealthError, JsonObject, ProbeError, ProbeTarget};
 
@@ -48,7 +46,7 @@ async fn cl_get_json<T: serde::de::DeserializeOwned>(
     let req = Request::builder()
         .method(Method::GET)
         .uri(uri.clone())
-        .body(box_full(Full::new(Bytes::new())))
+        .body(empty_body())
         .map_err(|e| Arc::from(e.to_string()))?;
     let body = cl
         .fetch_bytes(req)

@@ -1,29 +1,21 @@
 //! Upstream HTTP/TLS client builders and negotiated protocol tracking.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use http::Version;
-use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use tracing::{debug, info, warn};
 
-use crate::BoxError;
+use crate::response::ResBody;
 
 const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(60);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
-pub(crate) type ResBody = UnsyncBoxBody<Bytes, BoxError>;
 pub(crate) type Https = hyper_rustls::HttpsConnector<HttpConnector>;
 pub(crate) type ProxyClient = Client<Https, ResBody>;
-
-pub(crate) fn box_full(body: Full<Bytes>) -> ResBody {
-    body.map_err(|e: Infallible| match e {}).boxed_unsync()
-}
 
 pub(crate) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {

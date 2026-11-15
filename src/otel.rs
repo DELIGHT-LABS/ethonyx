@@ -628,9 +628,7 @@ mod tests {
                 let req = Request::builder()
                     .method(Method::POST)
                     .uri(uri.clone())
-                    .body(crate::transport::box_full(Full::new(Bytes::from_static(
-                        b"{}",
-                    ))))
+                    .body(crate::response::full_body(Bytes::from_static(b"{}")))
                     .unwrap();
                 async {
                     let resp = client.request(req).await.unwrap();
