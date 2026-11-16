@@ -1,8 +1,9 @@
 //! Ethonyx — Ethereum EL/CL sidecar library entry.
 //!
-//! The binary in `src/main.rs` is a thin wrapper around [`run`]. Tests can call
-//! [`run`] directly with a custom shutdown future to drive the full stack
-//! in-process without spawning a subprocess.
+//! The binary in `src/main.rs` is a thin wrapper around [`Prepared`]. Callers can
+//! drive the full stack in-process via [`run`] / [`Prepared::run`], or split port
+//! binding from serving via [`Prepared::bind`] and [`Bound::serve`] to inspect
+//! ephemeral [`Bound::local_addrs`] first.
 
 #![forbid(unsafe_code)]
 #![warn(unreachable_pub)]
@@ -12,7 +13,7 @@ mod headers;
 mod health;
 mod lifecycle;
 mod metrics;
-#[cfg(feature = "otel")]
+#[cfg_attr(not(feature = "otel"), path = "otel_noop.rs")]
 mod otel;
 mod proxy;
 mod response;
@@ -49,31 +50,31 @@ const HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(65);
 
 /// A validated configuration plus the telemetry providers started for it.
 ///
-/// Preparation is separate from [`Prepared::run`] so a binary can build its
-/// tracing subscriber from [`Prepared::tracer`] before the server starts.
-#[must_use = "Prepared does nothing unless `.run(shutdown).await` is called"]
+/// Preparation is separate from [`Prepared::bind`] and [`Prepared::run`] so a
+/// binary can build its tracing subscriber from `Prepared::tracer` before the
+/// server starts, and callers using ephemeral `:0` ports can inspect
+/// [`Bound::local_addrs`] before calling [`Bound::serve`].
+#[must_use = "Prepared does nothing unless `.bind().await` or `.run(shutdown).await` is called"]
 pub struct Prepared {
     cfg: Config,
-    validated: config::ValidatedConfig,
-    #[cfg(feature = "otel")]
-    telemetry: Option<otel::Telemetry>,
+    listen: Vec<config::ListenAddr>,
+    upstreams: config::ValidatedUpstreams,
+    telemetry: otel::Telemetry,
 }
 
 impl Prepared {
     /// Validate `cfg` and start the OTLP providers when an endpoint is configured.
     pub async fn new(cfg: Config) -> Result<Self, BoxError> {
-        #[cfg(not(feature = "otel"))]
-        let validated = cfg.parse_validated()?;
-        #[cfg(feature = "otel")]
-        let (validated, telemetry) = {
-            let mut validated = cfg.parse_validated()?;
-            let telemetry = otel::start(validated.otel_endpoint.take()).await?;
-            (validated, telemetry)
-        };
+        let config::ParsedConfig {
+            listen,
+            upstreams,
+            otel_endpoint,
+        } = cfg.parse_validated()?;
+        let telemetry = otel::start(otel_endpoint).await?;
         Ok(Self {
             cfg,
-            validated,
-            #[cfg(feature = "otel")]
+            listen,
+            upstreams,
             telemetry,
         })
     }
@@ -86,29 +87,218 @@ impl Prepared {
     /// Tracer for the caller's `tracing-opentelemetry` layer, if telemetry started.
     #[cfg(feature = "otel")]
     pub fn tracer(&self) -> Option<opentelemetry_sdk::trace::SdkTracer> {
-        self.telemetry.as_ref().map(otel::Telemetry::tracer)
+        self.telemetry.tracer()
+    }
+
+    /// Warm the initial health snapshot (unless `--trust-upstream` is set) and bind
+    /// every `--listen` TCP socket, returning a [`Bound`] server ready to [`Bound::serve`].
+    ///
+    /// Background health polling and connection acceptance start when [`Bound::serve`]
+    /// is polled. If binding fails, any started telemetry providers trigger best-effort
+    /// background cleanup on drop without stalling error reporting.
+    pub async fn bind(self) -> Result<Bound, BoxError> {
+        let Self {
+            cfg,
+            listen,
+            upstreams,
+            telemetry,
+        } = self;
+        let poll_interval = cfg.health_poll_interval;
+        let shutdown_grace = cfg.shutdown_grace;
+
+        let (probe_tx, health) = if cfg.trust_upstream {
+            (None, health::HealthSource::Trusted)
+        } else {
+            let (tx, rx) = watch::channel(Arc::new(health::Probe::pending()));
+            (Some(tx), health::HealthSource::Polled(rx))
+        };
+
+        let state = Arc::new(AppState::new(
+            &cfg,
+            upstreams,
+            telemetry.is_enabled(),
+            health,
+            metrics::ServerMetrics::new(telemetry.metric_sink()),
+        )?);
+
+        info!(
+            version = concat!("v", env!("CARGO_PKG_VERSION")),
+            git = env!("ETHONYX_GIT_DESCRIBE"),
+            ?cfg,
+            "starting ethonyx"
+        );
+
+        let mut initial_degraded = false;
+        if let Some(ref tx) = probe_tx {
+            // Warm the health cache with one poll before serving, then refresh it in
+            // the background so /healthz and /readyz read a snapshot instead of
+            // hitting upstream on every probe. `Prepared::run` cancels this await by
+            // dropping the future when shutdown arrives first.
+            let first_probe = Arc::new(health::probe_once(&state).await);
+            let eval = health::evaluate_readiness(&state.cfg, state.slot_clock, &first_probe);
+            health::update_metrics(&state, &first_probe, eval);
+            initial_degraded = first_probe.has_errors();
+            let _ = tx.send(first_probe);
+        }
+        let startup_msg = if cfg.trust_upstream {
+            "upstreams configured (trusted)"
+        } else if initial_degraded {
+            "upstreams configured (initial probe degraded)"
+        } else {
+            "upstreams connected"
+        };
+        info!(
+            el_http = %RedactedUrl(&cfg.el_http_url),
+            el_http_proto = %state.el.transport.startup_proto_label(),
+            el_ws = %RedactedUrl(&cfg.el_ws_url),
+            cl_beacon = %RedactedUrl(&cfg.cl_beacon_url),
+            cl_mev_relay = %upstream::RedactedOptUrl(cfg.cl_mev_relay_url.as_deref()),
+            cl_proto = %state.cl.transport.startup_proto_label(),
+            "{startup_msg}"
+        );
+
+        // No `.await` follows a failed bind: `Prepared::run` races `self.bind()`
+        // against `shutdown`, so returning immediately via `?` ensures a concurrent
+        // shutdown signal can never overtake and swallow a bind error.
+        let mut listeners = Vec::with_capacity(listen.len());
+        let mut local_addrs = Vec::with_capacity(listen.len());
+        for addr in listen {
+            let listener = TcpListener::bind((&*addr.host, addr.port))
+                .await
+                .map_err(|e| format!("failed to bind --listen address '{addr}': {e}"))?;
+            let local_addr = listener
+                .local_addr()
+                .map_err(|e| format!("failed to query local address for '{addr}': {e}"))?;
+            info!(listen = %local_addr, "listening");
+            listeners.push(listener);
+            local_addrs.push(local_addr);
+        }
+
+        Ok(Bound {
+            listeners,
+            local_addrs,
+            state,
+            probe_tx,
+            poll_interval,
+            shutdown_grace,
+            telemetry,
+        })
     }
 
     /// Bind every `cfg.listen` address, serve all routes, and wait for `shutdown`
-    /// before draining for `cfg.shutdown_grace` seconds. Telemetry providers are
-    /// shut down whether or not serving succeeded.
+    /// before draining for `cfg.shutdown_grace` seconds and flushing telemetry.
+    ///
+    /// If `shutdown` resolves before [`Prepared::bind`] completes, returns `Ok(())`
+    /// immediately without binding any listener or awaiting telemetry flush (any
+    /// started providers trigger best-effort background cleanup on drop).
     pub async fn run<F>(self, shutdown: F) -> Result<(), BoxError>
     where
         F: Future<Output = ()> + Send,
     {
-        #[cfg(not(feature = "otel"))]
-        {
-            run_inner(self.cfg, self.validated, shutdown, false).await
-        }
-        #[cfg(feature = "otel")]
-        {
-            let otel_enabled = self.telemetry.is_some();
-            let res = run_inner(self.cfg, self.validated, shutdown, otel_enabled).await;
-            if let Some(telemetry) = self.telemetry {
-                telemetry.shutdown().await;
+        tokio::pin!(shutdown);
+        let bound = tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                // Dropping the `bind` future cancels startup (including a slow or
+                // unreachable initial health probe) before any listener is bound;
+                // `Telemetry::drop` triggers best-effort background cleanup.
+                info!("shutdown signal received during startup");
+                return Ok(());
             }
-            res
+            bound = self.bind() => bound?,
+        };
+        bound.serve(shutdown).await
+    }
+}
+
+/// A [`Prepared`] server whose initial health snapshot is warm and whose TCP
+/// listeners are bound and ready to accept connections.
+#[must_use = "Bound does nothing unless `.serve(shutdown).await` is called"]
+pub struct Bound {
+    listeners: Vec<TcpListener>,
+    local_addrs: Vec<std::net::SocketAddr>,
+    state: Arc<AppState>,
+    probe_tx: Option<watch::Sender<Arc<health::Probe>>>,
+    poll_interval: Duration,
+    shutdown_grace: Duration,
+    telemetry: otel::Telemetry,
+}
+
+impl Bound {
+    /// Actual bound socket addresses in the same order as [`Config::listen`].
+    pub fn local_addrs(&self) -> &[std::net::SocketAddr] {
+        &self.local_addrs
+    }
+
+    /// Serve all bound listeners until `shutdown` resolves, then drain active
+    /// connections for `cfg.shutdown_grace` seconds and shut down telemetry.
+    pub async fn serve<F>(self, shutdown: F) -> Result<(), BoxError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let Self {
+            listeners,
+            local_addrs: _,
+            state,
+            probe_tx,
+            poll_interval,
+            shutdown_grace,
+            telemetry,
+        } = self;
+
+        let (shutdown_tx, shutdown_rx) = lifecycle::channel();
+
+        let poller = probe_tx.map(|tx| {
+            tokio::spawn(health::poll_loop(
+                Arc::clone(&state),
+                tx,
+                shutdown_rx.clone(),
+                poll_interval,
+            ))
+        });
+
+        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let lifecycle = lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
+        let prometheus = state.metrics.prometheus_handle();
+        let accept_handle = tokio::spawn(accept_loop(listeners, state, lifecycle));
+
+        // Prometheus idle-bucket upkeep belongs to the serving task itself: it runs
+        // while this server waits for shutdown and needs no task of its own.
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut shutdown => break,
+                () = tokio::time::sleep(Duration::from_secs(5)) => prometheus.run_upkeep(),
+            }
         }
+        drop(prometheus);
+        info!("shutdown signal received");
+
+        let deadline = tokio::time::Instant::now() + shutdown_grace;
+        shutdown_tx.send(deadline);
+
+        let accept_res = accept_handle.await;
+        let poller_res = match poller {
+            Some(poller) => Some(poller.await),
+            None => None,
+        };
+
+        info!(
+            grace_secs = shutdown_grace.as_secs(),
+            "draining connections"
+        );
+        // Each connection, HTTP/2 request and relay uses the same deadline. Wait for
+        // their futures to be dropped even with zero grace; timing out this barrier
+        // would let serve() return before sockets and request tasks are released.
+        let _ = conn_rx.recv().await;
+
+        telemetry.shutdown().await;
+        accept_res?;
+        if let Some(poller_res) = poller_res {
+            poller_res?;
+        }
+        Ok(())
     }
 }
 
@@ -118,151 +308,6 @@ where
     F: Future<Output = ()> + Send,
 {
     Prepared::new(cfg).await?.run(shutdown).await
-}
-
-async fn run_inner<F>(
-    cfg: Config,
-    mut validated: config::ValidatedConfig,
-    shutdown: F,
-    otel_enabled: bool,
-) -> Result<(), BoxError>
-where
-    F: Future<Output = ()> + Send,
-{
-    let listen_addrs = std::mem::take(&mut validated.listen);
-
-    let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-    let prometheus_recorder = prometheus_builder.build_recorder();
-    let prometheus_handle = prometheus_recorder.handle();
-
-    #[cfg(feature = "otel")]
-    let recorder_installed = if otel_enabled {
-        let fanout = metrics_util::layers::FanoutBuilder::default()
-            .add_recorder(prometheus_recorder)
-            .add_recorder(crate::otel::OtelRecorder::new())
-            .build();
-        ::metrics::set_global_recorder(fanout).is_ok()
-    } else {
-        ::metrics::set_global_recorder(prometheus_recorder).is_ok()
-    };
-    #[cfg(not(feature = "otel"))]
-    let recorder_installed = ::metrics::set_global_recorder(prometheus_recorder).is_ok();
-
-    if recorder_installed {
-        metrics::install_prometheus_handle(prometheus_handle.clone());
-        // The recorder is process-global: only its successful installer starts
-        // upkeep, and it remains available across individual run() calls.
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                prometheus_handle.run_upkeep();
-            }
-        });
-    }
-
-    info!(
-        version = concat!("v", env!("CARGO_PKG_VERSION")),
-        git = env!("ETHONYX_GIT_DESCRIBE"),
-        ?cfg,
-        "starting ethonyx"
-    );
-
-    let poll_interval = cfg.health_poll_interval;
-    let shutdown_grace = cfg.shutdown_grace;
-
-    let (probe_tx, health) = if cfg.trust_upstream {
-        (None, health::HealthSource::Trusted)
-    } else {
-        let (tx, rx) = watch::channel(Arc::new(health::Probe::pending()));
-        (Some(tx), health::HealthSource::Polled(rx))
-    };
-    let (shutdown_tx, shutdown_rx) = lifecycle::channel();
-
-    let state = Arc::new(AppState::new(&cfg, validated, otel_enabled, health)?);
-
-    tokio::pin!(shutdown);
-
-    let mut initial_degraded = false;
-    if let Some(ref tx) = probe_tx {
-        // Warm the health cache with one poll before serving, then refresh it in
-        // the background so /healthz and /readyz read a snapshot instead of
-        // hitting upstream on every probe. Race `shutdown` so SIGTERM during a
-        // slow or unreachable startup probe exits immediately.
-        let first_probe = tokio::select! {
-            biased;
-            () = &mut shutdown => {
-                info!("shutdown signal received during initial health probe");
-                return Ok(());
-            }
-            probe = health::probe_once(&state) => Arc::new(probe),
-        };
-        let eval = health::evaluate_readiness(&state.cfg, state.slot_clock, &first_probe);
-        health::update_metrics(&state, &first_probe, eval);
-        initial_degraded = first_probe.has_errors();
-        let _ = tx.send(first_probe);
-    }
-    let startup_msg = if cfg.trust_upstream {
-        "upstreams configured (trusted)"
-    } else if initial_degraded {
-        "upstreams configured (initial probe degraded)"
-    } else {
-        "upstreams connected"
-    };
-    info!(
-        el_http = %RedactedUrl(&cfg.el_http_url),
-        el_http_proto = %state.el.transport.startup_proto_label(),
-        el_ws = %RedactedUrl(&cfg.el_ws_url),
-        cl_beacon = %RedactedUrl(&cfg.cl_beacon_url),
-        cl_mev_relay = %upstream::RedactedOptUrl(cfg.cl_mev_relay_url.as_deref()),
-        cl_proto = %state.cl.transport.startup_proto_label(),
-        "{startup_msg}"
-    );
-    drop(cfg);
-
-    let mut listeners = Vec::with_capacity(listen_addrs.len());
-    for addr in listen_addrs {
-        let listener = TcpListener::bind((&*addr.host, addr.port))
-            .await
-            .map_err(|e| format!("failed to bind --listen address '{addr}': {e}"))?;
-        info!(listen = %addr, "listening");
-        listeners.push(listener);
-    }
-
-    // Spawn the background poller only after all TCP listeners bind successfully
-    // so a bind error never leaves a detached background poller running.
-    let poller = probe_tx.map(|tx| {
-        tokio::spawn(health::poll_loop(
-            state.clone(),
-            tx,
-            shutdown_rx.clone(),
-            poll_interval,
-        ))
-    });
-
-    let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let lifecycle = lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
-    let accept_handle = tokio::spawn(accept_loop(listeners, state, lifecycle));
-
-    shutdown.await;
-    info!("shutdown signal received");
-
-    let deadline = tokio::time::Instant::now() + shutdown_grace;
-    shutdown_tx.send(deadline);
-
-    let _ = accept_handle.await;
-    if let Some(poller) = poller {
-        let _ = poller.await;
-    }
-
-    info!(
-        grace_secs = shutdown_grace.as_secs(),
-        "draining connections"
-    );
-    // Each connection, HTTP/2 request and relay uses the same deadline. Wait for
-    // their futures to be dropped even with zero grace; timing out this barrier
-    // would let run() return before sockets and request tasks are released.
-    let _ = conn_rx.recv().await;
-    Ok(())
 }
 
 async fn accept_round_robin(
@@ -766,5 +811,48 @@ mod tests {
         // Idle for 66s (> 65s): server closes the idle keep-alive socket!
         tokio::time::advance(Duration::from_secs(66)).await;
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_bind_assigns_ephemeral_ports_and_serves_until_shutdown() {
+        use clap::Parser;
+        use tokio::io::AsyncWriteExt;
+
+        let cfg = Config::parse_from([
+            "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
+            "--listen",
+            "127.0.0.1:0",
+            "--trust-upstream",
+            "--shutdown-grace",
+            "0",
+        ]);
+        let bound = Prepared::new(cfg).await.unwrap().bind().await.unwrap();
+        let [a0, a1] = bound.local_addrs() else {
+            panic!("expected two bound addresses");
+        };
+        assert_ne!(a0.port(), 0);
+        assert_ne!(a1.port(), 0);
+        assert_ne!(a0.port(), a1.port());
+        let addr0 = *a0;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(bound.serve(async move {
+            let _ = rx.await;
+        }));
+
+        let mut stream = tokio::net::TcpStream::connect(addr0).await.unwrap();
+        stream
+            .write_all(b"GET /livez HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = [0u8; 128];
+        let n = stream.read(&mut resp).await.unwrap();
+        assert!(resp[..n].starts_with(b"HTTP/1.1 200 OK"));
+        drop(stream);
+
+        let _ = tx.send(());
+        server.await.unwrap().unwrap();
     }
 }

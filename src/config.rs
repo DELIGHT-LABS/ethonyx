@@ -357,14 +357,17 @@ impl RuntimeOpts {
     }
 }
 
-pub(crate) struct ValidatedConfig {
-    pub(crate) listen: Vec<ListenAddr>,
+pub(crate) struct ValidatedUpstreams {
     pub(crate) el_http: HttpUpstream,
     pub(crate) el_ws: WsUpstream,
     pub(crate) cl_beacon: HttpUpstream,
     pub(crate) cl_mev_relay: Option<HttpUpstream>,
     pub(crate) slot_clock: Option<SlotClock>,
-    #[cfg(feature = "otel")]
+}
+
+pub(crate) struct ParsedConfig {
+    pub(crate) listen: Vec<ListenAddr>,
+    pub(crate) upstreams: ValidatedUpstreams,
     pub(crate) otel_endpoint: Option<HttpUpstream>,
 }
 
@@ -400,7 +403,7 @@ impl Config {
         self.parse_validated().map(|_| ())
     }
 
-    pub(crate) fn parse_validated(&self) -> Result<ValidatedConfig, BoxError> {
+    pub(crate) fn parse_validated(&self) -> Result<ParsedConfig, BoxError> {
         if self.listen.is_empty() {
             return Err("no listen addresses configured".into());
         }
@@ -446,20 +449,16 @@ impl Config {
             .as_deref()
             .map(|u| HttpUpstream::parse("--cl-mev-relay-url", u))
             .transpose()?;
-        #[cfg(feature = "otel")]
-        let otel_endpoint = self
-            .otel_endpoint
-            .as_deref()
-            .map(crate::otel::parse_endpoint)
-            .transpose()?;
-        Ok(ValidatedConfig {
+        let otel_endpoint = crate::otel::parse_config_endpoint(self)?;
+        Ok(ParsedConfig {
             listen,
-            el_http,
-            el_ws,
-            cl_beacon,
-            cl_mev_relay,
-            slot_clock: SlotClock::new(cl_genesis_time, cl_seconds_per_slot),
-            #[cfg(feature = "otel")]
+            upstreams: ValidatedUpstreams {
+                el_http,
+                el_ws,
+                cl_beacon,
+                cl_mev_relay,
+                slot_clock: SlotClock::new(cl_genesis_time, cl_seconds_per_slot),
+            },
             otel_endpoint,
         })
     }

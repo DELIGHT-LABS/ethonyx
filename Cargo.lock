@@ -371,7 +371,6 @@ dependencies = [
  "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
- "metrics-util",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

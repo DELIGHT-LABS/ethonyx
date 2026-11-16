@@ -58,8 +58,6 @@ impl WsMode {
             CONNECTION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL,
             SEC_WEBSOCKET_VERSION, UPGRADE,
         };
-        #[cfg(not(feature = "otel"))]
-        let _ = otel_enabled;
         let mut versions = req.headers().get_all(SEC_WEBSOCKET_VERSION).iter();
         if versions.next().is_none_or(|v| v != "13") || versions.next().is_some() {
             return Err("invalid websocket version".into());
@@ -80,7 +78,6 @@ impl WsMode {
         // Strip hop-by-hop and Connection-nominated headers BEFORE injecting OTel
         // trace context or restoring canonical WebSocket handshake fields.
         crate::headers::strip_hop_by_hop(req.headers_mut());
-        #[cfg(feature = "otel")]
         if otel_enabled {
             crate::otel::propagate_context(req.headers_mut());
         }
