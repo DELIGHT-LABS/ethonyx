@@ -17,27 +17,20 @@ async fn main() -> Result<(), BoxError> {
         .with_filter(fmt_filter);
 
     #[cfg(feature = "otel")]
-    {
-        let otel_layer = app.tracer().map(|tracer| {
-            // Keep OTel request spans active when `--log-level warn` quiets stdout,
-            // while still honoring `RUST_LOG` if explicitly provided.
-            let otel_filter =
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                    tracing_subscriber::EnvFilter::new("ethonyx=info,access_log=off")
-                });
-            tracing_opentelemetry::layer()
-                .with_tracer(tracer)
-                .with_filter(otel_filter)
-        });
-        tracing_subscriber::registry()
-            .with(otel_layer)
-            .with(fmt_layer)
-            .init();
-    }
-    #[cfg(not(feature = "otel"))]
-    {
-        tracing_subscriber::registry().with(fmt_layer).init();
-    }
+    let otel_layer = app.tracer().map(|tracer| {
+        // Keep OTel request spans active when `--log-level warn` quiets stdout,
+        // while still honoring `RUST_LOG` if explicitly provided.
+        let otel_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ethonyx=info,access_log=off"));
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(otel_filter)
+    });
+
+    let registry = tracing_subscriber::registry();
+    #[cfg(feature = "otel")]
+    let registry = registry.with(otel_layer);
+    registry.with(fmt_layer).init();
 
     let shutdown = async {
         #[cfg(unix)]

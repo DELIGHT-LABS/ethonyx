@@ -71,7 +71,7 @@ pub(crate) fn update_metrics(state: &AppState, probe: &Probe, eval: ReadinessEva
     });
     let el_block = probe.el_block.as_ref().ok().map(|b| b.number);
 
-    state.health_metrics.record(HealthSample {
+    state.metrics.record_health(HealthSample {
         el_ok: eval.el_sync_ok(),
         cl_ok: eval.cl_sync_ok(),
         el_peers,

@@ -27,7 +27,6 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
-metrics-util = { version = "0.20", optional = true, default-features = false }
 rustls = { version = "0.23.46" }
 socket2 = "0.6"
 opentelemetry = { version = "0.33.1", optional = true, default-features = false, features = ["trace", "metrics"] }
@@ -36,7 +35,7 @@ opentelemetry-otlp = { version = "0.33.1", optional = true, default-features = f
 tracing-opentelemetry = { version = "0.34", optional = true, default-features = false }
 
 [features]
-otel = ["dep:metrics-util", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [dev-dependencies]
 hyper-util = { version = "0.1.21", features = ["server-auto"] }

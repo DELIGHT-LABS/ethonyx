@@ -1690,10 +1690,10 @@ async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
             .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
             .sum()
     };
-    let before = request_count(&metrics_str);
+    assert_eq!(request_count(&metrics_str), 1.0);
     ethonyx.shutdown().await;
 
-    // A second run in the same runtime reuses the process-global recorder.
+    // A second server instance owns an isolated recorder (starts at 0 and omits unpolled gauges).
     let second = EthonyxHandle::start(&["--trust-upstream", "--mock-eth-syncing"]).await;
     let (status, _) = post_json(
         &c,
@@ -1703,7 +1703,9 @@ async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let (_, body) = get(&c, &second.url("/metrics")).await;
-    assert!(request_count(&String::from_utf8_lossy(&body)) >= before + 1.0);
+    let second_metrics = String::from_utf8_lossy(&body);
+    assert_eq!(request_count(&second_metrics), 1.0);
+    assert!(!second_metrics.contains("ethonyx_upstream_health_status"));
     second.shutdown().await;
 }
 

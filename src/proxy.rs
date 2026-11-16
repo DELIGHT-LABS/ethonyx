@@ -17,7 +17,7 @@ use tracing::{Instrument, debug, info, trace, warn};
 use crate::BoxError;
 use crate::headers::{sanitize_response_headers, strip_hop_by_hop};
 use crate::health;
-use crate::metrics::{UpstreamLayer, classify_method, render_prometheus};
+use crate::metrics::{UpstreamLayer, classify_method};
 use crate::response::{
     ResBody, empty_body, full_body, raw_json_response, text_response, uri_too_long_response,
 };
@@ -125,7 +125,6 @@ impl Connection {
                 path = req.uri().path(),
                 upstream = upstream_type,
             );
-            #[cfg(feature = "otel")]
             if otel_enabled {
                 crate::otel::attach_parent_context(&span, req.headers());
             }
@@ -217,7 +216,7 @@ impl Probe {
                 let body = if head {
                     empty_body()
                 } else {
-                    full_body(Bytes::from(render_prometheus()))
+                    full_body(Bytes::from(state.metrics.render_prometheus()))
                 };
                 Response::builder()
                     .status(StatusCode::OK)
@@ -447,7 +446,6 @@ async fn execute_upstream(
     // Strip hop-by-hop and Connection-nominated headers BEFORE injecting OTel
     // trace context so `Connection: traceparent` cannot strip outgoing spans.
     strip_hop_by_hop(&mut parts.headers);
-    #[cfg(feature = "otel")]
     if state.otel_enabled {
         crate::otel::propagate_context(&mut parts.headers);
     }
@@ -900,9 +898,17 @@ mod tests {
 
         let cfg =
             crate::Config::parse_from(["ethonyx", "--trust-upstream", "--max-connections", "2"]);
-        let validated = cfg.parse_validated().unwrap();
-        let state =
-            Arc::new(AppState::new(&cfg, validated, false, health::HealthSource::Trusted).unwrap());
+        let parsed = cfg.parse_validated().unwrap();
+        let state = Arc::new(
+            AppState::new(
+                &cfg,
+                parsed.upstreams,
+                false,
+                health::HealthSource::Trusted,
+                crate::metrics::ServerMetrics::new(None),
+            )
+            .unwrap(),
+        );
         let sem = Arc::clone(&state.conn_limit);
         let tcp_permit = Arc::new(sem.clone().try_acquire_owned().unwrap());
         let (_shutdown_tx, shutdown_rx) = crate::lifecycle::channel();

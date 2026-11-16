@@ -4,9 +4,9 @@ use http::Uri;
 use tokio::sync::Semaphore;
 
 use crate::BoxError;
-use crate::config::{Config, RuntimeOpts, SlotClock, ValidatedConfig};
+use crate::config::{Config, RuntimeOpts, SlotClock, ValidatedUpstreams};
 use crate::health::HealthSource;
-use crate::metrics::{HealthMetrics, ProxyMetrics};
+use crate::metrics::ServerMetrics;
 use crate::transport::{HttpTransport, ProxyClient, build_client, build_connectors};
 use crate::upstream::{HttpUpstream, WsUpstream};
 
@@ -31,27 +31,24 @@ pub(crate) struct AppState {
     pub(crate) otel_enabled: bool,
     pub(crate) conn_limit: Arc<Semaphore>,
     pub(crate) health: HealthSource,
-    pub(crate) metrics: ProxyMetrics,
-    pub(crate) health_metrics: HealthMetrics,
+    pub(crate) metrics: ServerMetrics,
 }
 
 impl AppState {
     pub(crate) fn new(
         cfg: &Config,
-        validated: ValidatedConfig,
+        upstreams: ValidatedUpstreams,
         otel_enabled: bool,
         health: HealthSource,
+        metrics: ServerMetrics,
     ) -> Result<Self, BoxError> {
-        let ValidatedConfig {
-            listen: _,
+        let ValidatedUpstreams {
             el_http,
             el_ws,
             cl_beacon,
             cl_mev_relay,
             slot_clock,
-            #[cfg(feature = "otel")]
-                otel_endpoint: _,
-        } = validated;
+        } = upstreams;
         let opts = RuntimeOpts::from_config(cfg);
 
         let (https, ws_tls) = build_connectors(el_ws.is_tls());
@@ -92,8 +89,7 @@ impl AppState {
             otel_enabled,
             conn_limit,
             health,
-            metrics: ProxyMetrics::default(),
-            health_metrics: HealthMetrics::default(),
+            metrics,
         })
     }
 }
