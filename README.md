@@ -164,9 +164,12 @@ for `text/event-stream` Beacon event streams.
 
 Shutdown sets one deadline shared by HTTP connections, HTTP/2 request tasks
 and WebSocket relays. Existing work can finish during `--shutdown-grace`; late
-handshakes use the time remaining. At the deadline, pending work is cancelled,
-and the library waits for its futures and sockets to be released before returning,
-including with zero grace or an already completed shutdown future.
+handshakes use the time remaining, and active WebSocket relays continue
+forwarding frames across the grace window before initiating an RFC 6455
+`Close(1001 Going Away)` handshake right ahead of the deadline. At the deadline,
+any remaining work is cancelled, and the library waits for its futures and
+sockets to be released before returning, including with zero grace or an
+already completed shutdown future.
 
 The upstream client auto-negotiates h2 for `https://` upstreams via ALPN. A
 cleartext EL JSON-RPC upstream can't be auto-negotiated, so the health poller

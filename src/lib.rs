@@ -15,8 +15,10 @@ mod metrics;
 #[cfg(feature = "otel")]
 mod otel;
 mod proxy;
+mod response;
 mod rpc;
 mod state;
+mod transport;
 mod upstream;
 mod websocket;
 
@@ -38,10 +40,6 @@ use tokio::sync::{TryAcquireError, watch};
 use tracing::{debug, info, trace, warn};
 
 use crate::state::AppState;
-
-use std::sync::OnceLock;
-pub(crate) static PROMETHEUS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
-    OnceLock::new();
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -151,7 +149,7 @@ where
     let recorder_installed = ::metrics::set_global_recorder(prometheus_recorder).is_ok();
 
     if recorder_installed {
-        let _ = PROMETHEUS_HANDLE.set(prometheus_handle.clone());
+        metrics::install_prometheus_handle(prometheus_handle.clone());
         // The recorder is process-global: only its successful installer starts
         // upkeep, and it remains available across individual run() calls.
         tokio::spawn(async move {
@@ -178,7 +176,7 @@ where
         let (tx, rx) = watch::channel(Arc::new(health::Probe::pending()));
         (Some(tx), health::HealthSource::Polled(rx))
     };
-    let (shutdown_tx, _) = watch::channel(None);
+    let (shutdown_tx, shutdown_rx) = lifecycle::channel();
 
     let state = Arc::new(AppState::new(&cfg, validated, otel_enabled, health)?);
 
@@ -198,7 +196,7 @@ where
             }
             probe = health::probe_once(&state) => Arc::new(probe),
         };
-        let eval = health::evaluate_readiness(&state, &first_probe);
+        let eval = health::evaluate_readiness(&state.cfg, state.slot_clock, &first_probe);
         health::update_metrics(&state, &first_probe, eval);
         initial_degraded = first_probe.has_errors();
         let _ = tx.send(first_probe);
@@ -236,20 +234,20 @@ where
         tokio::spawn(health::poll_loop(
             state.clone(),
             tx,
-            shutdown_tx.subscribe(),
+            shutdown_rx.clone(),
             poll_interval,
         ))
     });
 
     let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let lifecycle = lifecycle::Lifecycle::new(shutdown_tx.subscribe(), conn_tx);
+    let lifecycle = lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
     let accept_handle = tokio::spawn(accept_loop(listeners, state, lifecycle));
 
     shutdown.await;
     info!("shutdown signal received");
 
     let deadline = tokio::time::Instant::now() + shutdown_grace;
-    shutdown_tx.send_replace(Some(deadline));
+    shutdown_tx.send(deadline);
 
     let _ = accept_handle.await;
     if let Some(poller) = poller {
@@ -353,7 +351,7 @@ enum DetectedProto {
 async fn read_initial_preface<I: AsyncRead + Unpin>(
     mut stream: I,
     timeout: Duration,
-    lifecycle: &mut lifecycle::Lifecycle,
+    lifecycle: &lifecycle::Lifecycle,
 ) -> Option<(DetectedProto, PrefixedIo<I>)> {
     let mut buf = [0u8; 64];
     let mut len = 0usize;
@@ -424,17 +422,14 @@ impl ServerBuilders {
 async fn drive_graceful<C>(
     conn: C,
     graceful_shutdown: impl FnOnce(Pin<&mut C>),
-    conn_lifecycle: &mut lifecycle::Lifecycle,
+    conn_lifecycle: &lifecycle::Lifecycle,
     peer: std::net::SocketAddr,
 ) where
     C: Future<Output = hyper::Result<()>>,
 {
     tokio::pin!(conn);
     tokio::select! {
-        res = conn.as_mut() => match res {
-            Ok(()) => trace!(%peer, "connection closed"),
-            Err(e) => debug!(error = %e, %peer, "connection closed"),
-        },
+        biased;
         deadline = conn_lifecycle.deadline() => {
             graceful_shutdown(conn.as_mut());
             match tokio::time::timeout_at(deadline, conn).await {
@@ -443,6 +438,10 @@ async fn drive_graceful<C>(
                 Err(_) => trace!(%peer, "connection drain deadline reached"),
             }
         }
+        res = conn.as_mut() => match res {
+            Ok(()) => trace!(%peer, "connection closed"),
+            Err(e) => debug!(error = %e, %peer, "connection closed"),
+        },
     }
 }
 
@@ -451,7 +450,7 @@ async fn serve_detected<I, B, S>(
     proto: DetectedProto,
     io: TokioIo<PrefixedIo<I>>,
     svc: S,
-    conn_lifecycle: &mut lifecycle::Lifecycle,
+    conn_lifecycle: &lifecycle::Lifecycle,
     peer: std::net::SocketAddr,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -493,13 +492,13 @@ async fn serve_connection(
     stream: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
     state: Arc<AppState>,
-    mut conn_lifecycle: lifecycle::Lifecycle,
+    conn_lifecycle: lifecycle::Lifecycle,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
     builders: Arc<ServerBuilders>,
 ) {
     let _guard = state.metrics.active_tcp();
     let Some((proto, prefixed)) =
-        read_initial_preface(stream, INITIAL_READ_TIMEOUT, &mut conn_lifecycle).await
+        read_initial_preface(stream, INITIAL_READ_TIMEOUT, &conn_lifecycle).await
     else {
         trace!(%peer, "connection closed before protocol preface");
         return;
@@ -512,37 +511,26 @@ async fn serve_connection(
         permit,
     ));
     let svc = service_fn(move |req| Arc::clone(&connection).dispatch(req));
-    serve_detected(&builders, proto, io, svc, &mut conn_lifecycle, peer).await;
-}
-
-pub(crate) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
-    if let Err(e) = stream.set_nodelay(true) {
-        debug!(error = %e, "failed to set TCP_NODELAY");
-    }
-    let sock_ref = socket2::SockRef::from(stream);
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(60))
-        .with_interval(Duration::from_secs(10));
-    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-        debug!(error = %e, "failed to set TCP keepalive");
-    }
+    serve_detected(&builders, proto, io, svc, &conn_lifecycle, peer).await;
 }
 
 async fn accept_loop(
     listeners: Vec<TcpListener>,
     state: Arc<AppState>,
-    mut lifecycle: lifecycle::Lifecycle,
+    lifecycle: lifecycle::Lifecycle,
 ) {
     if listeners.is_empty() {
         return;
     }
     let builders = Arc::new(ServerBuilders::new(lifecycle.clone()));
+    let shutdown = lifecycle.deadline();
+    tokio::pin!(shutdown);
     let mut next_idx = 0usize;
     let mut saturated = false;
     loop {
         let (stream, peer) = tokio::select! {
             biased;
-            _ = lifecycle.deadline() => return,
+            _ = &mut shutdown => return,
             accept = accept_round_robin(&listeners, &mut next_idx) => match accept {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -551,7 +539,7 @@ async fn accept_loop(
                     // doesn't busy-spin a core retrying immediately.
                     tokio::select! {
                         biased;
-                        _ = lifecycle.deadline() => return,
+                        _ = &mut shutdown => return,
                         () = tokio::time::sleep(Duration::from_millis(100)) => continue,
                     }
                 }
@@ -577,7 +565,7 @@ async fn accept_loop(
                 }
                 tokio::select! {
                     biased;
-                    _ = lifecycle.deadline() => return,
+                    _ = &mut shutdown => return,
                     res = state.conn_limit.clone().acquire_owned() => match res {
                         Ok(permit) => Arc::new(permit),
                         Err(_) => return,
@@ -585,7 +573,7 @@ async fn accept_loop(
                 }
             }
         };
-        configure_tcp_stream(&stream);
+        transport::configure_tcp_stream(&stream);
         // Connection lifecycle is fine-grained, high-frequency detail, so
         // it lives at trace (accept/close) and on a dedicated `access_log`
         // target (the negotiated protocol + first request line) rather
@@ -694,15 +682,15 @@ mod tests {
         use std::convert::Infallible;
         use tokio::io::AsyncWriteExt;
 
-        let (_shutdown_tx, shutdown_rx) = watch::channel(None);
+        let (_shutdown_tx, shutdown_rx) = lifecycle::channel();
         let (conn_tx, _conn_rx) = tokio::sync::mpsc::channel(1);
         let lifecycle = lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
 
         // 1. Completely silent 0-byte socket times out at INITIAL_READ_TIMEOUT (15s).
         let (_silent_client, silent_server) = tokio::io::duplex(256);
-        let mut lc1 = lifecycle.clone();
+        let lc1 = lifecycle.clone();
         let silent_task = tokio::spawn(async move {
-            read_initial_preface(silent_server, INITIAL_READ_TIMEOUT, &mut lc1)
+            read_initial_preface(silent_server, INITIAL_READ_TIMEOUT, &lc1)
                 .await
                 .is_none()
         });
@@ -717,9 +705,9 @@ mod tests {
         // hanging forever waiting for the rest of the 24-byte preface.
         let (mut pri_client, pri_server) = tokio::io::duplex(256);
         pri_client.write_all(b"PRI ").await.unwrap();
-        let mut lc2 = lifecycle.clone();
+        let lc2 = lifecycle.clone();
         let pri_task = tokio::spawn(async move {
-            read_initial_preface(pri_server, INITIAL_READ_TIMEOUT, &mut lc2)
+            read_initial_preface(pri_server, INITIAL_READ_TIMEOUT, &lc2)
                 .await
                 .is_none()
         });
@@ -733,8 +721,7 @@ mod tests {
         // 2b. Complete 24-byte HTTP/2 preface is classified as DetectedProto::Http2.
         let (mut h2_client, h2_server) = tokio::io::duplex(256);
         h2_client.write_all(H2_PREFACE).await.unwrap();
-        let mut lc_h2 = lifecycle.clone();
-        let (h2_proto, _) = read_initial_preface(h2_server, INITIAL_READ_TIMEOUT, &mut lc_h2)
+        let (h2_proto, _) = read_initial_preface(h2_server, INITIAL_READ_TIMEOUT, &lifecycle)
             .await
             .expect("HTTP/2 preface");
         assert_eq!(h2_proto, DetectedProto::Http2);
@@ -742,26 +729,18 @@ mod tests {
         // 3. HTTP/1.1 connection completes preface immediately, survives 30s idle (> 15s),
         // and closes after 65s of keep-alive inactivity via `serve_detected`.
         let (mut h1_client, h1_server) = tokio::io::duplex(4096);
-        let mut lc3 = lifecycle.clone();
-        let builders = ServerBuilders::new(lc3.clone());
+        let lc3 = lifecycle.clone();
+        let builders = ServerBuilders::new(lifecycle);
         let peer: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let server_task = tokio::spawn(async move {
-            let (proto, prefixed) = read_initial_preface(h1_server, INITIAL_READ_TIMEOUT, &mut lc3)
+            let (proto, prefixed) = read_initial_preface(h1_server, INITIAL_READ_TIMEOUT, &lc3)
                 .await
                 .expect("HTTP/1.1 preface");
             assert_eq!(proto, DetectedProto::Http1);
             let svc = service_fn(|_req| async {
                 Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
             });
-            serve_detected(
-                &builders,
-                proto,
-                TokioIo::new(prefixed),
-                svc,
-                &mut lc3,
-                peer,
-            )
-            .await;
+            serve_detected(&builders, proto, TokioIo::new(prefixed), svc, &lc3, peer).await;
         });
 
         h1_client

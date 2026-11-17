@@ -430,7 +430,7 @@ mod tests {
         let tcp_guard = ::metrics::with_local_recorder(&recorder, || {
             let tcp = proxy_metrics.active_tcp();
             // Open and immediately drop a WS connection to verify symmetrical +1 / -1.
-            drop(proxy_metrics.active_ws());
+            drop(proxy_metrics.ws_slot().activate());
             health_metrics.record(crate::metrics::HealthSample {
                 el_ok: true,
                 cl_ok: true,
@@ -618,9 +618,9 @@ mod tests {
                 )),
         );
 
-        let (https, _) = crate::proxy::build_connectors(false);
-        let h1_client = crate::proxy::build_client(https.clone());
-        let h2c_client = crate::proxy::build_h2c_client(https);
+        let (https, _) = crate::transport::build_connectors(false);
+        let h1_client = crate::transport::build_client(https.clone());
+        let h2c_client = crate::transport::build_h2c_client(https);
         let uri: http::Uri = format!("http://{addr}/").parse().unwrap();
 
         async {
@@ -628,7 +628,7 @@ mod tests {
                 let req = Request::builder()
                     .method(Method::POST)
                     .uri(uri.clone())
-                    .body(crate::proxy::box_full(Full::new(Bytes::from_static(b"{}"))))
+                    .body(crate::response::full_body(Bytes::from_static(b"{}")))
                     .unwrap();
                 async {
                     let resp = client.request(req).await.unwrap();
