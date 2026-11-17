@@ -431,7 +431,7 @@ Run the longer correctness checks explicitly:
 cargo test --release --locked --lib rpc::tests::prefilter_seeded_stress_matches_full_parser \
   -- --ignored --exact
 ETHONYX_STRESS_SECONDS=60 cargo test --release --locked --test integration \
-  websocket_sustained_churn_preserves_replies_and_releases_upstreams \
+  websocket::websocket_sustained_churn_preserves_replies_and_releases_upstreams \
   -- --ignored --exact --nocapture
 ```
 
