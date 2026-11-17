@@ -318,7 +318,7 @@ pub(crate) fn classify_method(m: &http::Method) -> (Option<usize>, &'static str)
     }
 }
 
-pub(crate) const fn classify_status(status: u16) -> (Option<usize>, &'static str) {
+const fn classify_status(status: u16) -> (Option<usize>, &'static str) {
     match status {
         100 => (None, "100"),
         101 => (Some(0), "101"),
@@ -438,6 +438,39 @@ impl HealthMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Method;
+
+    #[test]
+    fn test_classify_method() {
+        assert_eq!(classify_method(&Method::POST), (Some(0), "POST"));
+        assert_eq!(classify_method(&Method::GET), (Some(1), "GET"));
+        assert_eq!(classify_method(&Method::CONNECT), (Some(2), "CONNECT"));
+        assert_eq!(classify_method(&Method::HEAD), (Some(3), "HEAD"));
+        assert_eq!(
+            classify_method(&Method::from_bytes(b"OPTIONS").unwrap()),
+            (None, "OPTIONS")
+        );
+        assert_eq!(
+            classify_method(&Method::from_bytes(b"PURGE").unwrap()),
+            (None, "OTHER")
+        );
+    }
+
+    #[test]
+    fn test_classify_status() {
+        assert_eq!(classify_status(101), (Some(0), "101"));
+        assert_eq!(classify_status(200), (Some(1), "200"));
+        assert_eq!(classify_status(204), (Some(2), "204"));
+        assert_eq!(classify_status(400), (Some(3), "400"));
+        assert_eq!(classify_status(404), (Some(4), "404"));
+        assert_eq!(classify_status(408), (None, "408"));
+        assert_eq!(classify_status(413), (Some(5), "413"));
+        assert_eq!(classify_status(414), (None, "414"));
+        assert_eq!(classify_status(502), (Some(6), "502"));
+        assert_eq!(classify_status(503), (Some(7), "503"));
+        assert_eq!(classify_status(418), (None, "OTHER"));
+        assert_eq!(classify_status(307), (None, "OTHER"));
+    }
 
     #[test]
     fn server_metrics_instances_are_isolated_across_hot_and_cold_series() {

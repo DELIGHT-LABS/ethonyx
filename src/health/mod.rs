@@ -6,8 +6,8 @@ mod eval;
 mod fetch;
 mod probe;
 
-pub(crate) use eval::{HealthSource, Probe, evaluate_readiness};
-pub(crate) use probe::{poll_loop, probe_once, update_metrics};
+pub(crate) use eval::HealthSource;
+pub(crate) use probe::{HealthPoller, channel};
 
 use std::fmt;
 use std::sync::Arc;
@@ -20,10 +20,8 @@ use crate::config::SlotClock;
 use crate::response::{ResBody, empty_json_response, raw_json_response};
 use crate::state::AppState;
 
-use cl::ClStatus;
-use el::{ElBlockResult, ElSyncingResult};
-use eval::{ClSyncEval, ElSyncEval, FreshEval, ReadinessEval, now_unix};
-use fetch::ProbeError;
+use el::ElSyncingResult;
+use eval::{ClSyncEval, ElSyncEval, FreshEval, Probe, ReadinessEval, evaluate_readiness, now_unix};
 
 const TRUSTED_READY_JSON: &[u8] = br#"{"status":"ready","el_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"},"cl_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"}}"#;
 const TRUSTED_HEALTH_H1_H1: &[u8] =
@@ -203,9 +201,9 @@ impl<'a> ReadyReport<'a> {
 }
 
 /// `/healthz` — verdict-free EL + CL snapshot, **always 200**. Serves the latest
-/// background poll (see [`poll_loop`]); block / slot ages are recomputed live per
-/// request. Under `--trust-upstream`, reports `mode: "trusted"` and omits
-/// unpolled fields instead of fabricating placeholder metrics.
+/// background poll; block / slot ages are recomputed live per request. Under
+/// `--trust-upstream`, reports `mode: "trusted"` and omits unpolled fields
+/// instead of fabricating placeholder metrics.
 pub(crate) fn report(state: &AppState, head: bool) -> Response<ResBody> {
     if head {
         return empty_json_response(StatusCode::OK);
@@ -217,16 +215,9 @@ pub(crate) fn report(state: &AppState, head: bool) -> Response<ResBody> {
             raw_json_response(StatusCode::OK, Bytes::from_static(raw))
         }
         HealthSource::Polled(rx) => {
+            // Clone the `Arc<Probe>` so the `watch::Ref` read lock is released before serialization.
             let probe = Arc::clone(&rx.borrow());
-            let mut snap = build_snapshot(
-                &probe.el_syncing,
-                &probe.el_peers,
-                &probe.el_block,
-                &probe.cl_status,
-                &probe.cl_peers,
-                state.slot_clock,
-                now_unix(),
-            );
+            let mut snap = build_snapshot(&probe, state.slot_clock, now_unix());
             snap.el.transport = state.el.transport.label();
             snap.cl.transport = state.cl.transport.label();
             json_response(StatusCode::OK, &snap)
@@ -266,6 +257,7 @@ pub(crate) fn ready(state: &AppState, head: bool) -> Response<ResBody> {
             empty_json_response(ready_status(ready))
         }
         (HealthSource::Polled(rx), false) => {
+            // Clone the `Arc<Probe>` so the `watch::Ref` read lock is released before serialization.
             let probe = Arc::clone(&rx.borrow());
             let eval = evaluate_readiness(&state.cfg, state.slot_clock, &probe);
             json_response(ready_status(eval.is_ready()), &ReadyReport::from_eval(eval))
@@ -286,25 +278,24 @@ pub(crate) fn node_health(state: &AppState) -> Response<ResBody> {
         HealthSource::Trusted => StatusCode::OK,
         HealthSource::Polled(rx) => {
             let probe = rx.borrow();
-            let eval = evaluate_readiness(&state.cfg, state.slot_clock, &probe);
-            classify_node_health(eval.is_ready(), state.cfg.readyz_strict, &probe)
+            classify_node_health(evaluate_readiness(&state.cfg, state.slot_clock, &probe))
         }
     };
     empty_json_response(code)
 }
 
-const fn classify_node_health(ready: bool, readyz_strict: bool, probe: &Probe) -> StatusCode {
-    if ready {
+const fn classify_node_health(eval: ReadinessEval<'_>) -> StatusCode {
+    if eval.is_ready() {
         return StatusCode::OK;
     }
     let el_is_syncing = matches!(
-        probe.el_syncing,
-        Ok(ElSyncingResult::Synced(true) | ElSyncingResult::Syncing { .. })
+        eval.el_sync,
+        ElSyncEval::SyncingBool | ElSyncEval::SyncingProgress { .. }
     );
-    let cl_is_syncing = matches!(&probe.cl_status, Ok(s) if s.is_syncing);
-    let both_reachable = probe.el_syncing.is_ok()
-        && probe.cl_status.is_ok()
-        && (!readyz_strict || probe.el_block.is_ok());
+    let cl_is_syncing = matches!(eval.cl_sync, ClSyncEval::Syncing { .. });
+    let both_reachable = !matches!(eval.el_sync, ElSyncEval::Err(_))
+        && !matches!(eval.cl_sync, ClSyncEval::Err(_))
+        && !matches!(eval.strict, Some((FreshEval::Err { .. }, _)));
     if both_reachable && (el_is_syncing || cl_is_syncing) {
         StatusCode::PARTIAL_CONTENT
     } else {
@@ -325,17 +316,9 @@ fn json_response<T: Serialize>(code: StatusCode, body: &T) -> Response<ResBody> 
 /// Fold the five upstream probe results into a numeric snapshot. Successful
 /// signals populate their fields; failed ones are pushed onto the layer's
 /// `errors` and leave the field unset.
-fn build_snapshot<'a>(
-    sync_r: &'a Result<ElSyncingResult, ProbeError>,
-    peers_r: &'a Result<u64, ProbeError>,
-    block_r: &'a Result<ElBlockResult, ProbeError>,
-    cl_status_r: &'a Result<ClStatus, ProbeError>,
-    cl_peers_r: &'a Result<u64, ProbeError>,
-    slot_clock: Option<SlotClock>,
-    now: u64,
-) -> HealthSnapshot<'a> {
+fn build_snapshot(probe: &Probe, slot_clock: Option<SlotClock>, now: u64) -> HealthSnapshot<'_> {
     let mut el = ElHealth::default();
-    match sync_r {
+    match &probe.el_syncing {
         Ok(ElSyncingResult::Synced(false)) => el.syncing = Some(false),
         Ok(ElSyncingResult::Synced(true)) => el.syncing = Some(true),
         Ok(ElSyncingResult::Syncing {
@@ -347,11 +330,11 @@ fn build_snapshot<'a>(
         }
         Err(e) => el.errors.push("eth_syncing", e),
     }
-    match peers_r {
+    match &probe.el_peers {
         Ok(n) => el.peers = Some(*n),
         Err(e) => el.errors.push("net_peerCount", e),
     }
-    match block_r {
+    match &probe.el_block {
         Ok(block) => {
             el.block_number = Some(block.number);
             el.block_age_secs = Some(now.saturating_sub(block.timestamp));
@@ -360,7 +343,7 @@ fn build_snapshot<'a>(
     }
 
     let mut cl = ClHealth::default();
-    match cl_status_r {
+    match &probe.cl_status {
         Ok(s) => {
             cl.syncing = Some(s.is_syncing);
             cl.sync_distance = Some(s.sync_distance);
@@ -369,7 +352,7 @@ fn build_snapshot<'a>(
         }
         Err(e) => cl.errors.push("node/syncing", e),
     }
-    match cl_peers_r {
+    match &probe.cl_peers {
         Ok(n) => cl.peers = Some(*n),
         Err(e) => cl.errors.push("node/peer_count", e),
     }
@@ -383,26 +366,27 @@ fn build_snapshot<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::cl::ClStatus;
+    use super::el::ElBlockResult;
     use super::*;
 
     #[test]
     fn snapshot_reports_numeric_values_when_healthy() {
-        let snap = build_snapshot(
-            &Ok(ElSyncingResult::Synced(false)),
-            &Ok(0x10),
-            &Ok(ElBlockResult {
+        let probe = Probe {
+            el_syncing: Ok(ElSyncingResult::Synced(false)),
+            el_peers: Ok(0x10),
+            el_block: Ok(ElBlockResult {
                 number: 5,
                 timestamp: 0x3e2,
             }),
-            &Ok(ClStatus {
+            cl_status: Ok(ClStatus {
                 head_slot: 10,
                 sync_distance: 0,
                 is_syncing: false,
             }),
-            &Ok(64u64),
-            SlotClock::new(1000, 12),
-            1300,
-        );
+            cl_peers: Ok(64),
+        };
+        let snap = build_snapshot(&probe, SlotClock::new(1000, 12), 1300);
         assert_eq!(snap.el.syncing, Some(false));
         assert_eq!(snap.el.peers, Some(16));
         assert_eq!(snap.el.block_number, Some(5));
@@ -417,12 +401,14 @@ mod tests {
 
     #[test]
     fn snapshot_records_errors_and_omits_values_on_failure() {
-        let r1 = Err("timeout".into());
-        let r2 = Err("http 500".into());
-        let r3 = Err("timeout".into());
-        let r4 = Err("http 404".into());
-        let r5 = Err("http 404".into());
-        let snap = build_snapshot(&r1, &r2, &r3, &r4, &r5, SlotClock::new(1000, 12), 1300);
+        let probe = Probe {
+            el_syncing: Err("timeout".into()),
+            el_peers: Err("http 500".into()),
+            el_block: Err("timeout".into()),
+            cl_status: Err("http 404".into()),
+            cl_peers: Err("http 404".into()),
+        };
+        let snap = build_snapshot(&probe, SlotClock::new(1000, 12), 1300);
         assert_eq!(snap.el.syncing, None);
         assert_eq!(snap.el.peers, None);
         assert_eq!(snap.el.block_number, None);
@@ -454,43 +440,38 @@ mod tests {
 
     #[test]
     fn snapshot_reports_el_sync_distance_while_syncing() {
-        let skip_u64 = Err("skip".into());
-        let skip_blk = Err("skip".into());
-        let skip_cl = Err("skip".into());
-        let snap = build_snapshot(
-            &Ok(ElSyncingResult::Syncing {
+        let probe = Probe {
+            el_syncing: Ok(ElSyncingResult::Syncing {
                 current_block: 0x10,
                 highest_block: 0x20,
             }),
-            &skip_u64,
-            &skip_blk,
-            &skip_cl,
-            &skip_u64,
-            SlotClock::new(0, 12),
-            1300,
-        );
+            el_peers: Err("skip".into()),
+            el_block: Err("skip".into()),
+            cl_status: Err("skip".into()),
+            cl_peers: Err("skip".into()),
+        };
+        let snap = build_snapshot(&probe, SlotClock::new(0, 12), 1300);
         assert_eq!(snap.el.syncing, Some(true));
         assert_eq!(snap.el.sync_distance, Some(16));
     }
 
     #[test]
     fn snapshot_omits_cl_slot_age_when_genesis_disabled() {
-        let snap = build_snapshot(
-            &Ok(ElSyncingResult::Synced(false)),
-            &Ok(0x10),
-            &Ok(ElBlockResult {
+        let probe = Probe {
+            el_syncing: Ok(ElSyncingResult::Synced(false)),
+            el_peers: Ok(0x10),
+            el_block: Ok(ElBlockResult {
                 number: 5,
                 timestamp: 0x3e2,
             }),
-            &Ok(ClStatus {
+            cl_status: Ok(ClStatus {
                 head_slot: 10,
                 sync_distance: 0,
                 is_syncing: false,
             }),
-            &Ok(64u64),
-            SlotClock::new(0, 12),
-            1300,
-        );
+            cl_peers: Ok(64),
+        };
+        let snap = build_snapshot(&probe, SlotClock::new(0, 12), 1300);
         assert_eq!(snap.cl.head_slot, Some(10));
         assert_eq!(snap.cl.slot_age_secs, None);
     }
@@ -534,6 +515,15 @@ mod tests {
 
     #[test]
     fn node_health_returns_206_only_when_both_layers_reachable_and_syncing() {
+        use clap::Parser;
+
+        let default_opts =
+            crate::config::RuntimeOpts::from_config(&crate::Config::parse_from(["ethonyx"]));
+        let strict_opts = crate::config::RuntimeOpts {
+            readyz_strict: true,
+            ..default_opts
+        };
+
         let synced_el = ElSyncingResult::Synced(false);
         let syncing_el = ElSyncingResult::Syncing {
             current_block: 10,
@@ -549,38 +539,55 @@ mod tests {
             sync_distance: 50,
             is_syncing: true,
         };
-        let ok_block = ElBlockResult {
+        let fresh_block = ElBlockResult {
+            number: 10,
+            timestamp: u64::MAX,
+        };
+        let stale_block = ElBlockResult {
             number: 10,
             timestamp: 1000,
         };
 
-        // 1. Ready -> 200 OK
+        // 1. Ready -> 200 OK (default and strict with fresh block)
         let ready_probe = Probe {
             el_syncing: Ok(synced_el),
             el_peers: Ok(10),
-            el_block: Ok(ok_block),
+            el_block: Ok(fresh_block),
             cl_status: Ok(synced_cl),
             cl_peers: Ok(10),
         };
         assert_eq!(
-            classify_node_health(true, false, &ready_probe),
+            classify_node_health(evaluate_readiness(&default_opts, None, &ready_probe)),
+            StatusCode::OK
+        );
+        assert_eq!(
+            classify_node_health(evaluate_readiness(&strict_opts, None, &ready_probe)),
             StatusCode::OK
         );
 
-        // 2. EL syncing + CL reachable -> 206 Partial Content
+        // 2. EL syncing + CL reachable -> 206 Partial Content (even when block is stale under --readyz-strict)
         let el_sync_probe = Probe {
             el_syncing: Ok(syncing_el),
             el_peers: Ok(10),
-            el_block: Ok(ok_block),
+            el_block: Ok(stale_block),
             cl_status: Ok(synced_cl),
             cl_peers: Ok(10),
         };
         assert_eq!(
-            classify_node_health(false, false, &el_sync_probe),
+            classify_node_health(evaluate_readiness(&default_opts, None, &el_sync_probe)),
             StatusCode::PARTIAL_CONTENT
         );
         assert_eq!(
-            classify_node_health(false, true, &el_sync_probe),
+            classify_node_health(evaluate_readiness(&strict_opts, None, &el_sync_probe)),
+            StatusCode::PARTIAL_CONTENT
+        );
+
+        let el_sync_bool_probe = Probe {
+            el_syncing: Ok(ElSyncingResult::Synced(true)),
+            ..el_sync_probe
+        };
+        assert_eq!(
+            classify_node_health(evaluate_readiness(&default_opts, None, &el_sync_bool_probe)),
             StatusCode::PARTIAL_CONTENT
         );
 
@@ -588,12 +595,12 @@ mod tests {
         let cl_down_probe = Probe {
             el_syncing: Ok(syncing_el),
             el_peers: Ok(10),
-            el_block: Ok(ok_block),
+            el_block: Ok(stale_block),
             cl_status: Err("connection refused".into()),
             cl_peers: Err("connection refused".into()),
         };
         assert_eq!(
-            classify_node_health(false, false, &cl_down_probe),
+            classify_node_health(evaluate_readiness(&default_opts, None, &cl_down_probe)),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
@@ -606,20 +613,24 @@ mod tests {
             cl_peers: Ok(10),
         };
         assert_eq!(
-            classify_node_health(false, false, &el_down_probe),
+            classify_node_health(evaluate_readiness(&default_opts, None, &el_down_probe)),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
-        // 5. CL syncing + EL reachable under --readyz-strict, unless EL block RPC itself failed
+        // 5. CL syncing + EL reachable under --readyz-strict -> 206, unless EL block RPC itself failed -> 503
         let cl_sync_probe = Probe {
             el_syncing: Ok(synced_el),
             el_peers: Ok(10),
-            el_block: Ok(ok_block),
+            el_block: Ok(stale_block),
             cl_status: Ok(syncing_cl),
             cl_peers: Ok(10),
         };
         assert_eq!(
-            classify_node_health(false, true, &cl_sync_probe),
+            classify_node_health(evaluate_readiness(
+                &strict_opts,
+                SlotClock::new(1000, 12),
+                &cl_sync_probe
+            )),
             StatusCode::PARTIAL_CONTENT
         );
         let strict_block_err_probe = Probe {
@@ -627,7 +638,11 @@ mod tests {
             ..cl_sync_probe
         };
         assert_eq!(
-            classify_node_health(false, true, &strict_block_err_probe),
+            classify_node_health(evaluate_readiness(
+                &strict_opts,
+                None,
+                &strict_block_err_probe
+            )),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
@@ -635,12 +650,12 @@ mod tests {
         let strict_stale_probe = Probe {
             el_syncing: Ok(synced_el),
             el_peers: Ok(10),
-            el_block: Ok(ok_block),
+            el_block: Ok(stale_block),
             cl_status: Ok(synced_cl),
             cl_peers: Ok(10),
         };
         assert_eq!(
-            classify_node_health(false, true, &strict_stale_probe),
+            classify_node_health(evaluate_readiness(&strict_opts, None, &strict_stale_probe)),
             StatusCode::SERVICE_UNAVAILABLE
         );
     }

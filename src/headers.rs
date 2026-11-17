@@ -96,14 +96,15 @@ pub(crate) fn sanitize_response_headers(status: StatusCode, headers: &mut Header
     }
 }
 
-#[cfg(feature = "otel")]
-pub(crate) fn is_connection_nominated(headers: &HeaderMap, target: &str) -> bool {
-    let target = target.as_bytes();
+/// Return `true` if any field line for `name` contains the comma-separated
+/// ASCII case-insensitive `token` (ignoring surrounding ASCII whitespace).
+pub(crate) fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
+    let token = token.as_bytes();
     headers
-        .get_all(CONNECTION)
+        .get_all(name)
         .iter()
         .flat_map(|value| value.as_bytes().split(|&b| b == b','))
-        .any(|token| token.trim_ascii().eq_ignore_ascii_case(target))
+        .any(|part| part.trim_ascii().eq_ignore_ascii_case(token))
 }
 
 fn remove_connection_nominated(headers: &mut HeaderMap) {
@@ -307,5 +308,22 @@ mod tests {
             sanitize_response_headers(StatusCode::OK, &mut m);
             assert!(!m.contains_key("content-length"), "bad={bad:?}");
         }
+    }
+
+    #[test]
+    fn matches_comma_separated_header_tokens_case_insensitively() {
+        let mut m = h(&[
+            ("connection", "keep-alive, , \tUpGrAdE "),
+            ("upgrade", "h2c"),
+        ]);
+        m.append(
+            UPGRADE,
+            HeaderValue::from_bytes(b"\xff, WebSocket").unwrap(),
+        );
+        assert!(header_has_token(&m, CONNECTION, "upgrade"));
+        assert!(header_has_token(&m, CONNECTION, "KEEP-ALIVE"));
+        assert!(header_has_token(&m, UPGRADE, "websocket"));
+        assert!(!header_has_token(&m, CONNECTION, "up"));
+        assert!(!header_has_token(&m, CONNECTION, "traceparent"));
     }
 }
