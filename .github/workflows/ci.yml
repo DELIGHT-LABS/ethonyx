@@ -59,7 +59,7 @@ jobs:
           ETHONYX_STRESS_SECONDS: "5"
         run: >-
           cargo test --locked --test integration
-          websocket_sustained_churn_preserves_replies_and_releases_upstreams
+          websocket::websocket_sustained_churn_preserves_replies_and_releases_upstreams
           -- --ignored --exact --nocapture
 
       - name: Release archive verifier tests

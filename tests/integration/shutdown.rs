@@ -1,0 +1,423 @@
+//! Graceful shutdown, drain-deadline propagation, pre-bind cancellation, and WebSocket `GoingAway` tests.
+
+use super::*;
+use ethonyx::run;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+#[tokio::test]
+async fn shutdown_releases_upgraded_websocket_connections() {
+    let upstream = ws_echo_upstream().await;
+    for mocking in ["false", "true"] {
+        let proxy = EthonyxHandle::start(&[
+            "--trust-upstream",
+            "--mock-eth-syncing",
+            mocking,
+            "--el-ws-url",
+            &upstream,
+        ])
+        .await;
+        let (mut ws_h1, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+            .await
+            .unwrap();
+        let (mut ws_h2, sender, h2_driver) = proxy.connect_h2_ws("/").await;
+        ws_h1
+            .send(Message::Text("established".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            ws_h1.next().await.unwrap().unwrap(),
+            Message::Text("established".into())
+        );
+        ws_h2
+            .send(Message::Text("established-h2".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            ws_h2.next().await.unwrap().unwrap(),
+            Message::Text("established-h2".into())
+        );
+        // Zero-grace shutdown must exit promptly without blocking on WS_CLOSE_GRACE (1s).
+        tokio::time::timeout(Duration::from_millis(500), proxy.shutdown())
+            .await
+            .expect("zero-grace shutdown must not block on WS_CLOSE_GRACE");
+        for closed in [
+            tokio::time::timeout(Duration::from_secs(1), ws_h1.next())
+                .await
+                .expect("an upgraded H1 socket must not outlive zero-grace shutdown"),
+            tokio::time::timeout(Duration::from_secs(1), ws_h2.next())
+                .await
+                .expect("an upgraded H2 stream must not outlive zero-grace shutdown"),
+        ] {
+            assert!(matches!(
+                closed,
+                None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+            ));
+        }
+        drop(sender);
+        h2_driver.abort();
+        let _ = h2_driver.await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_websocket_peer_close() {
+    let upstream = ws_echo_upstream().await;
+    let mut proxy = EthonyxHandle::start_with_grace(
+        &["--trust-upstream", "--el-ws-url", &upstream],
+        Duration::from_secs(3),
+    )
+    .await;
+    let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .unwrap();
+    ws.send(Message::Text("established".into())).await.unwrap();
+    let _ = ws.next().await.unwrap().unwrap();
+    proxy.shutdown.take().unwrap().send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !proxy.task.as_ref().unwrap().is_finished(),
+        "the active relay must remain tracked while draining"
+    );
+    ws.close(None).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(1), ws.next())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), proxy.shutdown())
+        .await
+        .expect("peer close should release the drain guard before its deadline");
+}
+
+#[tokio::test]
+async fn shutdown_bounds_an_unresponsive_websocket_peer() {
+    let upstream = ws_echo_upstream().await;
+    let proxy = EthonyxHandle::start_with_grace(
+        &["--trust-upstream", "--el-ws-url", &upstream],
+        Duration::from_secs(1),
+    )
+    .await;
+    let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .unwrap();
+    ws.send(Message::Text("established".into())).await.unwrap();
+    let _ = ws.next().await.unwrap().unwrap();
+    let start = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(3), proxy.shutdown())
+        .await
+        .unwrap();
+    assert!(
+        start.elapsed() >= Duration::from_millis(800),
+        "the relay should receive its configured grace period"
+    );
+    let closed = tokio::time::timeout(Duration::from_secs(1), ws.next())
+        .await
+        .unwrap();
+    assert!(matches!(
+        closed,
+        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+    ));
+}
+
+#[tokio::test]
+async fn shutdown_releases_a_stalled_http_response_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let (closed_tx, closed_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buffer = [0; 1024];
+        while !head.windows(4).any(|part| part == b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(count, 0);
+            head.extend_from_slice(&buffer[..count]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nprefix")
+            .await
+            .unwrap();
+        let end = socket.read(&mut buffer).await;
+        assert!(matches!(end, Ok(0) | Err(_)), "{end:?}");
+        let _ = closed_tx.send(());
+    });
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--cl-beacon-url", &upstream]).await;
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    socket
+        .write_all(b"GET /eth/stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    let mut buffer = [0; 1024];
+    while !response.ends_with(b"prefix") {
+        let count = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(count, 0);
+        response.extend_from_slice(&buffer[..count]);
+    }
+    proxy.shutdown().await;
+    let end = tokio::time::timeout(Duration::from_secs(1), socket.read(&mut buffer))
+        .await
+        .expect("zero-grace shutdown must release the downstream body");
+    assert!(matches!(end, Ok(0) | Err(_)), "{end:?}");
+    tokio::time::timeout(Duration::from_secs(1), closed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_already_ready_does_not_wait_for_a_new_watch_event() {
+    let make_cfg = || {
+        Config::parse_from([
+            "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
+            "--trust-upstream",
+            "--shutdown-grace",
+            "0",
+        ])
+    };
+    let bound = Prepared::new(make_cfg())
+        .await
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), bound.serve(async {}))
+        .await
+        .expect("an already completed shutdown must stop Bound::serve and the accept loop")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), run(make_cfg(), async {}))
+        .await
+        .expect("an already completed shutdown must cancel Prepared::run before binding")
+        .unwrap();
+}
+
+async fn shutdown_during_h2_ws_handshake(complete_handshake: bool, grace: Duration) {
+    use tokio::io::AsyncReadExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (dial_tx, dial_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let (closed_tx, closed_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        dial_tx.send(()).unwrap();
+        if complete_handshake {
+            release_rx.await.unwrap();
+            let mut ws = accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                if ws.send(message).await.is_err() {
+                    break;
+                }
+            }
+        } else {
+            // Read the pending handshake, then observe cancellation of its dial.
+            let mut buffer = [0; 4096];
+            while let Ok(n) = socket.read(&mut buffer).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        let _ = closed_tx.send(());
+    });
+    let mut proxy =
+        EthonyxHandle::start_with_grace(&["--trust-upstream", "--el-ws-url", &url], grace).await;
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, TestBody>(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let driver = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let mut req = Request::builder()
+        .method(Method::CONNECT)
+        .uri(proxy.url("/"))
+        .header("sec-websocket-version", "13")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let request = tokio::spawn(async move { sender.send_request(req).await });
+    tokio::time::timeout(Duration::from_secs(2), dial_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    proxy.shutdown.take().unwrap().send(()).unwrap();
+    let mut downstream = None;
+    if complete_handshake {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        release_tx.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        downstream = Some(hyper::upgrade::on(response).await.unwrap());
+    } else {
+        drop(release_tx);
+        // The shutdown barrier must not depend on the client dropping this request.
+        drop(request);
+    }
+    tokio::time::timeout(grace + Duration::from_secs(1), proxy.shutdown())
+        .await
+        .expect("the shared deadline must also cancel pending HTTP/2 request tasks");
+    assert!(started.elapsed() < grace + Duration::from_millis(500));
+    tokio::time::timeout(Duration::from_millis(200), closed_rx)
+        .await
+        .expect("upstream must be released when run returns, not after a new grace period")
+        .unwrap();
+    server.await.unwrap();
+    drop(downstream);
+    driver.abort();
+    let _ = driver.await;
+}
+
+#[tokio::test]
+async fn shutdown_late_websocket_relay_keeps_the_original_deadline() {
+    shutdown_during_h2_ws_handshake(true, Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn shutdown_cancels_pending_http2_websocket_handshakes() {
+    for grace in [Duration::ZERO, Duration::from_secs(1)] {
+        shutdown_during_h2_ws_handshake(false, grace).await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_during_initial_health_probe_exits_promptly_without_binding_listener() {
+    use clap::Parser;
+
+    // Hanging EL + CL TCP listeners that accept and never reply for 30s.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hang_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+
+    let cfg = ethonyx::Config::parse_from([
+        "ethonyx",
+        "--listen",
+        "127.0.0.1:0",
+        "--health-timeout",
+        "30",
+        "--el-http-url",
+        &hang_url,
+        "--cl-beacon-url",
+        &hang_url,
+    ]);
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let run_task = tokio::spawn(async move {
+        ethonyx::run(cfg, async move {
+            let _ = stop_rx.await;
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let _ = stop_tx.send(());
+
+    let res = tokio::time::timeout(Duration::from_secs(1), run_task)
+        .await
+        .expect("shutdown during initial health probe must return within 1s")
+        .unwrap();
+    assert!(res.is_ok());
+    server.abort();
+}
+
+#[tokio::test]
+async fn shutdown_sends_going_away_close_frame_to_active_h1_and_h2_websockets() {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let upstream = ws_echo_upstream().await;
+    let mut proxy = EthonyxHandle::start_with_grace(
+        &["--trust-upstream", "--el-ws-url", &upstream],
+        Duration::from_secs(1),
+    )
+    .await;
+
+    // 1. HTTP/1.1 Upgrade WebSocket subscriber.
+    let (mut ws_h1, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .unwrap();
+
+    // 2. HTTP/2 Extended CONNECT WebSocket subscriber.
+    let (mut ws_h2, sender, h2_driver) = proxy.connect_h2_ws("/").await;
+
+    let started = tokio::time::Instant::now();
+    proxy.shutdown.take().unwrap().send(()).unwrap();
+
+    // Both H1 and H2 relays remain fully operational during the drain window.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ws_h1
+        .send(Message::Text("mid-drain-h1".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ws_h1.next().await.unwrap().unwrap(),
+        Message::Text("mid-drain-h1".into())
+    );
+    ws_h2
+        .send(Message::Text("mid-drain-h2".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ws_h2.next().await.unwrap().unwrap(),
+        Message::Text("mid-drain-h2".into())
+    );
+
+    async fn read_going_away<S>(mut ws: tokio_tungstenite::WebSocketStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("Close frame before timeout")
+            .expect("stream item")
+            .expect("clean Close frame without reset");
+        let Message::Close(Some(frame)) = msg else {
+            panic!("expected Close(Some(..)), got {msg:?}");
+        };
+        assert_eq!(frame.code, CloseCode::Away);
+        assert_eq!(frame.reason.as_str(), "server shutting down");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), ws.next())
+                .await
+                .expect("EOF after Close handshake")
+                .is_none(),
+            "peer must observe clean EOF after Close handshake"
+        );
+    }
+
+    let ((), (), ()) = tokio::join!(
+        read_going_away(ws_h1),
+        read_going_away(ws_h2),
+        proxy.shutdown(),
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(800)
+            && started.elapsed() < Duration::from_millis(3000),
+        "active relays should close just before grace expiry (elapsed = {:?})",
+        started.elapsed()
+    );
+
+    drop(sender);
+    h2_driver.abort();
+    let _ = h2_driver.await;
+}
