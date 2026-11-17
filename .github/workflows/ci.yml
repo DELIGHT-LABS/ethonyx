@@ -20,9 +20,6 @@ jobs:
   build:
     name: Build & test (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    env:
-      # Integration tests release selected TCP ports before proxy startup.
-      RUST_TEST_THREADS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -187,9 +184,6 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
-    env:
-      # Coverage runs the same integration tests as the build jobs.
-      RUST_TEST_THREADS: "1"
     timeout-minutes: 30
     steps:
       - name: Checkout

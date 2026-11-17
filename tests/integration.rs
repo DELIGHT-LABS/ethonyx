@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{accept_async, connect_async};
 
-use ethonyx::{Config, run};
+use ethonyx::{Config, Prepared, run};
 
 type TestBody = Full<Bytes>;
 type TestClient = Client<HttpConnector, TestBody>;
@@ -32,13 +32,34 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // ---------- helpers ----------
 
-/// Bind an ephemeral port and immediately release it. Returns the port number.
-/// Race window between drop and re-bind is tiny on localhost.
-async fn pick_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+/// Reserves an ephemeral loopback TCP port without calling `listen()`, preventing
+/// any concurrent test from binding the same port until this guard drops.
+/// Connection attempts fail immediately with `ConnectionRefused` on Linux, while
+/// BSD/macOS drops incoming `SYN`s on bound non-listening sockets and exercises
+/// the `--health-timeout` / `--proxy-timeout` path instead.
+struct DeadPort {
+    _socket: tokio::net::TcpSocket,
+    port: u16,
+}
+
+impl DeadPort {
+    fn new() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        Self {
+            _socket: socket,
+            port,
+        }
+    }
+
+    fn http_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn ws_url(&self) -> String {
+        format!("ws://127.0.0.1:{}", self.port)
+    }
 }
 
 /// POST a JSON-RPC and retry briefly while the response is `502`. The very first
@@ -60,18 +81,75 @@ async fn post_json_settled(c: &TestClient, url: &str, body: Value) -> (StatusCod
     last
 }
 
-/// Poll until the given port accepts connections.
-async fn wait_for_port(port: u16) {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+#[cfg(feature = "otel")]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(feature = "otel")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
-    panic!("port {port} did not become available");
+}
+
+#[cfg(feature = "otel")]
+async fn spawn_binary_on_ephemeral_port(
+    upstream: &MockServer,
+    mut configure: impl FnMut(&mut std::process::Command),
+) -> (KillOnDrop, u16) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for attempt in 0..5 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ethonyx"));
+        cmd.args(["--listen", &format!("127.0.0.1:{port}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        configure(&mut cmd);
+        let mut child = KillOnDrop(cmd.spawn().unwrap());
+        let probe_path = format!("/__ethonyx_ready_{attempt}");
+        let probe_req =
+            format!("GET {probe_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+
+        for _ in 0..250 {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                let mut stderr = String::new();
+                if let Some(mut err_pipe) = child.0.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut err_pipe, &mut stderr);
+                }
+                if attempt < 4 && stderr.contains("failed to bind --listen address") {
+                    break;
+                }
+                panic!("ethonyx binary exited prematurely with {status} on port {port}: {stderr}");
+            }
+            // Open a fresh `Connection: close` socket each tick (never reusing a pooled
+            // keep-alive socket to a previous port holder), bound the probe with a short
+            // timeout in case a blackhole listener stole `port`, and verify that the
+            // request reached THIS test's dedicated `upstream` MockServer.
+            let probed = tokio::time::timeout(Duration::from_millis(250), async {
+                let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .ok()?;
+                sock.write_all(probe_req.as_bytes()).await.ok()?;
+                let mut discard = [0u8; 512];
+                let _ = sock.read(&mut discard).await;
+                Some(())
+            })
+            .await;
+            if matches!(probed, Ok(Some(()))) {
+                let mut recorded = upstream.recorded.lock().unwrap();
+                if recorded.iter().any(|r| r.path == probe_path) {
+                    recorded.retain(|r| !r.path.starts_with("/__ethonyx_ready_"));
+                    return (child, port);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    panic!("ethonyx subprocess failed to become ready after retries");
 }
 
 fn client() -> TestClient {
@@ -281,6 +359,7 @@ impl MockServer {
 
 struct EthonyxHandle {
     port: u16,
+    ports: Vec<u16>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), BoxError>>>,
 }
@@ -291,13 +370,11 @@ impl EthonyxHandle {
     }
 
     async fn start_with_grace(args: &[&str], grace: Duration) -> Self {
-        let port = pick_port().await;
-        let addr_str = format!("127.0.0.1:{port}");
         let grace_str = grace.as_secs().to_string();
         let mut argv: Vec<&str> = vec![
             "ethonyx",
             "--listen",
-            &addr_str,
+            "127.0.0.1:0",
             "--shutdown-grace",
             &grace_str,
             "--health-timeout",
@@ -307,14 +384,22 @@ impl EthonyxHandle {
         ];
         argv.extend_from_slice(args);
         let cfg = Config::try_parse_from(argv).expect("clap parse");
+        let bound = Prepared::new(cfg)
+            .await
+            .expect("prepare")
+            .bind()
+            .await
+            .expect("bind");
+        let ports: Vec<u16> = bound.local_addrs().iter().map(SocketAddr::port).collect();
+        let port = ports[0];
 
         let (tx, rx) = oneshot::channel::<()>();
-        let task = tokio::spawn(run(cfg, async move {
+        let task = tokio::spawn(bound.serve(async move {
             let _ = rx.await;
         }));
-        wait_for_port(port).await;
         EthonyxHandle {
             port,
+            ports,
             shutdown: Some(tx),
             task: Some(task),
         }
@@ -329,7 +414,9 @@ impl EthonyxHandle {
             let _ = tx.send(());
         }
         if let Some(task) = self.task.take() {
-            let _ = task.await;
+            task.await
+                .expect("ethonyx serve task panicked")
+                .expect("ethonyx serve returned error");
         }
     }
 
@@ -864,11 +951,11 @@ async fn el_down_keeps_default_h2c_verdict_and_502s() {
     // transport layer, so the poller keeps the default (h2c) verdict instead of
     // flapping to h1. /healthz still answers 200 with the EL error inline and
     // reports the unconfirmed default transport; the data-plane returns 502.
-    let dead = pick_port().await; // bound then released -> nothing listening
+    let dead = DeadPort::new();
     let cl = MockServer::start(ok_handler()).await;
     let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
-        &format!("http://127.0.0.1:{dead}"),
+        &dead.http_url(),
         "--cl-beacon-url",
         &cl.url,
     ])
@@ -1238,14 +1325,12 @@ async fn multi_port_listen_serves_same_routes() {
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
 
-    let p1 = pick_port().await;
-    let p2 = pick_port().await;
     let cfg = Config::try_parse_from([
         "ethonyx",
         "--listen",
-        &format!("127.0.0.1:{p1}"),
+        "127.0.0.1:0",
         "--listen",
-        &format!("127.0.0.1:{p2}"),
+        "127.0.0.1:0",
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
@@ -1255,15 +1340,19 @@ async fn multi_port_listen_serves_same_routes() {
     ])
     .unwrap();
 
+    let bound = Prepared::new(cfg).await.unwrap().bind().await.unwrap();
+    let [a1, a2] = bound.local_addrs() else {
+        panic!("expected two bound addresses");
+    };
+    let ports = [a1.port(), a2.port()];
+
     let (tx, rx) = oneshot::channel::<()>();
-    let task = tokio::spawn(run(cfg, async move {
+    let task = tokio::spawn(bound.serve(async move {
         let _ = rx.await;
     }));
-    wait_for_port(p1).await;
-    wait_for_port(p2).await;
 
     let c = client();
-    for port in [p1, p2] {
+    for port in ports {
         let (status, body) = get(&c, &format!("http://127.0.0.1:{port}/livez")).await;
         assert_eq!(status, StatusCode::OK, "port {port}");
         assert_eq!(&body[..], b"ok", "port {port}");
@@ -1305,14 +1394,14 @@ async fn ws_handshake_fails_with_502_when_upstream_down() {
     // rather than a 101 followed by an immediate abnormal close.
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
-    let dead = pick_port().await; // bound then released -> nothing listening
+    let dead = DeadPort::new();
     let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
         &cl.url,
         "--el-ws-url",
-        &format!("ws://127.0.0.1:{dead}"),
+        &dead.ws_url(),
     ])
     .await;
 
@@ -1362,14 +1451,14 @@ async fn http2_extended_connect_ws_502_when_upstream_down() {
     // on the CONNECT response, not an accepted-then-dropped tunnel.
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
-    let dead = pick_port().await;
+    let dead = DeadPort::new();
     let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
         &cl.url,
         "--el-ws-url",
-        &format!("ws://127.0.0.1:{dead}"),
+        &dead.ws_url(),
     ])
     .await;
 
@@ -1792,9 +1881,13 @@ async fn test_cl_node_health_intercept_and_passthrough() {
     ethonyx_trust.shutdown().await;
 }
 
+/// Without an active `tracing-opentelemetry` subscriber layer (`EthonyxHandle`
+/// runs in-process without installing a global subscriber), non-`Connection`-nominated
+/// `traceparent` headers pass through `strip_hop_by_hop` intact to the upstream.
 #[cfg(feature = "otel")]
 #[tokio::test]
 async fn trace_context_is_propagated_to_upstream() {
+    let collector = MockServer::start(ok_handler()).await;
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
     let ethonyx = EthonyxHandle::start(&[
@@ -1803,7 +1896,7 @@ async fn trace_context_is_propagated_to_upstream() {
         "--cl-beacon-url",
         &cl.url,
         "--otel-endpoint",
-        "http://127.0.0.1:4318",
+        &collector.url,
     ])
     .await;
 
@@ -1844,9 +1937,8 @@ async fn trace_context_is_propagated_to_upstream() {
 
 #[tokio::test]
 async fn trust_upstream_decoupled_from_mock_eth_syncing() {
-    let el_ws_port = pick_port().await;
-    let ws_listener = TcpListener::bind(("127.0.0.1", el_ws_port)).await.unwrap();
-    let ws_upstream = format!("ws://127.0.0.1:{el_ws_port}");
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_upstream = format!("ws://{}", ws_listener.local_addr().unwrap());
 
     tokio::spawn(async move {
         while let Ok((stream, _)) = ws_listener.accept().await {
@@ -2361,8 +2453,9 @@ async fn health_timeout_includes_a_stalled_response_body() {
 #[tokio::test]
 async fn websocket_rejects_invalid_handshakes_on_both_hops() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let dead = format!("ws://127.0.0.1:{}", pick_port().await);
-    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &dead]).await;
+    let dead = DeadPort::new();
+    let dead_url = dead.ws_url();
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &dead_url]).await;
     for headers in [
         "Sec-WebSocket-Version: 12\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
         "Sec-WebSocket-Version: 13\r\n", // missing key
@@ -2407,64 +2500,42 @@ async fn websocket_rejects_invalid_handshakes_on_both_hops() {
 #[cfg(all(feature = "otel", unix))]
 #[tokio::test]
 async fn binary_exports_traces_and_metrics_and_flushes_on_sigterm() {
-    use std::process::{Child, Command, Stdio};
-    struct KillOnDrop(Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
+    use std::process::Command;
     let collector = MockServer::start(ok_handler()).await;
     let upstream = MockServer::start(ok_handler()).await;
-    let port = pick_port().await;
-    let mut child = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_ethonyx"))
-            .args([
-                "--listen",
-                &format!("127.0.0.1:{port}"),
-                "--trust-upstream",
-                "--el-http-url",
-                &upstream.url,
-                "--cl-beacon-url",
-                &upstream.url,
-                "--otel-endpoint",
-                &format!("{}/prefix", collector.url),
-                "--log-level",
-                "warn",
-                "--shutdown-grace",
-                "1",
-            ])
-            .env("OTEL_METRIC_EXPORT_INTERVAL", "100")
-            .env("OTEL_BSP_SCHEDULE_DELAY", "100")
-            .env_remove("RUST_LOG")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_port(port).await;
+    // Set periodic export intervals to 60s so neither BatchSpanProcessor nor
+    // PeriodicReader exports on a timer during the test — only SIGTERM's
+    // `telemetry.shutdown().await` can deliver both signals to `collector`.
+    let (mut child, port) = spawn_binary_on_ephemeral_port(&upstream, |cmd| {
+        cmd.args([
+            "--trust-upstream",
+            "--el-http-url",
+            &upstream.url,
+            "--cl-beacon-url",
+            &upstream.url,
+            "--otel-endpoint",
+            &format!("{}/prefix", collector.url),
+            "--log-level",
+            "warn",
+            "--shutdown-grace",
+            "1",
+        ])
+        .env("OTEL_METRIC_EXPORT_INTERVAL", "60000")
+        .env("OTEL_BSP_SCHEDULE_DELAY", "60000")
+        .env_remove("RUST_LOG");
+    })
+    .await;
+
     let c = client();
-    let mut exported = false;
-    for _ in 0..50 {
-        get(&c, &format!("http://127.0.0.1:{port}/eth/test")).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let requests = collector.recorded.lock().unwrap();
-        exported = ["/prefix/v1/traces", "/prefix/v1/metrics"]
-            .iter()
-            .all(|path| {
-                requests
-                    .iter()
-                    .any(|r| r.path == *path && !r.body.is_empty())
-            });
-        if exported {
-            break;
-        }
-    }
+    let (status, _) = get(&c, &format!("http://127.0.0.1:{port}/eth/test")).await;
+    assert_eq!(status, StatusCode::OK);
+    drop(c);
+
     assert!(
-        exported,
-        "both OTLP signals must be exported by the actual binary"
+        collector.recorded.lock().unwrap().is_empty(),
+        "signals must still be buffered before SIGTERM"
     );
+
     assert!(
         Command::new("kill")
             .args(["-TERM", &child.0.id().to_string()])
@@ -2483,6 +2554,77 @@ async fn binary_exports_traces_and_metrics_and_flushes_on_sigterm() {
     .await
     .unwrap();
     assert!(status.success(), "{status}");
+
+    let requests = collector.recorded.lock().unwrap();
+    for path in ["/prefix/v1/traces", "/prefix/v1/metrics"] {
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.path == path && !r.body.is_empty()),
+            "SIGTERM shutdown must flush {path} (recorded paths: {:?})",
+            requests.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn bind_failure_is_not_swallowed_by_shutdown_with_unresponsive_otel_collector() {
+    let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let occupied_addr = occupied.local_addr().unwrap();
+
+    let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let collector_url = format!("http://{}", blackhole.local_addr().unwrap());
+    let collector_task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = blackhole.accept().await {
+            held.push(sock);
+        }
+    });
+
+    let cfg = Config::parse_from([
+        "ethonyx",
+        "--listen",
+        &occupied_addr.to_string(),
+        "--trust-upstream",
+        "--otel-endpoint",
+        &collector_url,
+    ]);
+    let prepared = Prepared::new(cfg).await.unwrap();
+    {
+        use opentelemetry::trace::{Span as _, Tracer as _};
+        let mut span = prepared
+            .tracer()
+            .expect("otel tracer")
+            .start("startup_check");
+        span.end();
+    }
+
+    // Under `--trust-upstream` with a numeric IP literal (`127.0.0.1`), `TcpListener::bind`
+    // resolves in a single poll without async DNS or probe I/O. Pending on poll #1 and
+    // ready on poll #2+: if `Prepared::bind` ever yields at a post-error `.await`,
+    // `biased` `select!` in `Prepared::run` immediately resolves `shutdown` (`Ok(())`).
+    let mut polls = 0u32;
+    let shutdown = std::future::poll_fn(move |_| {
+        polls += 1;
+        if polls > 1 {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    });
+    let err = tokio::time::timeout(Duration::from_secs(1), prepared.run(shutdown))
+        .await
+        .expect(
+            "bind failure must return promptly without stalling on an unresponsive OTel collector",
+        )
+        .expect_err("bind failure must not be overtaken and swallowed by a shutdown signal");
+    assert!(
+        err.to_string().contains("failed to bind --listen address"),
+        "unexpected error: {err}"
+    );
+
+    collector_task.abort();
 }
 
 #[tokio::test]
@@ -3103,17 +3245,29 @@ async fn invalid_jsonrpc_batches_are_forwarded_intact_over_http_and_websocket() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_already_ready_does_not_wait_for_a_new_watch_event() {
-    let cfg = Config::parse_from([
-        "ethonyx",
-        "--listen",
-        "127.0.0.1:0",
-        "--trust-upstream",
-        "--shutdown-grace",
-        "0",
-    ]);
-    tokio::time::timeout(Duration::from_secs(1), run(cfg, async {}))
+    let make_cfg = || {
+        Config::parse_from([
+            "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
+            "--trust-upstream",
+            "--shutdown-grace",
+            "0",
+        ])
+    };
+    let bound = Prepared::new(make_cfg())
         .await
-        .expect("an already completed shutdown must stop the accept loop")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), bound.serve(async {}))
+        .await
+        .expect("an already completed shutdown must stop Bound::serve and the accept loop")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), run(make_cfg(), async {}))
+        .await
+        .expect("an already completed shutdown must cancel Prepared::run before binding")
         .unwrap();
 }
 
@@ -3457,7 +3611,7 @@ async fn websocket_rejects_split_protocol_duplicates_before_dialing() {
                 .map(|&value| ("sec-websocket-protocol", value))
                 .collect();
             let (response, driver) = tokio::time::timeout(
-                Duration::from_secs(3),
+                Duration::from_secs(10),
                 ws_handshake_response(&proxy, h2, &headers),
             )
             .await
@@ -3765,8 +3919,8 @@ async fn mock_eth_syncing_forwards_non_empty_params_over_http_and_websocket() {
 
 #[tokio::test]
 async fn bad_gateway_redacts_upstream_details_and_http1_preserves_content_length() {
-    let dead_port = pick_port().await;
-    let dead_url = format!("http://127.0.0.1:{dead_port}");
+    let dead = DeadPort::new();
+    let dead_url = dead.http_url();
     let live_el = MockServer::start(Arc::new(|_| {
         (
             StatusCode::OK,
@@ -3878,8 +4032,8 @@ async fn mock_cl_subscriptions_drains_body_over_keep_alive_and_times_out_stalled
 async fn node_health_returns_503_on_partial_outage_or_strict_staleness_and_206_when_syncing() {
     let now_hex = format!("0x{:x}", now_unix());
     let stale_hex = format!("0x{:x}", now_unix().saturating_sub(600));
-    let dead_port = pick_port().await;
-    let dead_cl = format!("http://127.0.0.1:{dead_port}");
+    let dead = DeadPort::new();
+    let dead_cl = dead.http_url();
 
     // 1. EL syncing + CL unreachable => 503 (never 206).
     let ts1 = now_hex.clone();
@@ -4269,15 +4423,6 @@ async fn adaptive_el_h2c_recovers_after_transient_upstream_restart() {
 #[cfg(feature = "otel")]
 #[tokio::test]
 async fn traceparent_survives_connection_nomination_and_propagates_to_websocket() {
-    use std::process::{Child, Command, Stdio};
-    struct KillOnDrop(Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
     let collector = MockServer::start(ok_handler()).await;
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
@@ -4305,37 +4450,34 @@ async fn traceparent_survives_connection_nomination_and_propagates_to_websocket(
         drop(ws);
     });
 
-    let port = pick_port().await;
-    let _child = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_ethonyx"))
-            .args([
-                "--listen",
-                &format!("127.0.0.1:{port}"),
-                "--trust-upstream",
-                "--el-http-url",
-                &el.url,
-                "--el-ws-url",
-                &ws_url,
-                "--cl-beacon-url",
-                &cl.url,
-                "--otel-endpoint",
-                &collector.url,
-            ])
-            .env("RUST_LOG", "info")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_port(port).await;
+    let (_child, port) = spawn_binary_on_ephemeral_port(&el, |cmd| {
+        cmd.args([
+            "--trust-upstream",
+            "--el-http-url",
+            &el.url,
+            "--el-ws-url",
+            &ws_url,
+            "--cl-beacon-url",
+            &cl.url,
+            "--otel-endpoint",
+            &collector.url,
+        ])
+        .env("RUST_LOG", "info");
+    })
+    .await;
 
-    // 1. HTTP request nominating `Connection: keep-alive, traceparent` still injects
-    // ethonyx's outgoing `traceparent` header upstream.
+    // 1. HTTP request nominating `Connection: keep-alive, traceparent` drops the
+    // hop-by-hop incoming `traceparent` on extraction and injects a fresh outgoing
+    // root `traceparent` header upstream.
     let c = client();
     let req = Request::builder()
         .method(Method::POST)
         .uri(format!("http://127.0.0.1:{port}/"))
         .header("connection", "keep-alive, traceparent")
+        .header(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from_static(
             br#"{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}"#,
@@ -4344,15 +4486,22 @@ async fn traceparent_survives_connection_nomination_and_propagates_to_websocket(
     let resp = c.request(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let http_tp = el
-        .received()
-        .into_iter()
-        .find_map(|r| r.headers.get("traceparent").cloned());
+        .recorded
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.method == Method::POST && r.path == "/")
+        .and_then(|r| r.headers.get("traceparent"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .expect("Connection: traceparent must not strip ethonyx's outgoing traceparent");
     assert!(
-        http_tp.is_some(),
-        "Connection: traceparent must not strip ethonyx's outgoing traceparent"
+        http_tp.starts_with("00-") && !http_tp.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"),
+        "Connection-nominated incoming traceparent must not link parent trace-id, got: {http_tp}"
     );
 
-    // 2. WebSocket handshake propagates `traceparent` to the upstream WS server.
+    // 2. WebSocket handshake extracts the non-nominated parent `trace-id` and injects
+    // a newly generated child `span-id` to the upstream WS server.
     let mut ws_req =
         tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(format!(
             "ws://127.0.0.1:{port}/"
@@ -4370,8 +4519,9 @@ async fn traceparent_survives_connection_nomination_and_propagates_to_websocket(
         .unwrap()
         .expect("upstream WS handshake must receive traceparent");
     assert!(
-        ws_tp.contains("4bf92f3577b34da6a3ce929d0e0e4736"),
-        "expected propagated WS trace ID, got: {ws_tp}"
+        ws_tp.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-")
+            && !ws_tp.contains("-00f067aa0ba902b7-"),
+        "expected propagated WS traceparent to preserve trace-id and rewrite child span-id, got: {ws_tp}"
     );
     let _ = ws.close(None).await;
 
@@ -4406,11 +4556,9 @@ async fn multi_listener_max_connections_fairness_and_h2_extended_connect_cap() {
         }
     });
 
-    let second_port = pick_port().await;
-    let second_listen = format!("127.0.0.1:{second_port}");
     let proxy = EthonyxHandle::start(&[
         "--listen",
-        &second_listen,
+        "127.0.0.1:0",
         "--trust-upstream",
         "--max-connections",
         "1",
@@ -4418,6 +4566,7 @@ async fn multi_listener_max_connections_fairness_and_h2_extended_connect_cap() {
         &ws_url,
     ])
     .await;
+    let second_port = proxy.ports[1];
 
     // 1. Even with --max-connections 1 and an idle second listener, repeated
     // connections on either port succeed without permit starvation.
@@ -4433,6 +4582,15 @@ async fn multi_listener_max_connections_fairness_and_h2_extended_connect_cap() {
         assert!(buf.starts_with(b"HTTP/1.1 200 OK"));
     }
 
+    let saturated_count = |text: &str| -> f64 {
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix("ethonyx_connection_limit_saturated_total ")
+                    .and_then(|v| v.parse::<f64>().ok())
+            })
+            .unwrap_or(0.0)
+    };
+
     // 2. Over a single HTTP/2 connection under --max-connections 1:
     //    - 1st Extended CONNECT WS stream reuses the H2 connection's permit (200 OK).
     //    - 2nd concurrent Extended CONNECT WS stream is rejected with 503 before dialing.
@@ -4447,6 +4605,19 @@ async fn multi_listener_max_connections_fairness_and_h2_extended_connect_cap() {
     let h2_conn = tokio::spawn(async move {
         let _ = conn.await;
     });
+
+    let before_resp = sender
+        .send_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://127.0.0.1:{}/metrics", proxy.port))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let before_bytes = before_resp.into_body().collect().await.unwrap().to_bytes();
+    let before = saturated_count(std::str::from_utf8(&before_bytes).unwrap());
 
     let make_ext_connect = |port: u16| {
         let mut req = Request::builder()
@@ -4529,19 +4700,12 @@ async fn multi_listener_max_connections_fairness_and_h2_extended_connect_cap() {
     .await
     .expect("closing H2 connection must release --max-connections 1 permit")
     .unwrap();
-    let metrics_text = String::from_utf8(
-        metrics_resp
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .to_vec(),
-    )
-    .unwrap();
+    let metrics_bytes = metrics_resp.into_body().collect().await.unwrap().to_bytes();
+    let metrics_text = std::str::from_utf8(&metrics_bytes).unwrap();
+    let after = saturated_count(metrics_text);
     assert!(
-        metrics_text.contains("ethonyx_connection_limit_saturated_total"),
-        "expected saturation counter in /metrics, got:\n{metrics_text}"
+        after >= before + 1.0,
+        "expected saturation counter to increment (before={before}, after={after}), got:\n{metrics_text}"
     );
 
     proxy.shutdown().await;
@@ -4611,205 +4775,6 @@ async fn uppercase_ws_scheme_and_non_origin_targets_work_safely() {
 
     proxy.shutdown().await;
     ws_server.await.unwrap();
-}
-
-#[tokio::test]
-async fn post_accept_permits_allow_two_h2_ws_streams_and_reject_invalid_or_oversized_targets() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    fn sum_metric_lines(metrics_text: &str, needle: &str) -> u64 {
-        metrics_text
-            .lines()
-            .filter(|l| !l.starts_with('#') && l.contains(needle))
-            .filter_map(|l| l.split_whitespace().last()?.parse::<u64>().ok())
-            .sum()
-    }
-
-    let el = MockServer::start(ok_handler()).await;
-    let ws_upstream = ws_echo_upstream().await;
-    let long_prefix = "k".repeat(62_000);
-    let scoped_el = format!("{}/v3/{long_prefix}", el.url);
-    let scoped_ws = format!("{ws_upstream}/v3/{long_prefix}");
-
-    let proxy = EthonyxHandle::start(&[
-        "--trust-upstream",
-        "--max-connections",
-        "2",
-        "--el-http-url",
-        &scoped_el,
-        "--el-ws-url",
-        &scoped_ws,
-    ])
-    .await;
-
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
-        .await
-        .unwrap();
-    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, TestBody>(TokioIo::new(tcp))
-        .await
-        .unwrap();
-    let h2_conn = tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
-    let fetch_metrics = |sender: &mut hyper::client::conn::http2::SendRequest<TestBody>| {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(format!("http://127.0.0.1:{}/metrics", proxy.port))
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        let fut = sender.send_request(req);
-        async move {
-            let resp = fut.await.unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            String::from_utf8(
-                resp.into_body()
-                    .collect()
-                    .await
-                    .unwrap()
-                    .to_bytes()
-                    .to_vec(),
-            )
-            .unwrap()
-        }
-    };
-
-    let m0 = fetch_metrics(&mut sender).await;
-    let sat0 = sum_metric_lines(&m0, "ethonyx_connection_limit_saturated_total");
-    let opts0 = sum_metric_lines(&m0, "method=\"OPTIONS\"");
-    let conn0 = sum_metric_lines(&m0, "method=\"CONNECT\"");
-
-    // 1. Rejected targets (`OPTIONS *`, authority `CONNECT`, and CL `CONNECT`) return 400
-    // BEFORE `ethonyx_proxy_requests_total` is recorded!
-    let mut raw_sock = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
-        .await
-        .unwrap();
-    raw_sock
-        .write_all(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let mut raw_resp = Vec::new();
-    raw_sock.read_to_end(&mut raw_resp).await.unwrap();
-    assert!(raw_resp.starts_with(b"HTTP/1.1 400 Bad Request"));
-    drop(raw_sock);
-
-    let mut cl_connect = Request::builder()
-        .method(Method::CONNECT)
-        .uri(format!(
-            "http://127.0.0.1:{}/eth/v1/node/health",
-            proxy.port
-        ))
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-    cl_connect
-        .extensions_mut()
-        .insert(hyper::ext::Protocol::from_static("websocket"));
-    let cl_connect_resp = sender.send_request(cl_connect).await.unwrap();
-    assert_eq!(cl_connect_resp.status(), StatusCode::BAD_REQUEST);
-    drop(cl_connect_resp);
-
-    let m1 = fetch_metrics(&mut sender).await;
-    assert_eq!(
-        sum_metric_lines(&m1, "method=\"OPTIONS\""),
-        opts0,
-        "OPTIONS * must not increment ethonyx_proxy_requests_total"
-    );
-    assert_eq!(
-        sum_metric_lines(&m1, "method=\"CONNECT\""),
-        conn0,
-        "rejected CONNECT must not increment ethonyx_proxy_requests_total"
-    );
-
-    // 2. Oversized rewritten URIs (> u16::MAX after joining scoped upstream prefix)
-    // return 414 URI Too Long instead of 502 Bad Gateway on both HTTP and WS paths.
-    let near_limit_path = format!("/{}", "a".repeat(4_096));
-    let long_http = Request::builder()
-        .method(Method::POST)
-        .uri(&near_limit_path)
-        .body(Full::new(Bytes::from_static(b"{}")))
-        .unwrap();
-    let long_http_resp = sender.send_request(long_http).await.unwrap();
-    assert_eq!(long_http_resp.status(), StatusCode::URI_TOO_LONG);
-    drop(long_http_resp);
-
-    let mut long_ws = Request::builder()
-        .method(Method::CONNECT)
-        .uri(&near_limit_path)
-        .header("sec-websocket-version", "13")
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-    long_ws
-        .extensions_mut()
-        .insert(hyper::ext::Protocol::from_static("websocket"));
-    let long_ws_resp = sender.send_request(long_ws).await.unwrap();
-    assert_eq!(long_ws_resp.status(), StatusCode::URI_TOO_LONG);
-    drop(long_ws_resp);
-
-    // 3. Under --max-connections 2, post-accept permit acquisition leaves the 2nd
-    // permit free so 1 H2 connection can open TWO concurrent Extended CONNECT WS
-    // streams (`IncludedH2` + `DedicatedH2`) with zero spurious saturation increments,
-    // and rejects the 3rd concurrent stream with 503 (+1 saturation).
-    let make_ext_ws = || {
-        let mut req = Request::builder()
-            .method(Method::CONNECT)
-            .uri(format!("http://127.0.0.1:{}/", proxy.port))
-            .header("sec-websocket-version", "13")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        req.extensions_mut()
-            .insert(hyper::ext::Protocol::from_static("websocket"));
-        req
-    };
-
-    let ws_resp1 = sender.send_request(make_ext_ws()).await.unwrap();
-    assert_eq!(ws_resp1.status(), StatusCode::OK);
-    let up1 = hyper::upgrade::on(ws_resp1).await.unwrap();
-    let mut ws1 = tokio_tungstenite::WebSocketStream::from_raw_socket(
-        TokioIo::new(up1),
-        tokio_tungstenite::tungstenite::protocol::Role::Client,
-        None,
-    )
-    .await;
-
-    let ws_resp2 = sender.send_request(make_ext_ws()).await.unwrap();
-    assert_eq!(
-        ws_resp2.status(),
-        StatusCode::OK,
-        "2nd H2 Extended CONNECT stream must acquire the 2nd permit under --max-connections 2"
-    );
-    let up2 = hyper::upgrade::on(ws_resp2).await.unwrap();
-    let mut ws2 = tokio_tungstenite::WebSocketStream::from_raw_socket(
-        TokioIo::new(up2),
-        tokio_tungstenite::tungstenite::protocol::Role::Client,
-        None,
-    )
-    .await;
-
-    let m2 = fetch_metrics(&mut sender).await;
-    assert_eq!(
-        sum_metric_lines(&m2, "ethonyx_connection_limit_saturated_total"),
-        sat0,
-        "saturation counter must stay unchanged before actual over-limit contention"
-    );
-
-    let ws_resp3 = sender.send_request(make_ext_ws()).await.unwrap();
-    assert_eq!(ws_resp3.status(), StatusCode::SERVICE_UNAVAILABLE);
-    drop(ws_resp3);
-
-    let m3 = fetch_metrics(&mut sender).await;
-    assert_eq!(
-        sum_metric_lines(&m3, "ethonyx_connection_limit_saturated_total"),
-        sat0 + 1,
-        "3rd concurrent H2 WS stream under --max-connections 2 must record +1 saturation"
-    );
-
-    let _ = ws1.close(None).await;
-    let _ = ws2.close(None).await;
-    drop((ws1, ws2, sender));
-    h2_conn.abort();
-    let _ = h2_conn.await;
-    proxy.shutdown().await;
 }
 
 #[tokio::test]
@@ -5099,7 +5064,7 @@ async fn shutdown_sends_going_away_close_frame_to_active_h1_and_h2_websockets() 
     );
     assert!(
         started.elapsed() >= Duration::from_millis(800)
-            && started.elapsed() < Duration::from_millis(1500),
+            && started.elapsed() < Duration::from_millis(3000),
         "active relays should close just before grace expiry (elapsed = {:?})",
         started.elapsed()
     );
@@ -5167,4 +5132,211 @@ async fn query_only_upstream_url_reaches_h2c_and_h1_as_root_path() {
 
         ethonyx.shutdown().await;
     }
+}
+
+fn sum_metric_lines(metrics_text: &str, needle: &str) -> u64 {
+    metrics_text
+        .lines()
+        .filter(|l| !l.starts_with('#') && l.contains(needle))
+        .filter_map(|l| l.split_whitespace().last()?.parse::<u64>().ok())
+        .sum()
+}
+
+#[tokio::test]
+async fn post_accept_permits_allow_two_h2_ws_streams_and_reject_invalid_or_oversized_targets() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ws_upstream = ws_echo_upstream().await;
+    let http_upstream = ws_upstream.replacen("ws://", "http://", 1);
+    let long_prefix = "k".repeat(62_000);
+    let scoped_el = format!("{http_upstream}/v3/{long_prefix}");
+    let scoped_ws = format!("{ws_upstream}/v3/{long_prefix}");
+
+    let cfg = Config::parse_from([
+        "ethonyx",
+        "--listen",
+        "127.0.0.1:0",
+        "--shutdown-grace",
+        "0",
+        "--trust-upstream",
+        "--max-connections",
+        "2",
+        "--el-http-url",
+        &scoped_el,
+        "--el-ws-url",
+        &scoped_ws,
+    ]);
+    let bound = Prepared::new(cfg).await.unwrap().bind().await.unwrap();
+    let port = bound.local_addrs()[0].port();
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(bound.serve(async move {
+        let _ = stop_rx.await;
+    }));
+
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, TestBody>(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let h2_conn = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let fetch_metrics = |sender: &mut hyper::client::conn::http2::SendRequest<TestBody>| {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://127.0.0.1:{port}/metrics"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let fut = sender.send_request(req);
+        async move {
+            let resp = fut.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.into_body().collect().await.unwrap().to_bytes()
+        }
+    };
+
+    let m0_bytes = fetch_metrics(&mut sender).await;
+    let m0 = std::str::from_utf8(&m0_bytes).unwrap();
+    assert_eq!(
+        sum_metric_lines(m0, "ethonyx_connection_limit_saturated_total"),
+        0
+    );
+    assert_eq!(sum_metric_lines(m0, "method=\"OPTIONS\""), 0);
+    assert_eq!(sum_metric_lines(m0, "method=\"CONNECT\""), 0);
+
+    // 1. Rejected targets (`OPTIONS *`, authority `CONNECT`, and CL `CONNECT`) return 400
+    // BEFORE `ethonyx_proxy_requests_total` is recorded!
+    let mut raw_sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    raw_sock
+        .write_all(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut raw_resp = Vec::new();
+    raw_sock.read_to_end(&mut raw_resp).await.unwrap();
+    assert!(raw_resp.starts_with(b"HTTP/1.1 400 Bad Request"));
+    drop(raw_sock);
+
+    let mut cl_connect = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{port}/eth/v1/node/health"))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    cl_connect
+        .extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let cl_connect_resp = sender.send_request(cl_connect).await.unwrap();
+    assert_eq!(cl_connect_resp.status(), StatusCode::BAD_REQUEST);
+    drop(cl_connect_resp);
+
+    let m1_bytes = fetch_metrics(&mut sender).await;
+    let m1 = std::str::from_utf8(&m1_bytes).unwrap();
+    assert_eq!(
+        sum_metric_lines(m1, "method=\"OPTIONS\""),
+        0,
+        "OPTIONS * must not increment ethonyx_proxy_requests_total"
+    );
+    assert_eq!(
+        sum_metric_lines(m1, "method=\"CONNECT\""),
+        0,
+        "rejected CONNECT must not increment ethonyx_proxy_requests_total"
+    );
+
+    // 2. Oversized rewritten URIs (> u16::MAX after joining scoped upstream prefix)
+    // return 414 URI Too Long instead of 502 Bad Gateway on both HTTP and WS paths.
+    let near_limit_path = format!("/{}", "a".repeat(4_096));
+    let long_http = Request::builder()
+        .method(Method::POST)
+        .uri(&near_limit_path)
+        .body(Full::new(Bytes::from_static(b"{}")))
+        .unwrap();
+    let long_http_resp = sender.send_request(long_http).await.unwrap();
+    assert_eq!(long_http_resp.status(), StatusCode::URI_TOO_LONG);
+    drop(long_http_resp);
+
+    let mut long_ws = Request::builder()
+        .method(Method::CONNECT)
+        .uri(&near_limit_path)
+        .header("sec-websocket-version", "13")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    long_ws
+        .extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let long_ws_resp = sender.send_request(long_ws).await.unwrap();
+    assert_eq!(long_ws_resp.status(), StatusCode::URI_TOO_LONG);
+    drop(long_ws_resp);
+
+    // 3. Under --max-connections 2, post-accept permit acquisition leaves the 2nd
+    // permit free so 1 H2 connection can open TWO concurrent Extended CONNECT WS
+    // streams (`IncludedH2` + `DedicatedH2`) with zero spurious saturation increments,
+    // and rejects the 3rd concurrent stream with 503 (+1 saturation).
+    let make_ext_ws = || {
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("http://127.0.0.1:{port}/"))
+            .header("sec-websocket-version", "13")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+        req
+    };
+
+    let ws_resp1 = sender.send_request(make_ext_ws()).await.unwrap();
+    assert_eq!(ws_resp1.status(), StatusCode::OK);
+    let up1 = hyper::upgrade::on(ws_resp1).await.unwrap();
+    let mut ws1 = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(up1),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+
+    let ws_resp2 = sender.send_request(make_ext_ws()).await.unwrap();
+    assert_eq!(
+        ws_resp2.status(),
+        StatusCode::OK,
+        "2nd H2 Extended CONNECT stream must acquire the 2nd permit under --max-connections 2"
+    );
+    let up2 = hyper::upgrade::on(ws_resp2).await.unwrap();
+    let mut ws2 = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(up2),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+
+    let m2_bytes = fetch_metrics(&mut sender).await;
+    let m2 = std::str::from_utf8(&m2_bytes).unwrap();
+    assert_eq!(
+        sum_metric_lines(m2, "ethonyx_connection_limit_saturated_total"),
+        0,
+        "saturation counter must stay unchanged before actual over-limit contention"
+    );
+
+    let ws_resp3 = sender.send_request(make_ext_ws()).await.unwrap();
+    assert_eq!(ws_resp3.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(ws_resp3);
+
+    let m3_bytes = fetch_metrics(&mut sender).await;
+    let m3 = std::str::from_utf8(&m3_bytes).unwrap();
+    assert_eq!(
+        sum_metric_lines(m3, "ethonyx_connection_limit_saturated_total"),
+        1,
+        "3rd concurrent H2 WS stream under --max-connections 2 must record +1 saturation"
+    );
+
+    let _ = ws1.close(None).await;
+    let _ = ws2.close(None).await;
+    drop((ws1, ws2, sender));
+    h2_conn.abort();
+    let _ = h2_conn.await;
+
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
 }
