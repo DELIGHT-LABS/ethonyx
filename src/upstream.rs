@@ -298,11 +298,14 @@ impl HttpUpstream {
     }
 }
 
-/// Validated `ws://` or `wss://` upstream endpoint with a pre-built `Host` header.
+/// Validated `ws://` or `wss://` upstream endpoint with a pre-built `Host`
+/// header and pre-parsed TCP dial target.
 #[derive(Clone)]
 pub(crate) struct WsUpstream {
     endpoint: Endpoint,
     host_header: HeaderValue,
+    dial_host: Box<str>,
+    dial_port: u16,
 }
 
 impl WsUpstream {
@@ -311,9 +314,20 @@ impl WsUpstream {
         let authority = endpoint.uri.authority().expect("validated authority");
         let host_header = HeaderValue::from_str(authority.as_str())
             .map_err(|_| format!("invalid {flag} ({}): invalid Host header", RedactedUrl(raw)))?;
+        let raw_host = authority.host();
+        let dial_host = raw_host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(raw_host)
+            .into();
+        let dial_port = authority
+            .port_u16()
+            .unwrap_or(if endpoint.is_tls { 443 } else { 80 });
         Ok(Self {
             endpoint,
             host_header,
+            dial_host,
+            dial_port,
         })
     }
 
@@ -325,26 +339,10 @@ impl WsUpstream {
         &self.host_header
     }
 
-    /// Host suitable for `TcpStream::connect` (IPv6 square brackets stripped).
-    pub(crate) fn dial_host(&self) -> &str {
-        let host = self
-            .endpoint
-            .uri
-            .authority()
-            .expect("validated authority")
-            .host();
-        host.strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(host)
-    }
-
-    pub(crate) fn dial_port(&self) -> u16 {
-        self.endpoint
-            .uri
-            .authority()
-            .expect("validated authority")
-            .port_u16()
-            .unwrap_or(if self.endpoint.is_tls { 443 } else { 80 })
+    /// `(host, port)` suitable for `TcpStream::connect` (IPv6 square brackets
+    /// stripped and default `80` / `443` port resolved at startup).
+    pub(crate) const fn dial_target(&self) -> (&str, u16) {
+        (&self.dial_host, self.dial_port)
     }
 
     pub(crate) fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {
@@ -420,15 +418,15 @@ mod tests {
         );
         let upper_wss = WsUpstream::parse("--el-ws-url", "Wss://[::1]:8546").unwrap();
         assert_eq!(upper_wss.host_header(), "[::1]:8546");
-        assert_eq!(upper_wss.dial_host(), "::1");
-        assert_eq!(upper_wss.dial_port(), 8546);
+        assert_eq!(upper_wss.dial_target(), ("::1", 8546));
         assert_eq!(
             upper_wss.rewrite_uri(Uri::from_static("/")).unwrap(),
             "wss://[::1]:8546"
         );
-        let default_ports_ws = WsUpstream::parse("--el-ws-url", "wss://ws.example.com").unwrap();
-        assert_eq!(default_ports_ws.dial_host(), "ws.example.com");
-        assert_eq!(default_ports_ws.dial_port(), 443);
+        let default_wss = WsUpstream::parse("--el-ws-url", "wss://ws.example.com").unwrap();
+        assert_eq!(default_wss.dial_target(), ("ws.example.com", 443));
+        let default_ws = WsUpstream::parse("--el-ws-url", "ws://ws.example.com").unwrap();
+        assert_eq!(default_ws.dial_target(), ("ws.example.com", 80));
 
         for bad_http in [
             "ws://user:TOPSECRET@127.0.0.1:8546/APIKEY",

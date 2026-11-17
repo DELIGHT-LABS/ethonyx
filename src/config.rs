@@ -826,4 +826,44 @@ mod tests {
                 .contains("shutdown-grace")
         );
     }
+
+    #[tokio::test]
+    async fn listen_addr_resolves_numeric_and_named_ipv6_zone_ids() {
+        use std::net::SocketAddr;
+
+        #[cfg(target_os = "macos")]
+        let named = "[fe80::1%lo0]:0";
+        #[cfg(target_os = "linux")]
+        let named = "[fe80::1%lo]:0";
+
+        let cfg = Config::parse_from(["ethonyx", "--listen", "[fe80::1%1]:0"]);
+        let validated = cfg.parse_validated().unwrap();
+        let addr = &validated.listen[0];
+        let resolved: Vec<_> = tokio::net::lookup_host((&*addr.host, addr.port))
+            .await
+            .expect("numeric IPv6 zone ID must resolve")
+            .collect();
+        assert!(matches!(resolved.as_slice(), [SocketAddr::V6(v6), ..] if v6.scope_id() == 1));
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let cfg = Config::parse_from(["ethonyx", "--listen", named]);
+            let validated = cfg.parse_validated().unwrap();
+            let addr = &validated.listen[0];
+            let resolved: Vec<_> = tokio::net::lookup_host((&*addr.host, addr.port))
+                .await
+                .expect("named IPv6 zone ID must resolve via OS getaddrinfo")
+                .collect();
+            assert!(matches!(resolved.as_slice(), [SocketAddr::V6(v6), ..] if v6.scope_id() != 0));
+
+            #[cfg(target_os = "macos")]
+            {
+                let listener = tokio::net::TcpListener::bind((&*addr.host, addr.port))
+                    .await
+                    .expect("macOS lo0 must bind [fe80::1%lo0]:0");
+                let local = listener.local_addr().unwrap();
+                assert!(matches!(local, SocketAddr::V6(v6) if v6.scope_id() != 0));
+            }
+        }
+    }
 }

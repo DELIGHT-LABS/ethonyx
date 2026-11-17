@@ -89,13 +89,49 @@ impl Drop for ShutdownTx {
 pub(crate) struct Shutdown(Arc<ShutdownInner>);
 
 impl Shutdown {
+    /// Wait until shutdown is triggered and return the drain deadline.
+    ///
+    /// Registers the task's [`Waker`] in [`Notify`] at most once per waker so
+    /// steady-state polls from `biased` `select!` loops (`Shutdown::bound`,
+    /// `drive_graceful`, `bridge_ws`) cost a single atomic load and pointer check
+    /// instead of locking `notify.waiters` on every socket wake.
+    pub(crate) async fn deadline(&self) -> Instant {
+        let inner = &*self.0;
+        if let Some(&at) = inner.deadline.get() {
+            return at;
+        }
+        let notified = inner.notify.notified();
+        tokio::pin!(notified);
+        let mut registered_waker: Option<Waker> = None;
+        std::future::poll_fn(|cx| {
+            if let Some(&at) = inner.deadline.get() {
+                return Poll::Ready(at);
+            }
+            if registered_waker
+                .as_ref()
+                .is_some_and(|w| w.will_wake(cx.waker()))
+            {
+                return Poll::Pending;
+            }
+            // `ShutdownTx` stores `deadline` before `notify_waiters()`, so any wake
+            // landing between the check above and registration is observed right below.
+            let _ = notified.as_mut().poll(cx);
+            if let Some(&at) = inner.deadline.get() {
+                return Poll::Ready(at);
+            }
+            registered_waker = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
+
     /// Run `task` until it completes or the drain deadline passes, whichever is
     /// first. `None` means the deadline cancelled it.
     pub(crate) async fn bound<F: Future>(&self, task: F) -> Option<F::Output> {
         tokio::pin!(task);
         tokio::select! {
             biased;
-            end = deadline(self) => timeout_at(end, task).await.ok(),
+            end = self.deadline() => timeout_at(end, task).await.ok(),
             value = &mut task => Some(value),
         }
     }
@@ -107,42 +143,6 @@ pub(crate) fn channel() -> (ShutdownTx, Shutdown) {
         notify: Notify::new(),
     });
     (ShutdownTx(Arc::clone(&inner)), Shutdown(inner))
-}
-
-/// Wait until shutdown is triggered and return the drain deadline.
-///
-/// Registers the task's [`Waker`] in [`Notify`] at most once per waker so
-/// steady-state polls from `biased` `select!` loops (`Shutdown::bound`,
-/// `drive_graceful`, `bridge_ws`) cost a single atomic load and pointer check
-/// instead of locking `notify.waiters` on every socket wake.
-pub(crate) async fn deadline(shutdown: &Shutdown) -> Instant {
-    let inner = &*shutdown.0;
-    if let Some(&at) = inner.deadline.get() {
-        return at;
-    }
-    let notified = inner.notify.notified();
-    tokio::pin!(notified);
-    let mut registered_waker: Option<Waker> = None;
-    std::future::poll_fn(|cx| {
-        if let Some(&at) = inner.deadline.get() {
-            return Poll::Ready(at);
-        }
-        if registered_waker
-            .as_ref()
-            .is_some_and(|w| w.will_wake(cx.waker()))
-        {
-            return Poll::Pending;
-        }
-        // `ShutdownTx` stores `deadline` before `notify_waiters()`, so any wake
-        // landing between the check above and registration is observed right below.
-        let _ = notified.as_mut().poll(cx);
-        if let Some(&at) = inner.deadline.get() {
-            return Poll::Ready(at);
-        }
-        registered_waker = Some(cx.waker().clone());
-        Poll::Pending
-    })
-    .await
 }
 
 #[derive(Clone)]
@@ -160,7 +160,7 @@ impl Lifecycle {
     }
 
     pub(crate) async fn deadline(&self) -> Instant {
-        deadline(&self.shutdown).await
+        self.shutdown.deadline().await
     }
 
     /// Run a closure with direct access to [`Shutdown`] while guaranteeing its
@@ -251,7 +251,7 @@ mod tests {
         }
 
         let (tx, rx) = channel();
-        let fut = deadline(&rx);
+        let fut = rx.deadline();
         tokio::pin!(fut);
 
         let w1_state = Arc::new(CountWake(AtomicUsize::new(0)));

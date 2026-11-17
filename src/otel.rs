@@ -29,7 +29,7 @@ struct HeaderMapCarrierRef<'a>(&'a http::HeaderMap);
 impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrierRef<'a> {
     fn get(&self, key: &str) -> Option<&str> {
         let val = self.0.get(key)?.to_str().ok()?;
-        (!crate::headers::is_connection_nominated(self.0, key)).then_some(val)
+        (!crate::headers::header_has_token(self.0, http::header::CONNECTION, key)).then_some(val)
     }
 
     fn keys(&self) -> Vec<&str> {

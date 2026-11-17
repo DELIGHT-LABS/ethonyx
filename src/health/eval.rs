@@ -33,7 +33,7 @@ pub(crate) struct Probe {
 }
 
 impl Probe {
-    pub(crate) fn pending() -> Self {
+    pub(super) fn pending() -> Self {
         let pending: ProbeError = Arc::from("initial poll pending");
         Self {
             el_syncing: Err(pending.clone()),
@@ -44,7 +44,7 @@ impl Probe {
         }
     }
 
-    pub(crate) const fn has_errors(&self) -> bool {
+    pub(super) const fn has_errors(&self) -> bool {
         self.el_syncing.is_err()
             || self.el_peers.is_err()
             || self.el_block.is_err()
@@ -155,24 +155,24 @@ impl fmt::Display for FreshEval<'_> {
 }
 
 /// Zero-allocation readiness evaluation shared across `HEAD /readyz`, `GET /readyz`,
-/// `node_health`, `poll_loop` metrics, and readiness transition logs.
+/// `node_health`, health probe metrics, and readiness transition logs.
 #[derive(Clone, Copy)]
-pub(crate) struct ReadinessEval<'a> {
+pub(super) struct ReadinessEval<'a> {
     pub(super) el_sync: ElSyncEval<'a>,
     pub(super) cl_sync: ClSyncEval<'a>,
     pub(super) strict: Option<(FreshEval<'a>, FreshEval<'a>)>,
 }
 
 impl ReadinessEval<'_> {
-    pub(crate) const fn el_sync_ok(&self) -> bool {
+    pub(super) const fn el_sync_ok(&self) -> bool {
         self.el_sync.is_ok()
     }
 
-    pub(crate) const fn cl_sync_ok(&self) -> bool {
+    pub(super) const fn cl_sync_ok(&self) -> bool {
         self.cl_sync.is_ok()
     }
 
-    pub(crate) const fn is_ready(&self) -> bool {
+    pub(super) const fn is_ready(&self) -> bool {
         self.el_sync_ok()
             && self.cl_sync_ok()
             && match self.strict {
@@ -182,7 +182,7 @@ impl ReadinessEval<'_> {
     }
 }
 
-pub(crate) fn evaluate_readiness<'a>(
+pub(super) fn evaluate_readiness<'a>(
     cfg: &RuntimeOpts,
     slot_clock: Option<SlotClock>,
     probe: &'a Probe,

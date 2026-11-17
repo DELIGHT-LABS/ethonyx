@@ -13,13 +13,56 @@ use crate::state::AppState;
 use super::cl::{cl_peer_count, cl_syncing_status};
 use super::el::el_batch_detect;
 use super::eval::{
-    ElSyncEval, Probe, ReadinessEval, Transition, evaluate_readiness, readiness_transition,
+    ElSyncEval, HealthSource, Probe, ReadinessEval, Transition, evaluate_readiness,
+    readiness_transition,
 };
 use super::fetch::{HealthError, ProbeTarget};
 
+pub(crate) struct HealthPoller {
+    tx: watch::Sender<Arc<Probe>>,
+    interval: Duration,
+}
+
+pub(crate) fn channel(cfg: &crate::Config) -> (HealthSource, Option<HealthPoller>) {
+    if cfg.trust_upstream {
+        (HealthSource::Trusted, None)
+    } else {
+        let (tx, rx) = watch::channel(Arc::new(Probe::pending()));
+        (
+            HealthSource::Polled(rx),
+            Some(HealthPoller {
+                tx,
+                interval: cfg.health_poll_interval,
+            }),
+        )
+    }
+}
+
+impl HealthPoller {
+    /// Warm the health cache with one poll before serving so `/healthz` and
+    /// `/readyz` read a snapshot instead of hitting upstream per probe. Returns
+    /// `true` when any upstream signal failed during the initial poll.
+    pub(crate) async fn warm(&self, state: &AppState) -> bool {
+        let first_probe = Arc::new(probe_once(state).await);
+        let eval = evaluate_readiness(&state.cfg, state.slot_clock, &first_probe);
+        update_metrics(state, &first_probe, eval);
+        let degraded = first_probe.has_errors();
+        let _ = self.tx.send(first_probe);
+        degraded
+    }
+
+    pub(crate) fn spawn(
+        self,
+        state: Arc<AppState>,
+        shutdown: crate::lifecycle::Shutdown,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(poll_loop(state, self.tx, shutdown, self.interval))
+    }
+}
+
 /// Query all five upstream signals once. Each call is bounded by
 /// `--health-timeout`; failures land in the result rather than aborting.
-pub(crate) async fn probe_once(state: &AppState) -> Probe {
+async fn probe_once(state: &AppState) -> Probe {
     let timeout = state.cfg.health_timeout;
     let el = ProbeTarget {
         client: &state.client,
@@ -58,7 +101,7 @@ pub(crate) async fn probe_once(state: &AppState) -> Probe {
     }
 }
 
-pub(crate) fn update_metrics(state: &AppState, probe: &Probe, eval: ReadinessEval<'_>) {
+fn update_metrics(state: &AppState, probe: &Probe, eval: ReadinessEval<'_>) {
     let el_peers = probe.el_peers.as_ref().map_or(0.0, |&p| p as f64);
     let cl_peers = probe.cl_peers.as_ref().map_or(0.0, |&p| p as f64);
     let el_distance = match eval.el_sync {
@@ -102,13 +145,13 @@ impl<T: fmt::Display> fmt::Display for OptDisplay<T> {
 /// This loop is also the single place readiness is logged: a transition is logged
 /// once (bounded to the poll rate), independent of how often `/readyz` is probed,
 /// and visible even if nothing probes it.
-pub(crate) async fn poll_loop(
+async fn poll_loop(
     state: Arc<AppState>,
     tx: watch::Sender<Arc<Probe>>,
     shutdown: crate::lifecycle::Shutdown,
     interval: Duration,
 ) {
-    let shutdown = crate::lifecycle::deadline(&shutdown);
+    let shutdown = shutdown.deadline();
     tokio::pin!(shutdown);
     let mut prev_ready: Option<bool> = None;
     loop {
