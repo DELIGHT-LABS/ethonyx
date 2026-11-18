@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 
 fn git_stdout(args: &[&str]) -> Option<String> {
     let output = Command::new("git")
+        .arg("--no-optional-locks")
         .args(args)
         .stderr(Stdio::null())
         .output()
@@ -48,9 +49,9 @@ fn emit_source_rerun_hints(dir: &Path) {
 fn emit_git_rerun_hints() {
     // Resolve worktree-local (`HEAD`, `logs/HEAD`) and shared (`packed-refs`,
     // `refs/tags`, `--git-common-dir`) paths in one git call. Omit `index`:
-    // `git describe --dirty` refreshes `.git/index` during `build.rs`, which
-    // would trigger a spurious second rebuild; crate source hints in `main`
-    // track uncommitted edits at zero extra compile cost.
+    // `--no-optional-locks` keeps `git describe --dirty` from refreshing
+    // `.git/index`, and crate source hints in `main` already track uncommitted
+    // edits without spurious rebuilds on index-only git operations.
     let Some(text) = git_stdout(&[
         "rev-parse",
         "--git-path",
