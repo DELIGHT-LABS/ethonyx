@@ -319,6 +319,8 @@ async fn run_rejects_zero_poll_interval() {
         "ethonyx",
         "--listen",
         "127.0.0.1:0",
+        "--el-http-url",
+        "http://127.0.0.1:8545",
         "--health-poll-interval",
         "0",
     ])
@@ -658,7 +660,13 @@ async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
     ethonyx.shutdown().await;
 
     // A second server instance owns an isolated recorder (starts at 0 and omits unpolled gauges).
-    let second = EthonyxHandle::start(&["--trust-upstream", "--mock-eth-syncing"]).await;
+    let second = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--mock-eth-syncing",
+    ])
+    .await;
     let (status, _) = post_json(
         &c,
         &second.url("/"),
@@ -676,14 +684,17 @@ async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
 #[tokio::test]
 async fn test_cl_node_health_intercept_and_passthrough() {
     let el = MockServer::start(Arc::new(|req| {
-        if req.body.windows(11).any(|w| w == b"eth_syncing") {
-            (
-                StatusCode::OK,
-                br#"{"jsonrpc":"2.0","id":1,"result":false}"#.to_vec(),
-            )
-        } else {
-            (StatusCode::OK, b"{}".to_vec())
-        }
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+        let result = match method {
+            "eth_syncing" => json!(false),
+            "eth_getBlockByNumber" => json!({"number": "0x1", "timestamp": "0x1"}),
+            _ => json!("0x1"),
+        };
+        (
+            StatusCode::OK,
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
+        )
     }))
     .await;
 
@@ -1032,8 +1043,33 @@ async fn node_health_returns_503_on_partial_outage_or_strict_staleness_and_206_w
 
 #[tokio::test]
 async fn trust_upstream_reports_honest_healthz_mode_without_fabricated_fields() {
-    let trusted = EthonyxHandle::start(&["--trust-upstream"]).await;
     let c = client();
+
+    // 1. EL-only `--trust-upstream`: omits `cl` completely on both `/healthz` and `/readyz`.
+    let trusted_el =
+        EthonyxHandle::start(&["--el-http-url", "http://127.0.0.1:8545", "--trust-upstream"]).await;
+    let (status_el, body_el) = get(&c, &trusted_el.url("/healthz")).await;
+    assert_eq!(status_el, StatusCode::OK);
+    let snap_el: Value = serde_json::from_slice(&body_el).unwrap();
+    assert_eq!(
+        snap_el,
+        json!({"mode": "trusted", "el": {"transport": "http/1.1"}})
+    );
+    let (r_status_el, r_body_el) = get(&c, &trusted_el.url("/readyz")).await;
+    assert_eq!(r_status_el, StatusCode::OK);
+    let ready_el: Value = serde_json::from_slice(&r_body_el).unwrap();
+    assert!(ready_el.get("cl_syncing").is_none(), "{ready_el}");
+    trusted_el.shutdown().await;
+
+    // 2. EL + CL `--trust-upstream`: includes both `el` and `cl` transports.
+    let trusted = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--cl-beacon-url",
+        "http://127.0.0.1:5052",
+    ])
+    .await;
     let (status, body) = get(&c, &trusted.url("/healthz")).await;
     assert_eq!(status, StatusCode::OK);
     let snap: Value = serde_json::from_slice(&body).unwrap();

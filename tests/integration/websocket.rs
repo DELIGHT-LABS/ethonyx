@@ -343,7 +343,14 @@ async fn test_ws_handshake_preserves_upstream_path_without_trailing_slash() {
     });
 
     let upstream_url = format!("ws://127.0.0.1:{port}/v2/testkey");
-    let ethonyx = EthonyxHandle::start(&["--el-ws-url", &upstream_url, "--trust-upstream"]).await;
+    let ethonyx = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--el-ws-url",
+        &upstream_url,
+        "--trust-upstream",
+    ])
+    .await;
 
     let ws_url = ethonyx.url("/").replace("http://", "ws://");
     let (ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
@@ -381,8 +388,14 @@ async fn websocket_subprotocol_is_negotiated_end_to_end() {
             ws.send(message).await.unwrap();
         }
     });
-    let proxy =
-        EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &format!("ws://{addr}")]).await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--el-ws-url",
+        &format!("ws://{addr}"),
+    ])
+    .await;
     let mut req = format!("ws://127.0.0.1:{}/", proxy.port)
         .into_client_request()
         .unwrap();
@@ -409,6 +422,8 @@ async fn websocket_fragmented_utf8_ping_close_and_mock_batch() {
     for mocking in [false, true] {
         let mock_arg = if mocking { "true" } else { "false" };
         let proxy = EthonyxHandle::start(&[
+            "--el-http-url",
+            "http://127.0.0.1:8545",
             "--trust-upstream",
             "--mock-eth-syncing",
             mock_arg,
@@ -492,7 +507,14 @@ async fn websocket_fragmented_utf8_ping_close_and_mock_batch() {
 async fn websocket_rejects_invalid_and_oversized_frames() {
     use tokio::io::AsyncWriteExt;
     let upstream = ws_echo_upstream().await;
-    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &upstream]).await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--el-ws-url",
+        &upstream,
+    ])
+    .await;
     let mut oversized_pong = vec![0x8a, 0xfe, 0, 126, 0, 0, 0, 0];
     oversized_pong.extend_from_slice(&[0; 126]);
     let mut oversized_frame = vec![0x82, 0xff];
@@ -528,7 +550,14 @@ async fn websocket_rejects_invalid_handshakes_on_both_hops() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dead = DeadPort::new();
     let dead_url = dead.ws_url();
-    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &dead_url]).await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--el-ws-url",
+        &dead_url,
+    ])
+    .await;
     for headers in [
         "Sec-WebSocket-Version: 12\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
         "Sec-WebSocket-Version: 13\r\n", // missing key
@@ -561,7 +590,14 @@ async fn websocket_rejects_invalid_handshakes_on_both_hops() {
         }
         socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: invalid-signature\r\n\r\n").await.unwrap();
     });
-    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--el-ws-url",
+        &url,
+    ])
+    .await;
     let err = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
         .await
         .unwrap_err();
@@ -609,6 +645,8 @@ async fn websocket_sustained_churn_preserves_replies_and_releases_upstreams() {
             }
         });
         let proxy = EthonyxHandle::start(&[
+            "--el-http-url",
+            "http://127.0.0.1:8545",
             "--trust-upstream",
             "--mock-eth-syncing",
             if mocking { "true" } else { "false" },
@@ -709,6 +747,8 @@ async fn websocket_header_lists_and_http1_connect_are_validated_before_dialing()
     let canonical = "Connection: Upgrade\r\nUpgrade: websocket\r\n";
     for mocking in [false, true] {
         let proxy = EthonyxHandle::start(&[
+            "--el-http-url",
+            "http://127.0.0.1:8545",
             "--trust-upstream",
             "--el-ws-url",
             &upstream,
@@ -837,7 +877,14 @@ async fn websocket_header_lists_and_http1_connect_are_validated_before_dialing()
 async fn http2_websocket_rejects_missing_invalid_and_duplicate_versions_without_dialing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("ws://{}", listener.local_addr().unwrap());
-    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &upstream]).await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--el-ws-url",
+        &upstream,
+    ])
+    .await;
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -981,7 +1028,14 @@ async fn websocket_negotiates_split_protocols_without_forwarding_extensions() {
             ws.send(message).await.unwrap();
             let _ = ws.next().await;
         });
-        let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+        let proxy = EthonyxHandle::start(&[
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+            "--el-ws-url",
+            &url,
+        ])
+        .await;
         let (response, driver) = ws_handshake_response(
             &proxy,
             h2,
@@ -1032,7 +1086,14 @@ async fn websocket_negotiates_split_protocols_without_forwarding_extensions() {
 async fn websocket_rejects_split_protocol_duplicates_before_dialing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
-    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--el-ws-url",
+        &url,
+    ])
+    .await;
     for h2 in [false, true] {
         let count = if h2 { 1024 } else { 32_768 };
         let large = (0..count)
@@ -1113,7 +1174,14 @@ async fn websocket_rejects_unsolicited_extensions_and_invalid_protocol_selection
                 .unwrap();
                 let _ = ws.next().await;
             });
-            let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+            let proxy = EthonyxHandle::start(&[
+                "--el-http-url",
+                "http://127.0.0.1:8545",
+                "--trust-upstream",
+                "--el-ws-url",
+                &url,
+            ])
+            .await;
             let (response, driver) = ws_handshake_response(
                 &proxy,
                 h2,
@@ -1177,7 +1245,14 @@ async fn websocket_strips_hop_by_hop_and_connection_nominated_headers_on_upstrea
         .unwrap();
         let _ = ws.next().await;
     });
-    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-ws-url", &url]).await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--el-ws-url",
+        &url,
+    ])
+    .await;
     let socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -1236,6 +1311,8 @@ async fn websocket_mock_mode_bounds_post_close_drain_when_upstream_keeps_tcp_ope
             let _ = released_tx.send(());
         });
         let proxy = EthonyxHandle::start(&[
+            "--el-http-url",
+            "http://127.0.0.1:8545",
             "--trust-upstream",
             "--mock-eth-syncing",
             mocking,

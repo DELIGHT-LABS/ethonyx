@@ -271,7 +271,14 @@ async fn response_connection_options_are_stripped_for_h1_and_h2_clients() {
             });
         }
     });
-    let ethonyx = EthonyxHandle::start(&["--trust-upstream", "--cl-beacon-url", &upstream]).await;
+    let ethonyx = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--cl-beacon-url",
+        &upstream,
+    ])
+    .await;
     for c in [client(), h2c_client()] {
         let req = Request::builder()
             .uri(ethonyx.url("/eth/header-test"))
@@ -574,7 +581,13 @@ async fn trusted_h1_upstream_and_http_notifications() {
 #[tokio::test]
 async fn mock_body_stall_has_a_deadline() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let proxy = EthonyxHandle::start(&["--trust-upstream", "--mock-eth-syncing"]).await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--mock-eth-syncing",
+    ])
+    .await;
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -821,7 +834,15 @@ async fn bad_gateway_redacts_upstream_details_and_http1_preserves_content_length
 async fn mock_cl_subscriptions_drains_body_over_keep_alive_and_times_out_stalled_body() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let proxy = EthonyxHandle::start(&["--trust-upstream", "--mock-cl-subscriptions"]).await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--cl-beacon-url",
+        "http://127.0.0.1:5052",
+        "--mock-cl-subscriptions",
+    ])
+    .await;
 
     // 1. Two sequential POSTs with split chunked bodies over one HTTP/1.1 keep-alive socket.
     let mut keepalive = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
@@ -983,6 +1004,8 @@ async fn max_connections_caps_concurrent_http_and_upgraded_websocket_clients() {
 
     let ws_upstream = ws_echo_upstream().await;
     let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
         "--trust-upstream",
         "--max-connections",
         "2",
@@ -1073,6 +1096,8 @@ async fn multi_listener_max_connections_fairness_and_h2_extended_connect_cap() {
     let proxy = EthonyxHandle::start(&[
         "--listen",
         "127.0.0.1:0",
+        "--el-http-url",
+        "http://127.0.0.1:8545",
         "--trust-upstream",
         "--max-connections",
         "1",

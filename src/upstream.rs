@@ -11,6 +11,30 @@ use crate::BoxError;
 #[derive(Clone, Copy)]
 pub(crate) struct RedactedUrl<'a>(pub(crate) &'a str);
 
+fn fmt_redacted_parts(
+    f: &mut fmt::Formatter<'_>,
+    scheme: &str,
+    authority: &Authority,
+    path: &str,
+    has_query_or_frag: bool,
+) -> fmt::Result {
+    for b in scheme.bytes() {
+        f.write_char(char::from(b.to_ascii_lowercase()))?;
+    }
+    f.write_str("://")?;
+    match authority.as_str().rsplit_once('@') {
+        Some((_, host_port)) => {
+            f.write_str("<redacted>@")?;
+            f.write_str(host_port)?;
+        }
+        None => f.write_str(authority.as_str())?,
+    }
+    if !matches!(path, "" | "/") || has_query_or_frag {
+        f.write_str("/<redacted>")?;
+    }
+    Ok(())
+}
+
 impl fmt::Display for RedactedUrl<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (without_frag, has_frag) = match self.0.split_once('#') {
@@ -23,25 +47,13 @@ impl fmt::Display for RedactedUrl<'_> {
         let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) else {
             return f.write_str("<invalid-url>");
         };
-
-        for b in scheme.bytes() {
-            f.write_char(char::from(b.to_ascii_lowercase()))?;
-        }
-        f.write_str("://")?;
-        match authority.as_str().rsplit_once('@') {
-            Some((_, host_port)) => {
-                f.write_str("<redacted>@")?;
-                f.write_str(host_port)?;
-            }
-            None => f.write_str(authority.as_str())?,
-        }
-
-        let has_secret_suffix =
-            !matches!(uri.path(), "" | "/") || uri.query().is_some() || has_frag;
-        if has_secret_suffix {
-            f.write_str("/<redacted>")?;
-        }
-        Ok(())
+        fmt_redacted_parts(
+            f,
+            scheme,
+            authority,
+            uri.path(),
+            uri.query().is_some() || has_frag,
+        )
     }
 }
 
@@ -51,14 +63,33 @@ impl fmt::Debug for RedactedUrl<'_> {
     }
 }
 
-/// Formats an optional URL as [`RedactedUrl`] when `Some`, or `"none"` when `None`.
+/// Formats a pre-validated [`Uri`] (lowercase scheme, validated authority, no fragment)
+/// with non-root paths and queries redacted.
 #[derive(Clone, Copy)]
-pub(crate) struct RedactedOptUrl<'a>(pub(crate) Option<&'a str>);
+pub(crate) struct RedactedUri<'a>(&'a Uri);
 
-impl fmt::Display for RedactedOptUrl<'_> {
+impl fmt::Display for RedactedUri<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scheme = self.0.scheme_str().expect("validated scheme");
+        let authority = self.0.authority().expect("validated authority");
+        fmt_redacted_parts(
+            f,
+            scheme,
+            authority,
+            self.0.path(),
+            self.0.query().is_some(),
+        )
+    }
+}
+
+/// Formats an optional [`RedactedUri`] when `Some`, or `"none"` when `None`.
+#[derive(Clone, Copy)]
+pub(crate) struct RedactedOptUri<'a>(pub(crate) Option<RedactedUri<'a>>);
+
+impl fmt::Display for RedactedOptUri<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Some(url) => RedactedUrl(url).fmt(f),
+            Some(uri) => uri.fmt(f),
             None => f.write_str("none"),
         }
     }
@@ -293,6 +324,25 @@ impl HttpUpstream {
         &self.0.uri
     }
 
+    pub(crate) const fn redacted(&self) -> RedactedUri<'_> {
+        RedactedUri(&self.0.uri)
+    }
+
+    /// Compare two validated endpoints after normalizing host case and default
+    /// `:80`/`:443` ports while preserving path and query bytes (`/v1` vs `/v1/`).
+    pub(crate) fn same_endpoint(&self, other: &Self) -> bool {
+        if self.0.is_tls != other.0.is_tls {
+            return false;
+        }
+        let a = self.0.uri.authority().expect("validated authority");
+        let b = other.0.uri.authority().expect("validated authority");
+        let default_port = if self.0.is_tls { 443 } else { 80 };
+        a.host().eq_ignore_ascii_case(b.host())
+            && a.port_u16().unwrap_or(default_port) == b.port_u16().unwrap_or(default_port)
+            && self.0.uri.path() == other.0.uri.path()
+            && self.0.uri.query() == other.0.uri.query()
+    }
+
     pub(crate) fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {
         self.0.rewrite_uri(inbound)
     }
@@ -333,6 +383,10 @@ impl WsUpstream {
 
     pub(crate) const fn is_tls(&self) -> bool {
         self.endpoint.is_tls
+    }
+
+    pub(crate) const fn redacted(&self) -> RedactedUri<'_> {
+        RedactedUri(&self.endpoint.uri)
     }
 
     pub(crate) const fn host_header(&self) -> &HeaderValue {

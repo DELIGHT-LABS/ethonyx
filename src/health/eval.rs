@@ -10,52 +10,81 @@ use crate::config::{RuntimeOpts, SlotClock};
 use super::cl::ClStatus;
 use super::el::{ElBlockResult, ElSyncingResult};
 use super::fetch::ProbeError;
+use super::reference::{ReferenceProbe, ReferenceSample, ReferenceState};
 
 /// Source of readiness and health data for `/healthz`, `/readyz`, and `node_health`.
 pub(crate) enum HealthSource {
     /// `--trust-upstream`: no background poller or `watch` channel is allocated.
     Trusted,
     /// Active background polling feeding snapshots via `watch`.
-    Polled(watch::Receiver<Arc<Probe>>),
+    Polled(watch::Receiver<Probe>),
 }
 
-/// The five upstream probe results captured by one poll, shared with the request
-/// handlers via a `watch` channel. `/healthz` and `/readyz` read the latest one
-/// instead of querying upstream per request, so upstream load is decoupled from
-/// probe rate. Stored as raw results so block / slot ages can be recomputed live.
+pub(crate) struct ClProbe {
+    pub(super) status: Result<ClStatus, ProbeError>,
+    pub(super) peers: Result<u64, ProbeError>,
+}
+
+pub(crate) struct LocalProbe {
+    pub(super) el_syncing: Result<ElSyncingResult, ProbeError>,
+    pub(super) el_peers: Result<Option<u64>, ProbeError>,
+    pub(super) el_block: Result<ElBlockResult, ProbeError>,
+    pub(super) cl: Option<ClProbe>,
+}
+
+/// Upstream probe results captured by background polling and shared with request
+/// handlers via a `watch` channel. `local` and `reference` live in separate `Arc`s
+/// so independent poll cadences swap their half with zero field-by-field cloning.
 #[derive(Clone)]
 pub(crate) struct Probe {
-    pub(super) el_syncing: Result<ElSyncingResult, ProbeError>,
-    pub(super) el_peers: Result<u64, ProbeError>,
-    pub(super) el_block: Result<ElBlockResult, ProbeError>,
-    pub(super) cl_status: Result<ClStatus, ProbeError>,
-    pub(super) cl_peers: Result<u64, ProbeError>,
+    pub(super) local: Arc<LocalProbe>,
+    pub(super) reference: Option<Arc<ReferenceProbe>>,
+    /// Readiness the poller evaluated when it published this snapshot (`None` before
+    /// the first poll). Only the poller reads it, to log transitions once; request
+    /// handlers always re-evaluate.
+    pub(super) published_ready: Option<bool>,
 }
 
 impl Probe {
-    pub(super) fn pending() -> Self {
-        let pending: ProbeError = Arc::from("initial poll pending");
+    pub(super) fn pending(has_cl: bool, has_reference: bool) -> Self {
+        let pending = || -> ProbeError { Box::from("initial poll pending") };
+        let cl = has_cl.then(|| ClProbe {
+            status: Err(pending()),
+            peers: Err(pending()),
+        });
+        let local = Arc::new(LocalProbe {
+            el_syncing: Err(pending()),
+            el_peers: Err(pending()),
+            el_block: Err(pending()),
+            cl,
+        });
+        let reference = has_reference.then(|| Arc::new(ReferenceProbe::pending()));
         Self {
-            el_syncing: Err(pending.clone()),
-            el_peers: Err(pending.clone()),
-            el_block: Err(pending.clone()),
-            cl_status: Err(pending.clone()),
-            cl_peers: Err(pending),
+            local,
+            reference,
+            published_ready: None,
         }
     }
 
-    pub(super) const fn has_errors(&self) -> bool {
-        self.el_syncing.is_err()
-            || self.el_peers.is_err()
-            || self.el_block.is_err()
-            || self.cl_status.is_err()
-            || self.cl_peers.is_err()
+    pub(super) fn has_errors(&self) -> bool {
+        self.local.el_syncing.is_err()
+            || self.local.el_peers.is_err()
+            || self.local.el_block.is_err()
+            || self
+                .local
+                .cl
+                .as_ref()
+                .is_some_and(|cl| cl.status.is_err() || cl.peers.is_err())
+            || self
+                .reference
+                .as_deref()
+                .is_some_and(|reference| !reference.errors.is_empty())
     }
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum ElSyncEval<'a> {
-    Synced,
+    Synced { block: u64 },
     SyncingBool,
     SyncingProgress { current_block: u64, distance: u64 },
     Err(&'a str),
@@ -63,20 +92,28 @@ pub(super) enum ElSyncEval<'a> {
 
 impl ElSyncEval<'_> {
     pub(super) const fn is_ok(self) -> bool {
-        matches!(self, Self::Synced)
+        matches!(self, Self::Synced { .. })
+    }
+
+    pub(super) const fn is_syncing(self) -> bool {
+        matches!(self, Self::SyncingBool | Self::SyncingProgress { .. })
+    }
+
+    pub(super) const fn is_reachable(self) -> bool {
+        !matches!(self, Self::Err(_))
     }
 }
 
 impl fmt::Display for ElSyncEval<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Synced => f.write_str("synced"),
+            Self::Synced { block } => write!(f, "synced (block {block})"),
             Self::SyncingBool => f.write_str("syncing (true)"),
             Self::SyncingProgress {
                 current_block,
                 distance,
             } => write!(f, "syncing (block {current_block}, distance {distance})"),
-            Self::Err(e) => write!(f, "eth_syncing: {e}"),
+            Self::Err(err) => f.write_str(err),
         }
     }
 }
@@ -85,12 +122,22 @@ impl fmt::Display for ElSyncEval<'_> {
 pub(super) enum ClSyncEval<'a> {
     Synced { head_slot: u64, sync_distance: u64 },
     Syncing { head_slot: u64, sync_distance: u64 },
+    Optimistic { head_slot: u64, sync_distance: u64 },
+    ElOffline { head_slot: u64 },
     Err(&'a str),
 }
 
 impl ClSyncEval<'_> {
     pub(super) const fn is_ok(self) -> bool {
         matches!(self, Self::Synced { .. })
+    }
+
+    pub(super) const fn is_syncing(self) -> bool {
+        matches!(self, Self::Syncing { .. })
+    }
+
+    pub(super) const fn is_reachable(self) -> bool {
+        !matches!(self, Self::Err(_) | Self::ElOffline { .. })
     }
 }
 
@@ -105,7 +152,49 @@ impl fmt::Display for ClSyncEval<'_> {
                 head_slot,
                 sync_distance,
             } => write!(f, "syncing (slot {head_slot}, distance {sync_distance})"),
-            Self::Err(e) => write!(f, "node/syncing: {e}"),
+            Self::Optimistic {
+                head_slot,
+                sync_distance,
+            } => write!(f, "optimistic (slot {head_slot}, distance {sync_distance})"),
+            Self::ElOffline { head_slot } => write!(f, "el_offline (slot {head_slot})"),
+            Self::Err(err) => f.write_str(err),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ReferenceLagEval {
+    WithinLag {
+        sample: ReferenceSample,
+        max_lag: u64,
+    },
+    Lagging {
+        sample: ReferenceSample,
+        max_lag: u64,
+    },
+    FailOpenUnavailable,
+}
+
+impl ReferenceLagEval {
+    pub(super) const fn is_ok(self) -> bool {
+        matches!(self, Self::WithinLag { .. } | Self::FailOpenUnavailable)
+    }
+}
+
+impl fmt::Display for ReferenceLagEval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WithinLag { sample, max_lag } => write!(
+                f,
+                "lag {} (reference block {}, max {max_lag})",
+                sample.block_lag, sample.block_number
+            ),
+            Self::Lagging { sample, max_lag } => write!(
+                f,
+                "lag {} exceeds max {max_lag} (reference block {})",
+                sample.block_lag, sample.block_number
+            ),
+            Self::FailOpenUnavailable => f.write_str("reference unavailable (fail-open)"),
         }
     }
 }
@@ -126,10 +215,7 @@ pub(super) enum FreshEval<'a> {
     Disabled {
         head_slot: u64,
     },
-    Err {
-        prefix: &'static str,
-        err: &'a str,
-    },
+    Err(&'a str),
 }
 
 impl FreshEval<'_> {
@@ -149,7 +235,7 @@ impl fmt::Display for FreshEval<'_> {
                 max_age,
             } => write!(f, "{kind} {num} stale: {age}s (max {max_age})"),
             Self::Disabled { head_slot } => write!(f, "slot {head_slot} (age check disabled)"),
-            Self::Err { prefix, err } => write!(f, "{prefix}: {err}"),
+            Self::Err(err) => f.write_str(err),
         }
     }
 }
@@ -159,52 +245,58 @@ impl fmt::Display for FreshEval<'_> {
 #[derive(Clone, Copy)]
 pub(super) struct ReadinessEval<'a> {
     pub(super) el_sync: ElSyncEval<'a>,
-    pub(super) cl_sync: ClSyncEval<'a>,
-    pub(super) strict: Option<(FreshEval<'a>, FreshEval<'a>)>,
+    pub(super) cl_sync: Option<ClSyncEval<'a>>,
+    pub(super) el_reference_lag: Option<ReferenceLagEval>,
+    pub(super) el_block_fresh: Option<FreshEval<'a>>,
+    pub(super) cl_slot_fresh: Option<FreshEval<'a>>,
 }
 
 impl ReadinessEval<'_> {
-    pub(super) const fn el_sync_ok(&self) -> bool {
+    pub(super) fn is_ready(&self) -> bool {
         self.el_sync.is_ok()
-    }
-
-    pub(super) const fn cl_sync_ok(&self) -> bool {
-        self.cl_sync.is_ok()
-    }
-
-    pub(super) const fn is_ready(&self) -> bool {
-        self.el_sync_ok()
-            && self.cl_sync_ok()
-            && match self.strict {
-                None => true,
-                Some((el_f, cl_f)) => el_f.is_ok() && cl_f.is_ok(),
-            }
+            && self.cl_sync.is_none_or(ClSyncEval::is_ok)
+            && self.el_reference_lag.is_none_or(ReferenceLagEval::is_ok)
+            && self.el_block_fresh.is_none_or(FreshEval::is_ok)
+            && self.cl_slot_fresh.is_none_or(FreshEval::is_ok)
     }
 }
 
-pub(super) fn evaluate_readiness<'a>(
-    cfg: &RuntimeOpts,
-    slot_clock: Option<SlotClock>,
-    probe: &'a Probe,
-) -> ReadinessEval<'a> {
-    let el_sync = eval_el_syncing(&probe.el_syncing);
-    let cl_sync = eval_cl_syncing(&probe.cl_status);
-    // `now` is only needed for strict freshness checks; the default sync-only path skips reading the clock.
-    let strict = cfg.readyz_strict.then(|| {
-        let now = now_unix();
-        (
-            eval_el_block_fresh(&probe.el_block, cfg.el_max_block_age_secs, now),
-            eval_cl_slot_fresh(&probe.cl_status, slot_clock, cfg.cl_max_slot_age_secs, now),
-        )
-    });
+pub(super) fn evaluate_readiness<'a>(cfg: &RuntimeOpts, probe: &'a Probe) -> ReadinessEval<'a> {
+    let local = &probe.local;
+    let el_sync = eval_el_syncing(&local.el_syncing, &local.el_block);
+    let cl_sync = local.cl.as_ref().map(|cl| eval_cl_syncing(&cl.status));
+    let el_reference_lag = probe
+        .reference
+        .as_deref()
+        .map(|ref_probe| eval_reference_lag(ref_probe.state, cfg.el_max_reference_lag));
+
+    // `now` is only needed for strict freshness checks; the default path skips reading the clock.
+    let (el_block_fresh, cl_slot_fresh) = match cfg.strict {
+        Some(strict) => {
+            let now = now_unix();
+            let el_f = Some(eval_el_block_fresh(
+                &local.el_block,
+                strict.el_max_block_age_secs,
+                now,
+            ));
+            let cl_f = local.cl.as_ref().map(|cl| {
+                eval_cl_slot_fresh(&cl.status, cfg.slot_clock, strict.cl_max_slot_age_secs, now)
+            });
+            (el_f, cl_f)
+        }
+        None => (None, None),
+    };
+
     ReadinessEval {
         el_sync,
         cl_sync,
-        strict,
+        el_reference_lag,
+        el_block_fresh,
+        cl_slot_fresh,
     }
 }
 
-/// What `poll_loop` should log given the previous and current readiness, so a
+/// What `publish` should log given the previous and current readiness, so a
 /// sustained state logs once (on transition) rather than once per poll.
 #[derive(Clone, Copy)]
 pub(super) enum Transition {
@@ -229,9 +321,12 @@ pub(super) fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn eval_el_syncing(r: &Result<ElSyncingResult, ProbeError>) -> ElSyncEval<'_> {
-    match r {
-        Ok(ElSyncingResult::Synced(false)) => ElSyncEval::Synced,
+fn eval_el_syncing<'a>(
+    syncing: &'a Result<ElSyncingResult, ProbeError>,
+    block: &'a Result<ElBlockResult, ProbeError>,
+) -> ElSyncEval<'a> {
+    match syncing {
+        Err(err) => ElSyncEval::Err(err),
         Ok(ElSyncingResult::Synced(true)) => ElSyncEval::SyncingBool,
         Ok(ElSyncingResult::Syncing {
             current_block,
@@ -240,21 +335,41 @@ fn eval_el_syncing(r: &Result<ElSyncingResult, ProbeError>) -> ElSyncEval<'_> {
             current_block: *current_block,
             distance: highest_block.saturating_sub(*current_block),
         },
-        Err(e) => ElSyncEval::Err(e),
+        Ok(ElSyncingResult::Synced(false)) => match block {
+            Ok(b) => ElSyncEval::Synced { block: b.number },
+            Err(err) => ElSyncEval::Err(err),
+        },
     }
 }
 
 fn eval_cl_syncing(r: &Result<ClStatus, ProbeError>) -> ClSyncEval<'_> {
     match r {
-        Ok(s) if !s.is_syncing => ClSyncEval::Synced {
-            head_slot: s.head_slot,
-            sync_distance: s.sync_distance,
-        },
-        Ok(s) => ClSyncEval::Syncing {
-            head_slot: s.head_slot,
-            sync_distance: s.sync_distance,
-        },
         Err(e) => ClSyncEval::Err(e),
+        Ok(s) if s.el_offline => ClSyncEval::ElOffline {
+            head_slot: s.head_slot,
+        },
+        Ok(s) if s.is_syncing => ClSyncEval::Syncing {
+            head_slot: s.head_slot,
+            sync_distance: s.sync_distance,
+        },
+        Ok(s) if s.is_optimistic => ClSyncEval::Optimistic {
+            head_slot: s.head_slot,
+            sync_distance: s.sync_distance,
+        },
+        Ok(s) => ClSyncEval::Synced {
+            head_slot: s.head_slot,
+            sync_distance: s.sync_distance,
+        },
+    }
+}
+
+const fn eval_reference_lag(state: ReferenceState, max_lag: u64) -> ReferenceLagEval {
+    match state.sample() {
+        Some(sample) if sample.block_lag <= max_lag => {
+            ReferenceLagEval::WithinLag { sample, max_lag }
+        }
+        Some(sample) => ReferenceLagEval::Lagging { sample, max_lag },
+        None => ReferenceLagEval::FailOpenUnavailable,
     }
 }
 
@@ -288,10 +403,7 @@ fn eval_el_block_fresh(
             now.saturating_sub(block.timestamp),
             max_age,
         ),
-        Err(e) => FreshEval::Err {
-            prefix: "eth_getBlockByNumber",
-            err: e,
-        },
+        Err(err) => FreshEval::Err(err),
     }
 }
 
@@ -311,10 +423,7 @@ fn eval_cl_slot_fresh(
             clock.slot_age(s.head_slot, now),
             max_age,
         ),
-        (Err(e), _) => FreshEval::Err {
-            prefix: "node/syncing",
-            err: e,
-        },
+        (Err(err), _) => FreshEval::Err(err),
     }
 }
 
@@ -328,47 +437,150 @@ mod tests {
     }
 
     #[test]
-    fn el_syncing_false_is_synced() {
-        let e = eval_el_syncing(&Ok(ElSyncingResult::Synced(false)));
-        assert_eval(e.is_ok(), e, true, "synced");
+    fn el_syncing_false_requires_readable_latest_block() {
+        let block = Ok(ElBlockResult {
+            number: 42,
+            timestamp: 1000,
+        });
+        let e = eval_el_syncing(&Ok(ElSyncingResult::Synced(false)), &block);
+        assert_eval(e.is_ok(), e, true, "synced (block 42)");
+
+        let broken_block: Result<ElBlockResult, ProbeError> =
+            Err("eth_getBlockByNumber: db error".into());
+        let e_err = eval_el_syncing(&Ok(ElSyncingResult::Synced(false)), &broken_block);
+        assert_eval(
+            e_err.is_ok(),
+            e_err,
+            false,
+            "eth_getBlockByNumber: db error",
+        );
     }
 
     #[test]
-    fn el_syncing_object_reports_block_progress() {
-        let e = eval_el_syncing(&Ok(ElSyncingResult::Syncing {
-            current_block: 0x10,
-            highest_block: 0x20,
-        }));
+    fn el_syncing_object_reports_progress_even_when_latest_block_is_null() {
+        let null_block: Result<ElBlockResult, ProbeError> = Err("null block".into());
+        let e = eval_el_syncing(
+            &Ok(ElSyncingResult::Syncing {
+                current_block: 0x10,
+                highest_block: 0x20,
+            }),
+            &null_block,
+        );
         assert_eval(e.is_ok(), e, false, "syncing (block 16, distance 16)");
+        assert!(e.is_syncing());
+        assert!(e.is_reachable());
     }
 
     #[test]
     fn el_syncing_error_is_prefixed() {
-        let r = Err("boom".into());
-        let e = eval_el_syncing(&r);
-        assert_eval(e.is_ok(), e, false, "eth_syncing: boom");
+        let r = Err(crate::health::fetch::HealthError::Rpc("boom".into()).during("eth_syncing"));
+        let block = Ok(ElBlockResult {
+            number: 1,
+            timestamp: 1,
+        });
+        let e = eval_el_syncing(&r, &block);
+        assert_eval(e.is_ok(), e, false, "eth_syncing: rpc error: boom");
+        assert!(!e.is_reachable());
     }
 
     #[test]
-    fn cl_syncing_synced_is_ok() {
-        let r = Ok(ClStatus {
+    fn cl_syncing_distinguishes_synced_syncing_optimistic_and_el_offline() {
+        let r_ok = Ok(ClStatus {
             head_slot: 42,
             sync_distance: 0,
             is_syncing: false,
+            is_optimistic: false,
+            el_offline: false,
         });
-        let e = eval_cl_syncing(&r);
-        assert_eval(e.is_ok(), e, true, "synced (slot 42, distance 0)");
-    }
+        let e_ok = eval_cl_syncing(&r_ok);
+        assert_eval(e_ok.is_ok(), e_ok, true, "synced (slot 42, distance 0)");
 
-    #[test]
-    fn cl_syncing_in_progress_fails() {
-        let r = Ok(ClStatus {
+        // Active syncing with `is_optimistic: true` stays `Syncing` (206-eligible).
+        let r_sync = Ok(ClStatus {
             head_slot: 42,
             sync_distance: 5,
             is_syncing: true,
+            is_optimistic: true,
+            el_offline: false,
         });
-        let e = eval_cl_syncing(&r);
-        assert_eval(e.is_ok(), e, false, "syncing (slot 42, distance 5)");
+        let e_sync = eval_cl_syncing(&r_sync);
+        assert_eval(
+            e_sync.is_ok(),
+            e_sync,
+            false,
+            "syncing (slot 42, distance 5)",
+        );
+        assert!(e_sync.is_syncing());
+        assert!(e_sync.is_reachable());
+
+        // Non-syncing optimistic (silent EL stall / ENOSPC) fails readiness and is not syncing.
+        let r_opt = Ok(ClStatus {
+            head_slot: 42,
+            sync_distance: 0,
+            is_syncing: false,
+            is_optimistic: true,
+            el_offline: false,
+        });
+        let e_opt = eval_cl_syncing(&r_opt);
+        assert_eval(
+            e_opt.is_ok(),
+            e_opt,
+            false,
+            "optimistic (slot 42, distance 0)",
+        );
+        assert!(!e_opt.is_syncing());
+        assert!(e_opt.is_reachable());
+
+        // `el_offline: true` takes precedence even over `is_syncing: true` (unreachable Engine API).
+        let r_off = Ok(ClStatus {
+            head_slot: 42,
+            sync_distance: 5,
+            is_syncing: true,
+            is_optimistic: true,
+            el_offline: true,
+        });
+        let e_off = eval_cl_syncing(&r_off);
+        assert_eval(e_off.is_ok(), e_off, false, "el_offline (slot 42)");
+        assert!(!e_off.is_reachable());
+    }
+
+    #[test]
+    fn reference_lag_eval_covers_within_lagging_retained_and_unavailable() {
+        let within = eval_reference_lag(
+            ReferenceState::Active(ReferenceSample {
+                block_number: 101,
+                block_lag: 1,
+            }),
+            1,
+        );
+        assert_eval(
+            within.is_ok(),
+            within,
+            true,
+            "lag 1 (reference block 101, max 1)",
+        );
+
+        let lagging = eval_reference_lag(
+            ReferenceState::Retained(ReferenceSample {
+                block_number: 102,
+                block_lag: 2,
+            }),
+            1,
+        );
+        assert_eval(
+            lagging.is_ok(),
+            lagging,
+            false,
+            "lag 2 exceeds max 1 (reference block 102)",
+        );
+
+        let unavail = eval_reference_lag(ReferenceState::Unavailable, 1);
+        assert_eval(
+            unavail.is_ok(),
+            unavail,
+            true,
+            "reference unavailable (fail-open)",
+        );
     }
 
     #[test]
@@ -397,6 +609,8 @@ mod tests {
             head_slot: 7,
             sync_distance: 0,
             is_syncing: false,
+            is_optimistic: false,
+            el_offline: false,
         });
         let e = eval_cl_slot_fresh(&r, SlotClock::new(0, 12), 60, 9_999_999);
         assert_eval(e.is_ok(), e, true, "slot 7 (age check disabled)");
@@ -408,6 +622,8 @@ mod tests {
             head_slot: 10,
             sync_distance: 0,
             is_syncing: false,
+            is_optimistic: false,
+            el_offline: false,
         });
         let e = eval_cl_slot_fresh(&r, SlotClock::new(1000, 12), 60, 1300);
         assert_eval(e.is_ok(), e, false, "slot 10 stale: 180s (max 60)");

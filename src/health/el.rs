@@ -1,8 +1,6 @@
 //! Execution Layer JSON-RPC batch probe (`eth_syncing`, `net_peerCount`, `eth_getBlockByNumber`)
 //! and adaptive cleartext `h2c` transport detection.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use http::{Method, Request, Uri};
 
@@ -12,6 +10,10 @@ use crate::transport::{H2cMode, HttpTransport, ProxyClient};
 use super::fetch::{HealthError, JsonObject, ProbeTarget, is_transport};
 
 const EL_BATCH_REQ: &[u8] = br#"[{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1},{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":2},{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":3}]"#;
+const EL_BLOCK_NUMBER_REQ: &[u8] =
+    br#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#;
+const EL_CHAIN_ID_REQ: &[u8] = br#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#;
+const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ElSyncingResult {
@@ -68,9 +70,38 @@ pub(super) struct ElBlockResult {
 #[cfg_attr(test, derive(Debug))]
 pub(super) struct ElBatchResult {
     pub(super) syncing: Result<ElSyncingResult, HealthError>,
-    pub(super) peers: Result<u64, HealthError>,
+    pub(super) peers: Result<Option<u64>, HealthError>,
     pub(super) block: Result<ElBlockResult, HealthError>,
 }
+
+#[derive(serde::Deserialize)]
+struct RpcResponse<'a> {
+    id: i64,
+    #[serde(borrow)]
+    result: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    error: Option<&'a serde_json::value::RawValue>,
+}
+
+impl RpcResponse<'_> {
+    fn decode<T: serde::de::DeserializeOwned>(self) -> Result<T, HealthError> {
+        if let Some(err) = self.error {
+            return Err(HealthError::Rpc(Box::from(err.get())));
+        }
+        let raw = self
+            .result
+            .ok_or_else(|| HealthError::Decode(Box::from("missing result")))?;
+        serde_json::from_str(raw.get()).map_err(decode_err)
+    }
+}
+
+fn decode_err(err: serde_json::Error) -> HealthError {
+    HealthError::Decode(err.to_string().into_boxed_str())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct HexQuantity(#[serde(deserialize_with = "hex_string")] u64);
 
 /// Query all three EL JSON-RPC methods in a batch request, maintaining the transport verdict.
 pub(super) async fn el_batch_detect(
@@ -146,75 +177,104 @@ pub(super) async fn el_batch_detect(
     }
 }
 
-async fn el_batch_rpc(el: ProbeTarget<'_>, uri: &Uri) -> Result<ElBatchResult, HealthError> {
+async fn el_post_rpc(
+    el: ProbeTarget<'_>,
+    uri: &Uri,
+    payload: &'static [u8],
+) -> Result<Bytes, HealthError> {
     let req = Request::builder()
         .method(Method::POST)
         .uri(uri.clone())
         .header("content-type", "application/json")
-        .body(full_body(Bytes::from_static(EL_BATCH_REQ)))
-        .map_err(|e| HealthError::Transport(Arc::from(format!("build: {e}"))))?;
-    let body = el.fetch_bytes(req).await?;
+        .body(full_body(Bytes::from_static(payload)))
+        .map_err(|e| HealthError::Transport(format!("build: {e}").into_boxed_str()))?;
+    el.fetch_bytes(req).await
+}
+
+async fn el_batch_rpc(el: ProbeTarget<'_>, uri: &Uri) -> Result<ElBatchResult, HealthError> {
+    let body = el_post_rpc(el, uri, EL_BATCH_REQ).await?;
     parse_el_batch(&body)
 }
 
-fn parse_el_batch(body: &[u8]) -> Result<ElBatchResult, HealthError> {
-    #[derive(serde::Deserialize)]
-    struct RpcResponse<'a> {
-        id: i64,
-        #[serde(borrow)]
-        result: Option<&'a serde_json::value::RawValue>,
-        #[serde(borrow)]
-        error: Option<&'a serde_json::value::RawValue>,
+pub(super) async fn el_block_number(el: ProbeTarget<'_>, uri: &Uri) -> Result<u64, HealthError> {
+    el_quantity_rpc(el, uri, EL_BLOCK_NUMBER_REQ).await
+}
+
+pub(super) async fn el_chain_id(el: ProbeTarget<'_>, uri: &Uri) -> Result<u64, HealthError> {
+    el_quantity_rpc(el, uri, EL_CHAIN_ID_REQ).await
+}
+
+/// Query one hex-quantity RPC. An adaptive cleartext target uses its currently selected
+/// `h2c`/`h1` client and retries once over `el.client` (HTTP/1.1) on transport errors
+/// without mutating `H2cMode` (owned exclusively by [`el_batch_detect`]); every other
+/// target has a single client and is queried once.
+async fn el_quantity_rpc(
+    el: ProbeTarget<'_>,
+    uri: &Uri,
+    payload: &'static [u8],
+) -> Result<u64, HealthError> {
+    let selected = el.transport.select_client(el.client);
+    let first = ProbeTarget {
+        client: selected,
+        ..el
+    };
+    let body = match el_post_rpc(first, uri, payload).await {
+        Err(err) if is_transport(&err) && !std::ptr::eq(selected, el.client) => {
+            el_post_rpc(el, uri, payload).await
+        }
+        res => res,
+    }?;
+    parse_el_quantity(&body)
+}
+
+fn parse_el_quantity(body: &[u8]) -> Result<u64, HealthError> {
+    let JsonObject(resp): JsonObject<RpcResponse<'_>> =
+        serde_json::from_slice(body).map_err(decode_err)?;
+    if resp.id != 1 {
+        return Err(HealthError::Decode(Box::from("unexpected response id")));
     }
+    resp.decode::<HexQuantity>().map(|HexQuantity(n)| n)
+}
 
+fn is_method_not_found(err_raw: &str) -> bool {
     #[derive(serde::Deserialize)]
-    #[serde(transparent)]
-    struct HexQuantity(#[serde(deserialize_with = "hex_string")] u64);
+    struct RpcErrorCode {
+        code: i64,
+    }
+    serde_json::from_str::<JsonObject<RpcErrorCode>>(err_raw)
+        .is_ok_and(|JsonObject(e)| e.code == JSONRPC_METHOD_NOT_FOUND)
+}
 
-    let arr: [JsonObject<RpcResponse<'_>>; 3] =
-        serde_json::from_slice(body).map_err(|e| HealthError::Decode(Arc::from(e.to_string())))?;
+fn parse_el_batch(body: &[u8]) -> Result<ElBatchResult, HealthError> {
+    let arr: [JsonObject<RpcResponse<'_>>; 3] = serde_json::from_slice(body).map_err(decode_err)?;
     let mut slots: [Option<RpcResponse<'_>>; 3] = [None, None, None];
     for JsonObject(resp) in arr {
-        let Some(idx) = usize::try_from(resp.id)
+        // An id outside `1..=3` has no slot, and a repeated id overwrites one: with
+        // exactly three responses either case leaves a slot empty below.
+        if let Some(slot) = usize::try_from(resp.id)
             .ok()
             .and_then(|id| id.checked_sub(1))
-            .filter(|&idx| idx < 3)
-        else {
-            return Err(HealthError::Decode(Arc::from(
-                "duplicate or unexpected response id",
-            )));
-        };
-        if slots[idx].replace(resp).is_some() {
-            return Err(HealthError::Decode(Arc::from(
-                "duplicate or unexpected response id",
-            )));
+            .and_then(|idx| slots.get_mut(idx))
+        {
+            *slot = Some(resp);
         }
     }
-
-    let decode_res = |idx: usize| -> Result<&serde_json::value::RawValue, HealthError> {
-        let resp = slots[idx].as_ref().ok_or_else(|| {
-            HealthError::Decode(Arc::from(format!("missing response for id {}", idx + 1)))
-        })?;
-        if let Some(err) = resp.error {
-            return Err(HealthError::Rpc(Arc::from(err.get())));
-        }
-        resp.result
-            .ok_or_else(|| HealthError::Decode(Arc::from("missing result")))
+    let [Some(r_syncing), Some(r_peers), Some(r_block)] = slots else {
+        return Err(HealthError::Decode(Box::from(
+            "duplicate or unexpected response id",
+        )));
     };
 
-    let syncing = decode_res(0).and_then(|raw| {
-        serde_json::from_str(raw.get()).map_err(|e| HealthError::Decode(Arc::from(e.to_string())))
-    });
-    let peers = decode_res(1).and_then(|raw| {
-        serde_json::from_str::<HexQuantity>(raw.get())
-            .map(|HexQuantity(n)| n)
-            .map_err(|e| HealthError::Decode(Arc::from(e.to_string())))
-    });
-    let block = decode_res(2).and_then(|raw| {
-        serde_json::from_str::<JsonObject<ElBlockResult>>(raw.get())
-            .map(|JsonObject(block)| block)
-            .map_err(|e| HealthError::Decode(Arc::from(e.to_string())))
-    });
+    let syncing = r_syncing.decode();
+    let peers = match r_peers.error {
+        Some(err) if is_method_not_found(err.get()) => Ok(None),
+        _ => r_peers
+            .decode::<HexQuantity>()
+            .map(|HexQuantity(n)| Some(n)),
+    };
+    let block = r_block
+        .decode::<JsonObject<ElBlockResult>>()
+        .map(|JsonObject(block)| block);
 
     Ok(ElBatchResult {
         syncing,
@@ -254,6 +314,7 @@ mod tests {
     use crate::transport::{build_client, build_connectors};
     use http::{Response, StatusCode};
     use http_body_util::{BodyExt, Full};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -349,7 +410,7 @@ mod tests {
             } else if body == valid {
                 let batch = result.unwrap();
                 assert_eq!(batch.syncing.unwrap(), ElSyncingResult::Synced(false));
-                assert_eq!(batch.peers.unwrap(), 0x40);
+                assert_eq!(batch.peers.unwrap(), Some(0x40));
             } else {
                 assert!(matches!(result.unwrap_err(), HealthError::Decode(_)));
             }
@@ -452,7 +513,7 @@ mod tests {
             let input = format!("[{}]", order.map(|i| replies[i]).join(","));
             let parsed = parse_el_batch(input.as_bytes()).unwrap();
             assert_eq!(parsed.syncing.unwrap(), ElSyncingResult::Synced(false));
-            assert_eq!(parsed.peers.unwrap(), 0x40);
+            assert_eq!(parsed.peers.unwrap(), Some(0x40));
             assert_eq!(parsed.block.unwrap().timestamp, 2);
         }
         for input in [
@@ -480,6 +541,43 @@ mod tests {
         assert_eq!(parsed.syncing.unwrap(), ElSyncingResult::Synced(false));
         assert_eq!(parsed.block.unwrap().number, 0x42);
         assert!(matches!(parsed.peers, Err(HealthError::Rpc(_))));
+
+        // JSON-RPC `-32601` (Method not found) on `net_peerCount` is treated as unsupported (`Ok(None)`), not an error.
+        let method_not_found = parse_el_batch(br#"[{"id":1,"result":false},{"id":2,"error":{"code":-32601,"message":"Method not found"}},{"id":3,"result":{"number":"0x0","timestamp":"0x0"}}]"#).unwrap();
+        assert_eq!(method_not_found.peers.unwrap(), None);
+        assert_eq!(method_not_found.block.unwrap().number, 0);
+    }
+
+    #[test]
+    fn single_quantity_parser_enforces_object_id_and_hex_rules() {
+        assert_eq!(
+            parse_el_quantity(br#"{"jsonrpc":"2.0","id":1,"result":"0x0"}"#).unwrap(),
+            0
+        );
+        assert_eq!(
+            parse_el_quantity(br#"{"jsonrpc":"2.0","id":1,"result":"0xa4b1"}"#).unwrap(),
+            42_161
+        );
+        for bad in [
+            r#"{"jsonrpc":"2.0","id":2,"result":"0x1"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x00"}"#,
+            r#"[1,"0x1"]"#,
+        ] {
+            assert!(
+                matches!(
+                    parse_el_quantity(bad.as_bytes()),
+                    Err(HealthError::Decode(_))
+                ),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            parse_el_quantity(
+                br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#
+            ),
+            Err(HealthError::Rpc(_))
+        ));
     }
 
     #[test]

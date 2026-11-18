@@ -1,7 +1,5 @@
 //! Consensus Layer Beacon API health probes (`/eth/v1/node/syncing`, `/eth/v1/node/peer_count`).
 
-use std::sync::Arc;
-
 use http::{Method, Request, Uri};
 
 use crate::response::empty_body;
@@ -15,6 +13,10 @@ pub(super) struct ClStatus {
     #[serde(deserialize_with = "decimal_string")]
     pub(super) sync_distance: u64,
     pub(super) is_syncing: bool,
+    #[serde(default)]
+    pub(super) is_optimistic: bool,
+    #[serde(default)]
+    pub(super) el_offline: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -26,7 +28,7 @@ pub(super) async fn cl_syncing_status(
     cl: ProbeTarget<'_>,
     uri: &Uri,
 ) -> Result<ClStatus, ProbeError> {
-    cl_get_json(cl, uri).await
+    cl_get_json(cl, uri, "node/syncing").await
 }
 
 pub(super) async fn cl_peer_count(cl: ProbeTarget<'_>, uri: &Uri) -> Result<u64, ProbeError> {
@@ -35,30 +37,28 @@ pub(super) async fn cl_peer_count(cl: ProbeTarget<'_>, uri: &Uri) -> Result<u64,
         #[serde(deserialize_with = "decimal_string")]
         connected: u64,
     }
-    let peers: Peers = cl_get_json(cl, uri).await?;
+    let peers: Peers = cl_get_json(cl, uri, "node/peer_count").await?;
     Ok(peers.connected)
 }
 
 async fn cl_get_json<T: serde::de::DeserializeOwned>(
     cl: ProbeTarget<'_>,
     uri: &Uri,
+    method: &str,
 ) -> Result<T, ProbeError> {
     let req = Request::builder()
         .method(Method::GET)
         .uri(uri.clone())
         .body(empty_body())
-        .map_err(|e| Arc::from(e.to_string()))?;
-    let body = cl
-        .fetch_bytes(req)
-        .await
-        .map_err(HealthError::into_probe_error)?;
-    parse_cl_response(&body)
+        .map_err(|e| format!("{method}: {e}").into_boxed_str())?;
+    let body = cl.fetch_bytes(req).await.map_err(|e| e.during(method))?;
+    parse_cl_response(&body).map_err(|e| e.during(method))
 }
 
-fn parse_cl_response<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ProbeError> {
+fn parse_cl_response<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, HealthError> {
     serde_json::from_slice::<JsonObject<ClEnvelope<T>>>(body)
         .map(|JsonObject(envelope)| envelope.data.0)
-        .map_err(|e| Arc::from(format!("decode: {e}")))
+        .map_err(|e| HealthError::Decode(e.to_string().into_boxed_str()))
 }
 
 fn decimal_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
@@ -103,6 +103,15 @@ mod tests {
         let response: ClEnvelope<ClStatus> = serde_json::from_str(r#"{"data":{"head_slot":"9412341","sync_distance":"0","is_syncing":false,"extra":{"ignored":true}}}"#).unwrap();
         assert_eq!(response.data.0.head_slot, 9_412_341);
         assert_eq!(response.data.0.sync_distance, 0);
+        assert!(!response.data.0.is_optimistic);
+        assert!(!response.data.0.el_offline);
+
+        let flags: ClEnvelope<ClStatus> = serde_json::from_str(
+            r#"{"data":{"head_slot":"10","sync_distance":"0","is_syncing":false,"is_optimistic":true,"el_offline":true}}"#,
+        )
+        .unwrap();
+        assert!(flags.data.0.is_optimistic);
+        assert!(flags.data.0.el_offline);
         for value in [
             "42",
             "null",

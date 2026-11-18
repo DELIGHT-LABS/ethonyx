@@ -10,6 +10,7 @@ use hyper_util::rt::{TokioExecutor, TokioTimer};
 use tracing::{debug, info, warn};
 
 use crate::response::ResBody;
+use crate::upstream::{HttpUpstream, WsUpstream};
 
 const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(60);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -111,7 +112,7 @@ impl ObservedHttpVersion {
         }
     }
 
-    pub(crate) fn is_h2(&self) -> bool {
+    fn is_h2(&self) -> bool {
         self.0.load(Ordering::Relaxed) == Self::HTTP_2
     }
 
@@ -167,9 +168,9 @@ impl H2cMode {
     }
 }
 
-/// Unified transport tracker and client selector for EL and CL HTTP hops.
+/// Unified transport tracker and client selector for EL, CL, and reference HTTP hops.
 pub(crate) enum HttpTransport {
-    /// Cleartext HTTP/1.1 only (CL cleartext, or EL `--trust-upstream` cleartext).
+    /// Cleartext HTTP/1.1 only (CL/reference cleartext, or EL `--trust-upstream` cleartext).
     CleartextH1,
     /// `https://` upstream: negotiates `h2` vs `http/1.1` via TLS ALPN on `state.client`.
     TlsAuto(ObservedHttpVersion),
@@ -182,7 +183,7 @@ pub(crate) enum HttpTransport {
 }
 
 impl HttpTransport {
-    pub(crate) const fn new_cl(is_tls: bool) -> Self {
+    pub(crate) const fn new_standard(is_tls: bool) -> Self {
         if is_tls {
             Self::TlsAuto(ObservedHttpVersion::new())
         } else {
@@ -245,10 +246,6 @@ impl HttpTransport {
         }
     }
 
-    pub(crate) fn is_observed_h2(&self) -> bool {
-        matches!(self, Self::TlsAuto(obs) if obs.is_h2())
-    }
-
     /// Machine-readable transport label for `/healthz` (`"h2c"`, `"h2"`, or `"http/1.1"`).
     pub(crate) fn label(&self) -> &'static str {
         match self {
@@ -273,6 +270,26 @@ impl HttpTransport {
             },
         }
     }
+}
+
+pub(crate) struct HttpTarget {
+    pub(crate) upstream: HttpUpstream,
+    pub(crate) transport: HttpTransport,
+}
+
+impl HttpTarget {
+    pub(crate) const fn new_standard(upstream: HttpUpstream) -> Self {
+        let transport = HttpTransport::new_standard(upstream.is_tls());
+        Self {
+            upstream,
+            transport,
+        }
+    }
+}
+
+pub(crate) struct WsTarget {
+    pub(crate) upstream: WsUpstream,
+    pub(crate) tls: tokio_tungstenite::Connector,
 }
 
 #[cfg(test)]

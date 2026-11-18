@@ -25,7 +25,6 @@ mod upstream;
 mod websocket;
 
 pub use config::Config;
-use upstream::RedactedUrl;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -47,24 +46,18 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[must_use = "Prepared does nothing unless `.bind().await` or `.run(shutdown).await` is called"]
 pub struct Prepared {
     cfg: Config,
-    listen: Vec<config::ListenAddr>,
-    upstreams: config::ValidatedUpstreams,
+    parsed: config::ParsedConfig,
     telemetry: otel::Telemetry,
 }
 
 impl Prepared {
     /// Validate `cfg` and start the OTLP providers when an endpoint is configured.
     pub async fn new(cfg: Config) -> Result<Self, BoxError> {
-        let config::ParsedConfig {
-            listen,
-            upstreams,
-            otel_endpoint,
-        } = cfg.parse_validated()?;
-        let telemetry = otel::start(otel_endpoint).await?;
+        let mut parsed = cfg.parse_validated()?;
+        let telemetry = otel::start(parsed.otel_endpoint.take()).await?;
         Ok(Self {
             cfg,
-            listen,
-            upstreams,
+            parsed,
             telemetry,
         })
     }
@@ -89,19 +82,26 @@ impl Prepared {
     pub async fn bind(self) -> Result<Bound, BoxError> {
         let Self {
             cfg,
-            listen,
-            upstreams,
+            parsed:
+                config::ParsedConfig {
+                    listen,
+                    opts,
+                    upstreams,
+                    health,
+                    otel_endpoint: _,
+                },
             telemetry,
         } = self;
         let shutdown_grace = cfg.shutdown_grace;
-        let (health, poller) = health::channel(&cfg);
+        let el_references = health.reference_count();
+        let (health, mut poller) = health::channel(health, upstreams.cl.is_some());
         let state = Arc::new(AppState::new(
-            &cfg,
+            opts,
             upstreams,
             telemetry.is_enabled(),
             health,
             metrics::ServerMetrics::new(telemetry.metric_sink()),
-        )?);
+        ));
 
         info!(
             version = concat!("v", env!("CARGO_PKG_VERSION")),
@@ -109,10 +109,11 @@ impl Prepared {
             ?cfg,
             "starting ethonyx"
         );
+        drop(cfg);
 
         // `Prepared::run` cancels this warm-up poll by dropping the `bind` future
         // when shutdown arrives before listeners are bound.
-        let startup_msg = match &poller {
+        let startup_msg = match poller.as_mut() {
             None => "upstreams configured (trusted)",
             Some(poller) => {
                 if poller.warm(&state).await {
@@ -122,13 +123,25 @@ impl Prepared {
                 }
             }
         };
+        let el_ws = state.el_ws.as_ref().map(|ws| ws.upstream.redacted());
+        let cl_beacon = state.cl.as_ref().map(|cl| cl.beacon.upstream.redacted());
+        let cl_mev_relay = state
+            .cl
+            .as_ref()
+            .and_then(|cl| cl.mev_relay.as_ref())
+            .map(|mev| mev.upstream.redacted());
+        let cl_proto = state
+            .cl
+            .as_ref()
+            .map_or("none", |cl| cl.beacon.transport.startup_proto_label());
         info!(
-            el_http = %RedactedUrl(&cfg.el_http_url),
+            el_http = %state.el.upstream.redacted(),
             el_http_proto = %state.el.transport.startup_proto_label(),
-            el_ws = %RedactedUrl(&cfg.el_ws_url),
-            cl_beacon = %RedactedUrl(&cfg.cl_beacon_url),
-            cl_mev_relay = %upstream::RedactedOptUrl(cfg.cl_mev_relay_url.as_deref()),
-            cl_proto = %state.cl.transport.startup_proto_label(),
+            el_ws = %upstream::RedactedOptUri(el_ws),
+            el_references,
+            cl_beacon = %upstream::RedactedOptUri(cl_beacon),
+            cl_mev_relay = %upstream::RedactedOptUri(cl_mev_relay),
+            cl_proto = %cl_proto,
             "{startup_msg}"
         );
 
@@ -289,6 +302,8 @@ mod tests {
             "127.0.0.1:0",
             "--listen",
             "127.0.0.1:0",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
             "--trust-upstream",
             "--shutdown-grace",
             "0",

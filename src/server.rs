@@ -316,7 +316,7 @@ pub(crate) async fn accept_loop(
                 if !saturated {
                     saturated = true;
                     warn!(
-                        max_connections = state.cfg.max_connections,
+                        max_connections = state.opts.max_connections,
                         "connection limit reached; queueing accepts"
                     );
                 }
