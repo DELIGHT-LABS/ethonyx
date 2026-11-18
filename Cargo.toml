@@ -13,18 +13,19 @@ categories = ["network-programming"]
 [dependencies]
 clap = { version = "4.6", features = ["derive", "env"] }
 hyper = { version = "1.12", features = ["server", "client", "http1", "http2"] }
-hyper-util = { version = "0.1.21", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "http2", "tokio"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "aws-lc-rs", "webpki-tokio", "tls12"] }
 http = "1.5"
 http-body-util = "0.1.5"
 bytes = "1.12"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
-futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink", "async-await"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# Keep `smallvec` (avoids heap Vec fallback in JSON span/filter paths) and `tracing-log` (rustls/tungstenite bridge).
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "smallvec", "fmt", "json", "env-filter", "tracing-log"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 rustls = { version = "0.23.46" }
@@ -41,6 +42,10 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", 
 hyper-util = { version = "0.1.21", features = ["server-auto"] }
 tokio = { version = "1.54.1", features = ["test-util"] }
 
+# Omit DWARF debuginfo on third-party crates while keeping full local debuginfo for CodeLLDB.
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -52,7 +57,7 @@ publish = false                                              # binary, not a cra
 allow-branch = ["main"]                                      # release only from main
 tag-message = "Release v{{version}}"
 pre-release-commit-message = "chore: release v{{version}}"
-pre-release-hook = ["cargo", "test", "--locked"]             # gate before any state change
+pre-release-hook = ["cargo", "test", "--locked", "--all-features"] # gate before any state change
 pre-release-replacements = [
     { file = "CHANGELOG.md", search = "Unreleased",             replace = "{{version}}",                              min = 1 },
     { file = "CHANGELOG.md", search = "ReleaseDate",            replace = "{{date}}",                                 min = 1 },
