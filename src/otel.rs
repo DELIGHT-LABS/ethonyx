@@ -655,7 +655,7 @@ mod tests {
                 )),
         );
 
-        let (https, _) = crate::transport::build_connectors(false);
+        let https = crate::transport::build_https_connector();
         let h1_client = crate::transport::build_client(https.clone());
         let h2c_client = crate::transport::build_h2c_client(https);
         let uri: http::Uri = format!("http://{addr}/").parse().unwrap();

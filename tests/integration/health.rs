@@ -191,11 +191,11 @@ async fn healthz_is_200_even_when_upstreams_fail() {
 }
 
 #[tokio::test]
-async fn el_down_keeps_default_h2c_verdict_and_502s() {
+async fn el_down_keeps_conservative_h1_verdict_and_502s() {
     // EL upstream down: both the h2c probe and the h1 fallback fail at the
-    // transport layer, so the poller keeps the default (h2c) verdict instead of
-    // flapping to h1. /healthz still answers 200 with the EL error inline and
-    // reports the unconfirmed default transport; the data-plane returns 502.
+    // transport layer, so `H2cMode` stays `Unprobed` and reports the conservative
+    // `http/1.1` verdict instead of falsely claiming `h2c`. `/healthz` still
+    // answers 200 with the EL error inline; the data-plane returns 502.
     let dead = DeadPort::new();
     let cl = MockServer::start(ok_handler()).await;
     let ethonyx = EthonyxHandle::start(&[
@@ -213,8 +213,8 @@ async fn el_down_keeps_default_h2c_verdict_and_502s() {
     let el_errors = v["el"]["errors"].as_array().expect("el.errors array");
     assert!(!el_errors.is_empty(), "expected an EL error, got {v}");
     assert_eq!(
-        v["el"]["transport"], "h2c",
-        "a down EL keeps the default verdict"
+        v["el"]["transport"], "http/1.1",
+        "an unconfirmed/down EL stays conservatively on http/1.1"
     );
 
     // The data-plane forwards to the (dead) EL and surfaces a 502.
@@ -1081,41 +1081,48 @@ async fn trust_upstream_reports_honest_healthz_mode_without_fabricated_fields() 
 }
 
 #[tokio::test]
-async fn adaptive_el_h2c_recovers_after_transient_upstream_restart() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+async fn confirmed_el_h2c_survives_stale_socket_restart_and_downgrades_to_h1() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let el_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let el_addr = el_listener.local_addr().unwrap();
     let el_url = format!("http://{el_addr}");
     let allow_h2c = Arc::new(AtomicBool::new(true));
+    let el_reqs = Arc::new(AtomicUsize::new(0));
     let conn_handles: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
 
     let flag = allow_h2c.clone();
+    let reqs = el_reqs.clone();
     let handles = conn_handles.clone();
     let el_server = tokio::spawn(async move {
         while let Ok((stream, _)) = el_listener.accept().await {
             let h2 = flag.load(Ordering::Acquire);
+            let reqs = reqs.clone();
             let h = tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-                let svc = service_fn(|req: Request<Incoming>| async move {
-                    let bytes = req.into_body().collect().await.unwrap().to_bytes();
-                    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-                    let resp = if v.is_array() {
-                        json!([
-                            {"jsonrpc":"2.0","id":1,"result":false},
-                            {"jsonrpc":"2.0","id":2,"result":"0x4"},
-                            {"jsonrpc":"2.0","id":3,"result":{"number":"0x1","timestamp":"0x1"}}
-                        ])
-                    } else {
-                        json!({"jsonrpc":"2.0","id":1,"result":"0x1"})
-                    };
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .header("content-type", "application/json")
-                            .body(Full::new(Bytes::from(serde_json::to_vec(&resp).unwrap())))
-                            .unwrap(),
-                    )
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let reqs = reqs.clone();
+                    async move {
+                        reqs.fetch_add(1, Ordering::AcqRel);
+                        let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                        let resp = if v.is_array() {
+                            json!([
+                                {"jsonrpc":"2.0","id":1,"result":false},
+                                {"jsonrpc":"2.0","id":2,"result":"0x4"},
+                                {"jsonrpc":"2.0","id":3,"result":{"number":"0x1","timestamp":"0x1"}}
+                            ])
+                        } else {
+                            json!({"jsonrpc":"2.0","id":1,"result":"0x1"})
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(serde_json::to_vec(&resp).unwrap())))
+                                .unwrap(),
+                        )
+                    }
                 });
                 if h2 {
                     let _ = auto::Builder::new(TokioExecutor::new())
@@ -1152,13 +1159,38 @@ async fn adaptive_el_h2c_recovers_after_transient_upstream_restart() {
     .await;
     let c = client();
 
-    // 1. Initial poll confirms h2c (`H2C_CONFIRMED`).
+    // 1. Initial poll confirms h2c (`H2c`).
     let (_, hz1) = get(&c, &proxy.url("/healthz")).await;
     let v1: Value = serde_json::from_slice(&hz1).unwrap();
     assert_eq!(v1["el"]["transport"], "h2c");
 
-    // 2. Simulate transient h2c rejection (h1-only fallback -> `H1_VERIFY_ONCE`):
-    // flip `allow_h2c = false` and drop pooled server connections.
+    // 2. Drop pooled server connections while h2c stays enabled (pod roll / stale socket):
+    // confirmed h2c retries once on a fresh socket and stays on `h2c` without downgrading.
+    let before_reset = el_reqs.load(Ordering::Acquire);
+    for h in conn_handles.lock().unwrap().drain(..) {
+        h.abort();
+    }
+    let mut polled_after_reset = false;
+    for _ in 0..30 {
+        if el_reqs.load(Ordering::Acquire) > before_reset {
+            polled_after_reset = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    assert!(
+        polled_after_reset,
+        "expected a fresh health poll after stale socket reset"
+    );
+    let (_, hz2) = get(&c, &proxy.url("/healthz")).await;
+    let v2: Value = serde_json::from_slice(&hz2).unwrap();
+    assert_eq!(
+        v2["el"]["transport"], "h2c",
+        "stale pooled socket must retry h2c without downgrading to http/1.1"
+    );
+
+    // 3. When the upstream actually drops h2c (h1-only), the poller downgrades within
+    // one poll and settles on `http/1.1`.
     allow_h2c.store(false, Ordering::Release);
     for h in conn_handles.lock().unwrap().drain(..) {
         h.abort();
@@ -1169,8 +1201,6 @@ async fn adaptive_el_h2c_recovers_after_transient_upstream_restart() {
         let (_, hz) = get(&c, &proxy.url("/healthz")).await;
         let v: Value = serde_json::from_slice(&hz).unwrap();
         if v["el"]["transport"] == "http/1.1" {
-            // Restore h2c immediately so the `H1_VERIFY_ONCE` poll sees h2c back up!
-            allow_h2c.store(true, Ordering::Release);
             entered_fallback = true;
             break;
         }
@@ -1178,23 +1208,7 @@ async fn adaptive_el_h2c_recovers_after_transient_upstream_restart() {
     }
     assert!(
         entered_fallback,
-        "expected fallback to http/1.1 when h2c dropped"
-    );
-
-    // 3. `H1_VERIFY_ONCE` probes h2c once more and self-heals back to `H2C_CONFIRMED`.
-    let mut recovered_h2c = false;
-    for _ in 0..30 {
-        let (_, hz) = get(&c, &proxy.url("/healthz")).await;
-        let v: Value = serde_json::from_slice(&hz).unwrap();
-        if v["el"]["transport"] == "h2c" {
-            recovered_h2c = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(80)).await;
-    }
-    assert!(
-        recovered_h2c,
-        "confirmed h2c EL must self-heal back to h2c on the H1_VERIFY_ONCE poll"
+        "expected downgrade to http/1.1 when h2c dropped"
     );
 
     proxy.shutdown().await;

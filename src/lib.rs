@@ -30,8 +30,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::OptionFuture;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::state::AppState;
 
@@ -53,8 +54,8 @@ pub struct Prepared {
 impl Prepared {
     /// Validate `cfg` and start the OTLP providers when an endpoint is configured.
     pub async fn new(cfg: Config) -> Result<Self, BoxError> {
-        let mut parsed = cfg.parse_validated()?;
-        let telemetry = otel::start(parsed.otel_endpoint.take()).await?;
+        let (parsed, otel_endpoint) = cfg.parse_with_otel()?;
+        let telemetry = otel::start(otel_endpoint).await?;
         Ok(Self {
             cfg,
             parsed,
@@ -63,7 +64,7 @@ impl Prepared {
     }
 
     /// Borrow the validated [`Config`] (e.g. to configure logging before [`Prepared::run`]).
-    pub fn config(&self) -> &Config {
+    pub const fn config(&self) -> &Config {
         &self.cfg
     }
 
@@ -88,20 +89,11 @@ impl Prepared {
                     opts,
                     upstreams,
                     health,
-                    otel_endpoint: _,
+                    shutdown_grace,
                 },
             telemetry,
         } = self;
-        let shutdown_grace = cfg.shutdown_grace;
         let el_references = health.reference_count();
-        let (health, mut poller) = health::channel(health, upstreams.cl.is_some());
-        let state = Arc::new(AppState::new(
-            opts,
-            upstreams,
-            telemetry.is_enabled(),
-            health,
-            metrics::ServerMetrics::new(telemetry.metric_sink()),
-        ));
 
         info!(
             version = concat!("v", env!("CARGO_PKG_VERSION")),
@@ -113,16 +105,16 @@ impl Prepared {
 
         // `Prepared::run` cancels this warm-up poll by dropping the `bind` future
         // when shutdown arrives before listeners are bound.
-        let startup_msg = match poller.as_mut() {
-            None => "upstreams configured (trusted)",
-            Some(poller) => {
-                if poller.warm(&state).await {
-                    "upstreams configured (initial probe degraded)"
-                } else {
-                    "upstreams connected"
-                }
-            }
-        };
+        let (state, poller) = AppState::start(
+            opts,
+            upstreams,
+            health,
+            telemetry.is_enabled(),
+            metrics::ServerMetrics::new(telemetry.metric_sink()),
+        )
+        .await;
+
+        let startup_msg = state.health.startup_message();
         let el_ws = state.el_ws.as_ref().map(|ws| ws.upstream.redacted());
         let cl_beacon = state.cl.as_ref().map(|cl| cl.beacon.upstream.redacted());
         let cl_mev_relay = state
@@ -232,50 +224,84 @@ impl Bound {
         } = self;
 
         let (shutdown_tx, shutdown_rx) = lifecycle::channel();
-        let poller = poller.map(|p| p.spawn(Arc::clone(&state), shutdown_rx.clone()));
+        let mut poller = poller.map(|p| p.spawn(Arc::clone(&state), shutdown_rx.clone()));
 
         let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<()>(1);
         let lifecycle = lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
         let prometheus = state.metrics.prometheus_handle();
-        let accept_handle = tokio::spawn(server::accept_loop(listeners, state, lifecycle));
+        let mut accept_handle = tokio::spawn(server::accept_loop(listeners, state, lifecycle));
 
         // Prometheus idle-bucket upkeep belongs to the serving task itself: it runs
         // while this server waits for shutdown and needs no task of its own.
+        const UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
+        let mut upkeep = tokio::time::interval_at(
+            tokio::time::Instant::now() + UPKEEP_INTERVAL,
+            UPKEEP_INTERVAL,
+        );
+        upkeep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        enum ServeExit {
+            Shutdown,
+            Accept(Result<(), tokio::task::JoinError>),
+            Poller(Result<(), tokio::task::JoinError>),
+        }
+
         tokio::pin!(shutdown);
-        loop {
+        let exit = loop {
             tokio::select! {
                 biased;
-                () = &mut shutdown => break,
-                () = tokio::time::sleep(Duration::from_secs(5)) => prometheus.run_upkeep(),
+                () = &mut shutdown => {
+                    info!("shutdown signal received");
+                    break ServeExit::Shutdown;
+                }
+                res = &mut accept_handle => {
+                    warn!("accept loop exited unexpectedly; shutting down");
+                    break ServeExit::Accept(res);
+                }
+                Some(res) = OptionFuture::from(poller.as_mut()), if poller.is_some() => {
+                    warn!("health poller exited unexpectedly; shutting down");
+                    break ServeExit::Poller(res);
+                }
+                _ = upkeep.tick() => prometheus.run_upkeep(),
             }
-        }
+        };
         drop(prometheus);
-        info!("shutdown signal received");
 
         let deadline = tokio::time::Instant::now() + shutdown_grace;
         shutdown_tx.send(deadline);
 
-        let accept_res = accept_handle.await;
-        let poller_res = match poller {
-            Some(poller) => Some(poller.await),
-            None => None,
+        let outcome: Result<(), BoxError> = match exit {
+            ServeExit::Shutdown => {
+                let (accept_res, poller_res) =
+                    tokio::join!(accept_handle, OptionFuture::from(poller));
+                accept_res
+                    .and_then(|()| poller_res.transpose().map(|_| ()))
+                    .map_err(Into::into)
+            }
+            ServeExit::Accept(accept_res) => {
+                let poller_res = OptionFuture::from(poller).await;
+                accept_res
+                    .and_then(|()| poller_res.transpose().map(|_| ()))
+                    .map_err(BoxError::from)
+                    .and_then(|()| Err("accept loop exited unexpectedly".into()))
+            }
+            ServeExit::Poller(poller_res) => {
+                let accept_res = accept_handle.await;
+                accept_res
+                    .and(poller_res)
+                    .map_err(BoxError::from)
+                    .and_then(|()| Err("health poller exited unexpectedly".into()))
+            }
         };
 
-        info!(
-            grace_secs = shutdown_grace.as_secs(),
-            "draining connections"
-        );
+        info!(grace = ?shutdown_grace, "draining connections");
         // Each connection, HTTP/2 request and relay uses the same deadline. Wait for
         // their futures to be dropped even with zero grace; timing out this barrier
         // would let serve() return before sockets and request tasks are released.
         let _ = conn_rx.recv().await;
 
         telemetry.shutdown().await;
-        accept_res?;
-        if let Some(poller_res) = poller_res {
-            poller_res?;
-        }
-        Ok(())
+        outcome
     }
 }
 

@@ -11,10 +11,62 @@ use crate::BoxError;
 #[derive(Clone, Copy)]
 pub(crate) struct RedactedUrl<'a>(pub(crate) &'a str);
 
+/// Structural split of a `[ipv6]` / `host` authority with an optional `:port`.
+#[derive(Clone, Copy)]
+pub(crate) enum HostPort<'a> {
+    Bracketed {
+        host: &'a str,
+        port: Option<&'a str>,
+    },
+    Plain {
+        host: &'a str,
+        port: Option<&'a str>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum HostPortError {
+    UnclosedBracket,
+    TrailingAfterBracket,
+}
+
+/// Split an authority or listen address into its bracketed/plain host and optional
+/// `:port` using `split_once(':')` so unbracketed multi-colon inputs (such as
+/// credential strings missing `@`) never hide non-digit tokens behind a trailing port.
+pub(crate) fn split_host_port(input: &str) -> Result<HostPort<'_>, HostPortError> {
+    if let Some(rest) = input.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            return Err(HostPortError::UnclosedBracket);
+        };
+        let port = match suffix.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if suffix.is_empty() => None,
+            None => return Err(HostPortError::TrailingAfterBracket),
+        };
+        Ok(HostPort::Bracketed { host, port })
+    } else {
+        let (host, port) = match input.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (input, None),
+        };
+        Ok(HostPort::Plain { host, port })
+    }
+}
+
+fn has_safe_redacted_port(host_port: &str) -> bool {
+    match split_host_port(host_port) {
+        Ok(HostPort::Bracketed { port, .. } | HostPort::Plain { port, .. }) => {
+            port.is_none_or(|p| p.bytes().all(|b| b.is_ascii_digit()))
+        }
+        Err(_) => false,
+    }
+}
+
 fn fmt_redacted_parts(
     f: &mut fmt::Formatter<'_>,
     scheme: &str,
-    authority: &Authority,
+    has_userinfo: bool,
+    host_port: &str,
     path: &str,
     has_query_or_frag: bool,
 ) -> fmt::Result {
@@ -22,13 +74,10 @@ fn fmt_redacted_parts(
         f.write_char(char::from(b.to_ascii_lowercase()))?;
     }
     f.write_str("://")?;
-    match authority.as_str().rsplit_once('@') {
-        Some((_, host_port)) => {
-            f.write_str("<redacted>@")?;
-            f.write_str(host_port)?;
-        }
-        None => f.write_str(authority.as_str())?,
+    if has_userinfo {
+        f.write_str("<redacted>@")?;
     }
+    f.write_str(host_port)?;
     if !matches!(path, "" | "/") || has_query_or_frag {
         f.write_str("/<redacted>")?;
     }
@@ -37,9 +86,13 @@ fn fmt_redacted_parts(
 
 impl fmt::Display for RedactedUrl<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (without_frag, has_frag) = match self.0.split_once('#') {
+        let raw = self.0.trim();
+        let (without_frag, has_frag) = match raw.split_once('#') {
+            // A `#` before `@` (e.g. `user:pass#123@host`) would split inside
+            // userinfo and expose credentials as the parsed authority host.
+            Some((_, frag)) if frag.contains('@') => return f.write_str("<invalid-url>"),
             Some((base, _)) => (base, true),
-            None => (self.0, false),
+            None => (raw, false),
         };
         let Ok(uri) = without_frag.parse::<Uri>() else {
             return f.write_str("<invalid-url>");
@@ -47,10 +100,28 @@ impl fmt::Display for RedactedUrl<'_> {
         let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) else {
             return f.write_str("<invalid-url>");
         };
+        // `/` or `?` inside userinfo (e.g. `user:pass/abc@host`) terminates the
+        // authority early, leaving credentials in `authority` and `@` in path/query.
+        if uri
+            .path_and_query()
+            .is_some_and(|pq| pq.as_str().contains('@'))
+        {
+            return f.write_str("<invalid-url>");
+        }
+        let (has_userinfo, host_port) = match authority.as_str().rsplit_once('@') {
+            Some((_, hp)) => (true, hp),
+            None => (false, authority.as_str()),
+        };
+        // Non-digit `:port` (e.g. `user:pass/v3` missing `@`) can carry a password
+        // in the port position because `http::Uri` does not validate numeric ports.
+        if !has_safe_redacted_port(host_port) {
+            return f.write_str("<invalid-url>");
+        }
         fmt_redacted_parts(
             f,
             scheme,
-            authority,
+            has_userinfo,
+            host_port,
             uri.path(),
             uri.query().is_some() || has_frag,
         )
@@ -75,7 +146,8 @@ impl fmt::Display for RedactedUri<'_> {
         fmt_redacted_parts(
             f,
             scheme,
-            authority,
+            false,
+            authority.as_str(),
             self.0.path(),
             self.0.query().is_some(),
         )
@@ -109,33 +181,80 @@ pub(crate) fn parse_canonical_port(s: &str, allow_zero: bool) -> Option<u16> {
     s.parse::<u16>().ok()
 }
 
+fn invalid_url(flag: &'static str, raw: &str, detail: impl fmt::Display) -> BoxError {
+    format!("invalid {flag} ({}): {detail}", RedactedUrl(raw)).into()
+}
+
 /// Shared authority validation for upstream and OTLP URLs: rejects deprecated
-/// `user:pass@` userinfo (RFC 9110 §4.2.4 / RFC 6455 §3), empty hosts, and
-/// empty, zero, non-canonical, or out-of-range `:port` suffixes without leaking URL secrets.
-pub(crate) fn validate_authority(
+/// `user:pass@` userinfo (RFC 9110 §4.2.4 / RFC 6455 §3), empty, zoned, or
+/// malformed bracketed IPv6 hosts, trailing garbage after `]`, and empty, zero,
+/// non-canonical, or out-of-range `:port` suffixes without leaking URL secrets.
+fn validate_authority(
     flag: &'static str,
     raw: &str,
     authority: &Authority,
 ) -> Result<(), BoxError> {
     let auth = authority.as_str();
     if auth.contains('@') {
-        return Err(format!(
-            "invalid {flag} ({}): URL userinfo is not supported",
-            RedactedUrl(raw)
-        )
-        .into());
+        return Err(invalid_url(flag, raw, "URL userinfo is not supported"));
     }
-    if authority.host().is_empty() {
-        return Err(format!("invalid {flag} ({}): empty host", RedactedUrl(raw)).into());
-    }
-    let port_str = match auth.rsplit_once(']') {
-        Some((_, rest)) => rest.strip_prefix(':'),
-        None => auth.split_once(':').map(|(_, p)| p),
+    let port_str = match split_host_port(auth) {
+        Ok(HostPort::Bracketed { host, port }) => {
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(invalid_url(flag, raw, "invalid IPv6 host"));
+            }
+            port
+        }
+        Ok(HostPort::Plain { host, port }) => {
+            if auth.contains(['[', ']']) {
+                return Err(invalid_url(flag, raw, "invalid host"));
+            }
+            if host.is_empty() {
+                return Err(invalid_url(flag, raw, "empty host"));
+            }
+            port
+        }
+        Err(HostPortError::UnclosedBracket) => {
+            return Err(invalid_url(flag, raw, "invalid IPv6 host"));
+        }
+        Err(HostPortError::TrailingAfterBracket) => {
+            return Err(invalid_url(flag, raw, "invalid authority"));
+        }
     };
     if port_str.is_some_and(|p| parse_canonical_port(p, false).is_none()) {
-        return Err(format!("invalid {flag} ({}): invalid port", RedactedUrl(raw)).into());
+        return Err(invalid_url(flag, raw, "invalid port"));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum SchemeFamily {
+    Http,
+    Ws,
+}
+
+impl SchemeFamily {
+    fn parse(self, raw: Option<&str>) -> Option<(Scheme, bool)> {
+        let s = raw?;
+        match self {
+            Self::Http if s.eq_ignore_ascii_case("http") => Some((Scheme::HTTP, false)),
+            Self::Http if s.eq_ignore_ascii_case("https") => Some((Scheme::HTTPS, true)),
+            Self::Ws if s.eq_ignore_ascii_case("ws") => {
+                Some((Scheme::try_from("ws").expect("valid ws scheme"), false))
+            }
+            Self::Ws if s.eq_ignore_ascii_case("wss") => {
+                Some((Scheme::try_from("wss").expect("valid wss scheme"), true))
+            }
+            _ => None,
+        }
+    }
+
+    const fn expected(self) -> &'static str {
+        match self {
+            Self::Http => "scheme must be http or https",
+            Self::Ws => "scheme must be ws or wss",
+        }
+    }
 }
 
 /// Pre-classified base path/query shape so `rewrite_uri` avoids repeating string
@@ -148,7 +267,6 @@ enum BaseTarget {
     Scoped { join_prefix_len: usize },
 }
 
-#[derive(Clone)]
 struct Endpoint {
     uri: Uri,
     target: BaseTarget,
@@ -156,61 +274,38 @@ struct Endpoint {
 }
 
 impl Endpoint {
-    fn parse(
-        flag: &'static str,
-        raw: &str,
-        allowed_schemes: (&'static str, &'static str),
-    ) -> Result<Self, BoxError> {
+    fn parse(flag: &'static str, raw: &str, family: SchemeFamily) -> Result<Self, BoxError> {
+        let raw = raw.trim();
         if raw.contains('#') {
-            return Err(format!(
-                "invalid {flag} ({}): URL must not contain a #fragment",
-                RedactedUrl(raw)
-            )
-            .into());
+            return Err(invalid_url(flag, raw, "URL must not contain a #fragment"));
         }
         let parsed: Uri = raw
             .parse()
-            .map_err(|_| format!("invalid {flag} ({}): malformed URI", RedactedUrl(raw)))?;
+            .map_err(|_| invalid_url(flag, raw, "malformed URI"))?;
 
-        let (plain_scheme, tls_scheme) = allowed_schemes;
-        let (scheme, is_tls) = match parsed.scheme_str() {
-            Some(s) if s.eq_ignore_ascii_case(plain_scheme) => (
-                Scheme::try_from(plain_scheme).expect("valid static scheme"),
-                false,
-            ),
-            Some(s) if s.eq_ignore_ascii_case(tls_scheme) => (
-                Scheme::try_from(tls_scheme).expect("valid static scheme"),
-                true,
-            ),
-            _ => {
-                return Err(format!(
-                    "invalid {flag} ({}): scheme must be {plain_scheme} or {tls_scheme}",
-                    RedactedUrl(raw)
-                )
-                .into());
-            }
+        let Some((scheme, is_tls)) = family.parse(parsed.scheme_str()) else {
+            return Err(invalid_url(flag, raw, family.expected()));
         };
 
         let mut parts = parsed.into_parts();
         let Some(authority) = parts.authority.as_ref() else {
-            return Err(format!("invalid {flag} ({}): missing host", RedactedUrl(raw)).into());
+            return Err(invalid_url(flag, raw, "missing host"));
         };
         validate_authority(flag, raw, authority)?;
 
         // Normalize `https://host?query` (`path_and_query == "?query"`) to `"/?query"` once
-        // at startup so `uri.path_and_query()` always begins with `'/'` (RFC 9112 origin-form).
+        // at startup so any present `path_and_query` begins with `'/'` (RFC 9112 origin-form).
         if let Some(pq) = parts.path_and_query.as_ref()
             && !pq.as_str().starts_with('/')
         {
-            parts.path_and_query =
-                Some(compose_pq("/", "", pq.query(), None).map_err(|_| {
-                    format!("invalid {flag} ({}): malformed URI", RedactedUrl(raw))
-                })?);
+            parts.path_and_query = Some(
+                compose_pq("/", "", pq.query(), None)
+                    .map_err(|_| invalid_url(flag, raw, "malformed URI"))?,
+            );
         }
 
         parts.scheme = Some(scheme);
-        let uri = Uri::from_parts(parts)
-            .map_err(|_| format!("invalid {flag} ({}): malformed URI", RedactedUrl(raw)))?;
+        let uri = Uri::from_parts(parts).map_err(|_| invalid_url(flag, raw, "malformed URI"))?;
 
         let base_path = uri.path();
         let target = if base_path == "/" && uri.query().is_none() {
@@ -228,6 +323,10 @@ impl Endpoint {
         })
     }
 
+    const fn default_port(&self) -> u16 {
+        if self.is_tls { 443 } else { 80 }
+    }
+
     /// Compose the upstream URI by moving `inbound`'s [`PathAndQuery`] directly
     /// into [`Uri::from_parts`] on root-based upstreams (zero heap allocation),
     /// and assembling a single pre-sized [`BytesMut`] buffer when joining scoped
@@ -242,7 +341,10 @@ impl Endpoint {
         }
 
         let pq = match self.target {
-            BaseTarget::Root => inbound_pq.unwrap_or_else(|| PathAndQuery::from_static("/")),
+            BaseTarget::Root => match inbound_pq {
+                Some(pq) if pq.as_str().starts_with('/') => pq,
+                _ => compose_pq("/", "", None, inbound_query)?,
+            },
             BaseTarget::Scoped { join_prefix_len } => {
                 let base_path = self.uri.path();
                 let (head, tail) = if matches!(inbound_path, "" | "/") {
@@ -279,41 +381,34 @@ fn compose_pq(
     base_query: Option<&str>,
     inbound_query: Option<&str>,
 ) -> Result<PathAndQuery, InvalidUri> {
-    let query_cap = match (base_query, inbound_query) {
-        (Some(bq), Some(iq)) => {
-            1 + bq.len() + usize::from(!bq.is_empty() && !iq.is_empty()) + iq.len()
-        }
-        (Some(q), None) | (None, Some(q)) => 1 + q.len(),
-        (None, None) => 0,
+    let (q1, amp, q2) = match (base_query, inbound_query) {
+        (Some(bq), Some(iq)) => (Some(bq), !bq.is_empty() && !iq.is_empty(), Some(iq)),
+        (Some(q), None) | (None, Some(q)) => (Some(q), false, None),
+        (None, None) => (None, false, None),
     };
+    let query_cap = q1.map_or(0, |q| 1 + q.len()) + usize::from(amp) + q2.map_or(0, str::len);
     let mut buf = BytesMut::with_capacity(path_head.len() + path_tail.len() + query_cap);
     buf.extend_from_slice(path_head.as_bytes());
     buf.extend_from_slice(path_tail.as_bytes());
-    match (base_query, inbound_query) {
-        (Some(bq), Some(iq)) => {
-            buf.extend_from_slice(b"?");
-            buf.extend_from_slice(bq.as_bytes());
-            if !bq.is_empty() && !iq.is_empty() {
-                buf.extend_from_slice(b"&");
-            }
-            buf.extend_from_slice(iq.as_bytes());
-        }
-        (Some(q), None) | (None, Some(q)) => {
-            buf.extend_from_slice(b"?");
-            buf.extend_from_slice(q.as_bytes());
-        }
-        (None, None) => {}
+    if let Some(q1) = q1 {
+        buf.extend_from_slice(b"?");
+        buf.extend_from_slice(q1.as_bytes());
+    }
+    if amp {
+        buf.extend_from_slice(b"&");
+    }
+    if let Some(q2) = q2 {
+        buf.extend_from_slice(q2.as_bytes());
     }
     PathAndQuery::from_maybe_shared(buf.freeze())
 }
 
 /// Validated `http://` or `https://` upstream endpoint.
-#[derive(Clone)]
 pub(crate) struct HttpUpstream(Endpoint);
 
 impl HttpUpstream {
     pub(crate) fn parse(flag: &'static str, raw: &str) -> Result<Self, BoxError> {
-        Endpoint::parse(flag, raw, ("http", "https")).map(Self)
+        Endpoint::parse(flag, raw, SchemeFamily::Http).map(Self)
     }
 
     pub(crate) const fn is_tls(&self) -> bool {
@@ -336,7 +431,7 @@ impl HttpUpstream {
         }
         let a = self.0.uri.authority().expect("validated authority");
         let b = other.0.uri.authority().expect("validated authority");
-        let default_port = if self.0.is_tls { 443 } else { 80 };
+        let default_port = self.0.default_port();
         a.host().eq_ignore_ascii_case(b.host())
             && a.port_u16().unwrap_or(default_port) == b.port_u16().unwrap_or(default_port)
             && self.0.uri.path() == other.0.uri.path()
@@ -346,38 +441,34 @@ impl HttpUpstream {
     pub(crate) fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {
         self.0.rewrite_uri(inbound)
     }
+
+    /// Append a static path (e.g. `"/eth/v1/node/syncing"` or `"/v1/traces"`) onto
+    /// this base upstream, returning a redacted config error on failure.
+    pub(crate) fn join_static_path(
+        &self,
+        flag: &'static str,
+        path: &'static str,
+    ) -> Result<Uri, BoxError> {
+        self.rewrite_uri(Uri::from_static(path))
+            .map_err(|e| format!("invalid {flag} ({}): {e}", self.redacted()).into())
+    }
 }
 
-/// Validated `ws://` or `wss://` upstream endpoint with a pre-built `Host`
-/// header and pre-parsed TCP dial target.
-#[derive(Clone)]
+/// Validated `ws://` or `wss://` upstream endpoint with a pre-built `Host` header.
 pub(crate) struct WsUpstream {
     endpoint: Endpoint,
     host_header: HeaderValue,
-    dial_host: Box<str>,
-    dial_port: u16,
 }
 
 impl WsUpstream {
     pub(crate) fn parse(flag: &'static str, raw: &str) -> Result<Self, BoxError> {
-        let endpoint = Endpoint::parse(flag, raw, ("ws", "wss"))?;
+        let endpoint = Endpoint::parse(flag, raw, SchemeFamily::Ws)?;
         let authority = endpoint.uri.authority().expect("validated authority");
         let host_header = HeaderValue::from_str(authority.as_str())
-            .map_err(|_| format!("invalid {flag} ({}): invalid Host header", RedactedUrl(raw)))?;
-        let raw_host = authority.host();
-        let dial_host = raw_host
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(raw_host)
-            .into();
-        let dial_port = authority
-            .port_u16()
-            .unwrap_or(if endpoint.is_tls { 443 } else { 80 });
+            .map_err(|_| invalid_url(flag, raw, "invalid Host header"))?;
         Ok(Self {
             endpoint,
             host_header,
-            dial_host,
-            dial_port,
         })
     }
 
@@ -394,9 +485,18 @@ impl WsUpstream {
     }
 
     /// `(host, port)` suitable for `TcpStream::connect` (IPv6 square brackets
-    /// stripped and default `80` / `443` port resolved at startup).
-    pub(crate) const fn dial_target(&self) -> (&str, u16) {
-        (&self.dial_host, self.dial_port)
+    /// stripped and default `80` / `443` port resolved from the validated authority).
+    pub(crate) fn dial_target(&self) -> (&str, u16) {
+        let authority = self.endpoint.uri.authority().expect("validated authority");
+        let raw_host = authority.host();
+        let host = raw_host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(raw_host);
+        let port = authority
+            .port_u16()
+            .unwrap_or_else(|| self.endpoint.default_port());
+        (host, port)
     }
 
     pub(crate) fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {
@@ -441,6 +541,32 @@ mod tests {
                 "https://rpc.example.com#frag-secret",
                 "https://rpc.example.com/<redacted>",
             ),
+            ("https://user:pass#123@rpc.example.com", "<invalid-url>"),
+            ("https://user:12345#frag@rpc.example.com", "<invalid-url>"),
+            ("https://user:pass/a#b@rpc.example.com", "<invalid-url>"),
+            (
+                "https://user:TOPSECRET/abc@rpc.example.com",
+                "<invalid-url>",
+            ),
+            (
+                "https://user:TOPSECRET?abc@rpc.example.com",
+                "<invalid-url>",
+            ),
+            ("https://user:12345/abc@rpc.example.com", "<invalid-url>"),
+            ("https://SECRET/abc@rpc.example.com", "<invalid-url>"),
+            ("https://SECRET?abc@rpc.example.com", "<invalid-url>"),
+            ("https://user:TOPSECRET/v3", "<invalid-url>"),
+            ("http://[::1]:TOPSECRET/v3", "<invalid-url>"),
+            ("http://[::1]garbage/v3", "<invalid-url>"),
+            (
+                "http://127.0.0.1:99999/APIKEY",
+                "http://127.0.0.1:99999/<redacted>",
+            ),
+            ("http://127.0.0.1:/APIKEY", "http://127.0.0.1:/<redacted>"),
+            (
+                " https://rpc.example.com/secret?k=1 ",
+                "https://rpc.example.com/<redacted>",
+            ),
             ("not-a-url-with-secret", "<invalid-url>"),
             ("/relative/secret", "<invalid-url>"),
         ] {
@@ -481,6 +607,8 @@ mod tests {
         assert_eq!(default_wss.dial_target(), ("ws.example.com", 443));
         let default_ws = WsUpstream::parse("--el-ws-url", "ws://ws.example.com").unwrap();
         assert_eq!(default_ws.dial_target(), ("ws.example.com", 80));
+        let trimmed = HttpUpstream::parse("--el-http-url", "  http://127.0.0.1:8545  ").unwrap();
+        assert_eq!(trimmed.uri(), "http://127.0.0.1:8545/");
 
         for bad_http in [
             "ws://user:TOPSECRET@127.0.0.1:8546/APIKEY",
@@ -493,10 +621,22 @@ mod tests {
             "http://127.0.0.1:/APIKEY",
             "http://[::1]:/APIKEY",
             "http://[::1]:70000/APIKEY",
+            "http://[]/APIKEY",
+            "http://[]:8545/APIKEY",
+            "http://[::1]garbage/APIKEY",
+            "http://[::1]garbage:99999/APIKEY",
+            "http://foo[::1]:8545/APIKEY",
+            "http://[fe80::1%25en0]:8545/APIKEY",
+            "http://[fe80::1%25]:8545/APIKEY",
+            "http://[not-ipv6]:8545/APIKEY",
             "ftp://127.0.0.1:8545/APIKEY",
             "http:///APIKEY",
             "/v3/APIKEY",
             "https://rpc.example.com/v3/APIKEY#FRAGSECRET",
+            "https://user:TOPSECRET#FRAGSECRET@rpc.example.com/APIKEY",
+            "https://user:TOPSECRET/abc@rpc.example.com/APIKEY",
+            "https://user:TOPSECRET?abc@rpc.example.com/APIKEY",
+            "https://user:TOPSECRET/APIKEY",
         ] {
             let err = HttpUpstream::parse("--el-http-url", bad_http)
                 .err()
@@ -517,8 +657,13 @@ mod tests {
             "ws://127.0.0.1:+8546/APIKEY",
             "ws://127.0.0.1:008546/APIKEY",
             "ws://127.0.0.1:99999/APIKEY",
+            "ws://[]:8546/APIKEY",
+            "ws://[::1]garbage:8546/APIKEY",
+            "ws://foo[::1]:8546/APIKEY",
+            "ws://[fe80::1%25en0]:8546/APIKEY",
             "ws:///APIKEY",
             "wss://ws.example.com/APIKEY#FRAGSECRET",
+            "wss://user:TOPSECRET#FRAGSECRET@ws.example.com/APIKEY",
         ] {
             let err = WsUpstream::parse("--el-ws-url", bad_ws)
                 .err()
@@ -586,6 +731,15 @@ mod tests {
         assert_eq!(
             root_ws.rewrite_uri(Uri::from_static("/?q=1")).unwrap(),
             "ws://127.0.0.1:8546/?q=1"
+        );
+        // Absolute-form query-only inbound URI (`http://host?foo=1`) must still yield
+        // a leading `'/'` for valid HTTP/2 `:path` pseudo-headers.
+        let root_http = HttpUpstream::parse("--el-http-url", "http://127.0.0.1:8545").unwrap();
+        let abs_query: Uri = "http://example.com?foo=1".parse().unwrap();
+        let rewritten = root_http.rewrite_uri(abs_query).unwrap();
+        assert_eq!(
+            rewritten.path_and_query().map(PathAndQuery::as_str),
+            Some("/?foo=1")
         );
 
         let keyed_ws = WsUpstream::parse("--el-ws-url", "ws://127.0.0.1:8546/v2/testkey").unwrap();

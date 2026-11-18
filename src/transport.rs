@@ -1,13 +1,16 @@
 //! Upstream HTTP/TLS client builders and negotiated protocol tracking.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use http::Version;
+use http::{Request, Response, Version};
+use hyper::body::Incoming;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
-use tracing::{debug, info, warn};
+use tokio::time::Instant;
+use tracing::{debug, warn};
 
 use crate::response::ResBody;
 use crate::upstream::{HttpUpstream, WsUpstream};
@@ -36,6 +39,7 @@ fn build_http_connector() -> HttpConnector {
     http.set_nodelay(true);
     http.enforce_http(false);
     http.set_keepalive(Some(TCP_KEEPALIVE_TIME));
+    http.set_keepalive_interval(Some(TCP_KEEPALIVE_INTERVAL));
     http
 }
 
@@ -51,33 +55,52 @@ fn configure_client_builder() -> hyper_util::client::legacy::Builder {
     builder
 }
 
-/// Build the shared WebPKI TLS configuration once so `https://` and `wss://`
-/// upstreams share root certificates while keeping `wss://` ALPN empty (strictly
-/// HTTP/1.1 `Upgrade`) and using [`tokio_tungstenite::Connector::Plain`] on `ws://`.
-pub(crate) fn build_connectors(ws_is_tls: bool) -> (Https, tokio_tungstenite::Connector) {
+fn build_tls_config() -> rustls::ClientConfig {
     use hyper_rustls::ConfigBuilderExt;
 
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let base_tls = rustls::ClientConfig::builder()
+    rustls::ClientConfig::builder()
         .with_webpki_roots()
-        .with_no_client_auth();
+        .with_no_client_auth()
+}
+
+fn wrap_https_connector(tls: rustls::ClientConfig) -> Https {
+    hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        // ALPN advertises ["h2","http/1.1"] for https upstreams -> auto-negotiate
+        // h2 when the upstream offers it; cleartext upstreams stay h1.
+        .enable_all_versions()
+        .wrap_connector(build_http_connector())
+}
+
+/// Build an HTTPS-capable HTTP/1.1+HTTP/2 connector using WebPKI roots.
+#[cfg(test)]
+pub(crate) fn build_https_connector() -> Https {
+    wrap_https_connector(build_tls_config())
+}
+
+/// Build one WebPKI TLS configuration per server instance so its `https://` and
+/// `wss://` upstreams share root certificates and one session-resumption store, while
+/// `wss://` keeps ALPN empty (strictly HTTP/1.1 `Upgrade`) and `ws://` uses
+/// [`tokio_tungstenite::Connector::Plain`].
+pub(crate) fn build_connectors(ws_is_tls: bool) -> (Https, tokio_tungstenite::Connector) {
+    let base_tls = build_tls_config();
     let ws_tls = if ws_is_tls {
         tokio_tungstenite::Connector::Rustls(Arc::new(base_tls.clone()))
     } else {
         tokio_tungstenite::Connector::Plain
     };
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(base_tls)
-        .https_or_http()
-        // ALPN advertises ["h2","http/1.1"] for https upstreams -> auto-negotiate
-        // h2 when the upstream offers it; cleartext upstreams stay h1.
-        .enable_all_versions()
-        .wrap_connector(build_http_connector());
-    (https, ws_tls)
+    (wrap_https_connector(base_tls), ws_tls)
 }
 
 pub(crate) fn build_client(https: Https) -> ProxyClient {
     configure_client_builder().build(https)
+}
+
+#[cfg(test)]
+pub(crate) fn build_https_client() -> ProxyClient {
+    build_client(build_https_connector())
 }
 
 /// Cleartext-only HTTP/2 prior-knowledge (`h2c`) client for probed `http://` EL upstreams,
@@ -89,19 +112,18 @@ pub(crate) fn build_h2c_client(https: Https) -> ProxyClient {
 }
 
 /// Tracks the negotiated HTTP protocol version observed on an `https://` upstream.
-#[derive(Default)]
-pub(crate) struct ObservedHttpVersion(AtomicU8);
+struct ObservedHttpVersion(AtomicU8);
 
 impl ObservedHttpVersion {
     const UNOBSERVED: u8 = 0;
     const HTTP_11: u8 = 1;
     const HTTP_2: u8 = 2;
 
-    pub(crate) const fn new() -> Self {
+    const fn new() -> Self {
         Self(AtomicU8::new(Self::UNOBSERVED))
     }
 
-    pub(crate) fn record(&self, version: Version) {
+    fn record(&self, version: Version) {
         let encoded = if version == Version::HTTP_2 {
             Self::HTTP_2
         } else {
@@ -117,12 +139,12 @@ impl ObservedHttpVersion {
     }
 
     /// Machine-readable `/healthz` transport (`"h2"` once observed, conservative `"http/1.1"` otherwise).
-    pub(crate) fn label(&self) -> &'static str {
+    fn label(&self) -> &'static str {
         if self.is_h2() { "h2" } else { "http/1.1" }
     }
 
     /// Human-readable startup protocol summary (`"HTTPS (ALPN)"` before first TLS response).
-    pub(crate) fn startup_label(&self) -> &'static str {
+    fn startup_label(&self) -> &'static str {
         match self.0.load(Ordering::Relaxed) {
             Self::HTTP_2 => "HTTP/2 (TLS)",
             Self::HTTP_11 => "HTTP/1.1 (TLS)",
@@ -131,143 +153,285 @@ impl ObservedHttpVersion {
     }
 }
 
-/// Adaptive cleartext `h2c` state machine for probed `http://` EL upstreams.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum H2cMode {
-    Initial = 0,
-    Confirmed = 1,
-    H1VerifyOnce = 2,
-    H1Confirmed = 3,
-}
+/// Adaptive cleartext `h2c` state machine for probed `http://` EL upstreams,
+/// symmetric with [`ObservedHttpVersion`]. Data-plane requests and `/healthz`
+/// conservatively stay on HTTP/1.1 until `h2c` is confirmed.
+struct H2cState(AtomicU8);
 
-impl H2cMode {
-    pub(crate) fn load(atom: &AtomicU8) -> Self {
-        match atom.load(Ordering::Relaxed) {
-            0 => Self::Initial,
-            1 => Self::Confirmed,
-            2 => Self::H1VerifyOnce,
-            _ => Self::H1Confirmed,
-        }
+impl H2cState {
+    const UNPROBED: u8 = 0;
+    const H2C: u8 = 1;
+    const H1: u8 = 2;
+
+    const fn new() -> Self {
+        Self(AtomicU8::new(Self::UNPROBED))
     }
 
-    pub(crate) fn transition(atom: &AtomicU8, cur: Self, next: Self) {
+    fn load(&self) -> u8 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn prefers_h2c(&self) -> bool {
+        self.load() == Self::H2C
+    }
+
+    fn transition(&self, cur: u8, next: u8) {
         if cur == next {
             return;
         }
-        atom.store(next as u8, Ordering::Relaxed);
+        self.0.store(next, Ordering::Relaxed);
         match (cur, next) {
-            (Self::Confirmed, Self::H1VerifyOnce) => {
+            (Self::H2C, Self::H1) => {
                 warn!("EL JSON-RPC upstream stopped speaking h2c — using HTTP/1.1");
             }
-            (Self::H1VerifyOnce | Self::H1Confirmed, Self::Confirmed) => {
-                info!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
+            (Self::UNPROBED, Self::H2C) => {
+                debug!("EL JSON-RPC upstream speaks h2c — using HTTP/2");
             }
             _ => {}
         }
     }
-}
 
-/// Unified transport tracker and client selector for EL, CL, and reference HTTP hops.
-pub(crate) enum HttpTransport {
-    /// Cleartext HTTP/1.1 only (CL/reference cleartext, or EL `--trust-upstream` cleartext).
-    CleartextH1,
-    /// `https://` upstream: negotiates `h2` vs `http/1.1` via TLS ALPN on `state.client`.
-    TlsAuto(ObservedHttpVersion),
-    /// Probed cleartext `http://` EL upstream with a dedicated prior-knowledge `h2c` client
-    /// and one-shot `h2c` recovery verification.
-    AdaptiveH2c {
-        mode: AtomicU8,
-        client: Box<ProxyClient>,
-    },
-}
-
-impl HttpTransport {
-    pub(crate) const fn new_standard(is_tls: bool) -> Self {
-        if is_tls {
-            Self::TlsAuto(ObservedHttpVersion::new())
+    fn label(&self) -> &'static str {
+        if self.prefers_h2c() {
+            "h2c"
         } else {
-            Self::CleartextH1
+            "http/1.1"
         }
     }
 
-    pub(crate) fn new_el(trust_upstream: bool, is_tls: bool, https: Https) -> Self {
-        if is_tls {
-            Self::TlsAuto(ObservedHttpVersion::new())
-        } else if trust_upstream {
-            Self::CleartextH1
-        } else {
-            Self::AdaptiveH2c {
-                mode: AtomicU8::new(H2cMode::Initial as u8),
-                client: Box::new(build_h2c_client(https)),
-            }
+    fn startup_label(&self) -> &'static str {
+        match self.load() {
+            Self::UNPROBED => "HTTP/1.1 (unverified)",
+            Self::H2C => "HTTP/2 (h2c)",
+            _ => "HTTP/1.1",
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn set_confirmed_cleartext(&mut self, prefer_h2: bool) {
-        if let Self::AdaptiveH2c { mode, .. } = self {
-            mode.store(
-                if prefer_h2 {
-                    H2cMode::Confirmed as u8
-                } else {
-                    H2cMode::H1Confirmed as u8
-                },
-                Ordering::Relaxed,
-            );
+    fn set_confirmed(&self, prefer_h2: bool) {
+        self.0.store(
+            if prefer_h2 { Self::H2C } else { Self::H1 },
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Whether a health probe drives adaptive cleartext `h2c` state transitions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeMode {
+    Fixed,
+    Adaptive,
+}
+
+/// Header-stage failure returned by [`HttpTransport::send_probe`].
+/// Only header/connect errors are eligible for protocol fallback; once headers arrive,
+/// status codes and body collection run outside `transport`.
+pub(crate) enum ProbeTransportError {
+    Timeout,
+    Transport(hyper_util::client::legacy::Error),
+}
+
+enum TransportKind {
+    /// Direct `state.client` dispatch with no version tracking (cleartext HTTP/1.1
+    /// upstreams, `--trust-upstream` cleartext EL, untracked MEV relay, and reference probes).
+    Direct,
+    /// `https://` upstream: negotiates `h2` vs `http/1.1` via TLS ALPN on `state.client`.
+    TlsAuto(ObservedHttpVersion),
+    /// Probed cleartext `http://` EL upstream with a dedicated prior-knowledge `h2c` client.
+    AdaptiveH2c {
+        state: H2cState,
+        client: Box<ProxyClient>,
+    },
+}
+
+/// Opaque transport tracker, adaptive `h2c` state machine, and client selector for EL and CL hops.
+pub(crate) struct HttpTransport(TransportKind);
+
+/// Shared untracked transport for reference health probes whose protocol is not surfaced on `/healthz`.
+pub(crate) static UNTRACKED_TRANSPORT: HttpTransport = HttpTransport::new_untracked();
+
+impl HttpTransport {
+    const fn new_untracked() -> Self {
+        Self(TransportKind::Direct)
+    }
+
+    const fn new_standard(is_tls: bool) -> Self {
+        Self(if is_tls {
+            TransportKind::TlsAuto(ObservedHttpVersion::new())
+        } else {
+            TransportKind::Direct
+        })
+    }
+
+    fn new_el(trust_upstream: bool, is_tls: bool, https: &Https) -> Self {
+        if is_tls || trust_upstream {
+            Self::new_standard(is_tls)
+        } else {
+            Self(TransportKind::AdaptiveH2c {
+                state: H2cState::new(),
+                client: Box::new(build_h2c_client(https.clone())),
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_confirmed_cleartext(&self, prefer_h2: bool) {
+        if let TransportKind::AdaptiveH2c { state, .. } = &self.0 {
+            state.set_confirmed(prefer_h2);
         }
     }
 
     /// Whether data-plane requests currently prefer the cleartext `h2c` prior-knowledge client.
     #[cfg(test)]
     pub(crate) fn uses_h2c_client(&self) -> bool {
-        match self {
-            Self::CleartextH1 | Self::TlsAuto(_) => false,
-            Self::AdaptiveH2c { mode, .. } => {
-                matches!(H2cMode::load(mode), H2cMode::Initial | H2cMode::Confirmed)
-            }
+        match &self.0 {
+            TransportKind::Direct | TransportKind::TlsAuto(_) => false,
+            TransportKind::AdaptiveH2c { state, .. } => state.prefers_h2c(),
         }
     }
 
-    pub(crate) fn select_client<'a>(&'a self, default: &'a ProxyClient) -> &'a ProxyClient {
-        match self {
-            Self::AdaptiveH2c { mode, client }
-                if matches!(H2cMode::load(mode), H2cMode::Initial | H2cMode::Confirmed) =>
-            {
-                client
-            }
-            Self::CleartextH1 | Self::TlsAuto(_) | Self::AdaptiveH2c { .. } => default,
+    fn primary_client<'a>(&'a self, default: &'a ProxyClient) -> &'a ProxyClient {
+        match &self.0 {
+            TransportKind::AdaptiveH2c { state, client } if state.prefers_h2c() => client,
+            TransportKind::Direct
+            | TransportKind::TlsAuto(_)
+            | TransportKind::AdaptiveH2c { .. } => default,
         }
     }
 
-    pub(crate) fn record_version(&self, version: Version) {
-        if let Self::TlsAuto(obs) = self {
-            obs.record(version);
+    /// Send `req` over an explicit `client`, recording the protocol the hop negotiated.
+    ///
+    /// Calls `client.request(req)` eagerly so `Request<ResBody>` is moved into the client
+    /// before `.await` instead of bloating the returned future, and captures only `&'a self`.
+    fn send<'a>(
+        &'a self,
+        client: &ProxyClient,
+        req: Request<ResBody>,
+    ) -> impl Future<Output = Result<Response<Incoming>, hyper_util::client::legacy::Error>> + use<'a>
+    {
+        let fut = client.request(req);
+        async move {
+            let resp = fut.await?;
+            if let TransportKind::TlsAuto(obs) = &self.0 {
+                obs.record(resp.version());
+            }
+            Ok(resp)
+        }
+    }
+
+    async fn send_once(
+        &self,
+        client: &ProxyClient,
+        req: Request<ResBody>,
+        deadline: Instant,
+    ) -> Result<(Response<Incoming>, Instant), ProbeTransportError> {
+        let resp = tokio::time::timeout_at(deadline, self.send(client, req))
+            .await
+            .map_err(|_| ProbeTransportError::Timeout)?
+            .map_err(ProbeTransportError::Transport)?;
+        Ok((resp, deadline))
+    }
+
+    /// Send `req` over this transport's currently selected client, recording any TLS ALPN version.
+    pub(crate) fn request<'a>(
+        &'a self,
+        default: &ProxyClient,
+        req: Request<ResBody>,
+    ) -> impl Future<Output = Result<Response<Incoming>, hyper_util::client::legacy::Error>> + use<'a>
+    {
+        self.send(self.primary_client(default), req)
+    }
+
+    /// Retry a confirmed `h2c` probe once on a fast non-timeout failure (e.g., a stale
+    /// pooled socket evicted by Hyper) within the same header deadline; timeouts return
+    /// immediately in 1× timeout without doubling outage detection latency.
+    async fn send_h2c_with_stale_retry(
+        &self,
+        h2c: &ProxyClient,
+        deadline: Instant,
+        make_req: &impl Fn() -> Request<ResBody>,
+    ) -> Result<(Response<Incoming>, Instant), ProbeTransportError> {
+        match self.send_once(h2c, make_req(), deadline).await {
+            Ok(ok) => Ok(ok),
+            Err(ProbeTransportError::Timeout) => Err(ProbeTransportError::Timeout),
+            Err(_) => self.send_once(h2c, make_req(), deadline).await,
+        }
+    }
+
+    /// Execute one health probe header round-trip within `timeout` (when an `h2c` probe
+    /// falls back to HTTP/1.1, the fallback attempt gets its own `timeout`), driving
+    /// adaptive `h2c` detection under [`ProbeMode::Adaptive`] while confining fallback
+    /// strictly to header/transport failures (never HTTP status codes or body collection).
+    pub(crate) async fn send_probe(
+        &self,
+        default: &ProxyClient,
+        timeout: Duration,
+        mode: ProbeMode,
+        make_req: impl Fn() -> Request<ResBody>,
+    ) -> Result<(Response<Incoming>, Instant), ProbeTransportError> {
+        let TransportKind::AdaptiveH2c { state, client } = &self.0 else {
+            return self
+                .send_once(default, make_req(), Instant::now() + timeout)
+                .await;
+        };
+        let cur = state.load();
+        let first_deadline = Instant::now() + timeout;
+        let primary_err = match (cur, mode) {
+            (H2cState::UNPROBED, ProbeMode::Adaptive) => {
+                match self.send_once(client, make_req(), first_deadline).await {
+                    Ok(ok) => {
+                        state.transition(cur, H2cState::H2C);
+                        return Ok(ok);
+                    }
+                    // A HangH2c server may burn the full `timeout` on the preface, so fall
+                    // through to give the one-time HTTP/1.1 fallback its own full header budget.
+                    Err(err) => err,
+                }
+            }
+            (H2cState::H2C, _) => {
+                match self
+                    .send_h2c_with_stale_retry(client, first_deadline, &make_req)
+                    .await
+                {
+                    Ok(ok) => return Ok(ok),
+                    Err(ProbeTransportError::Timeout) => return Err(ProbeTransportError::Timeout),
+                    Err(err) => err,
+                }
+            }
+            // Settled HTTP/1.1 never re-probes h2c (keeps outage detection at 1x timeout);
+            // fixed callers (reference local reads) also stay on HTTP/1.1 while Unprobed
+            // to avoid racing `el_batch_detect` with duplicate h2c probes during warm-up.
+            _ => return self.send_once(default, make_req(), first_deadline).await,
+        };
+        match self
+            .send_once(default, make_req(), Instant::now() + timeout)
+            .await
+        {
+            Ok(ok) => {
+                if mode == ProbeMode::Adaptive {
+                    state.transition(cur, H2cState::H1);
+                }
+                Ok(ok)
+            }
+            Err(_) => Err(primary_err),
         }
     }
 
     /// Machine-readable transport label for `/healthz` (`"h2c"`, `"h2"`, or `"http/1.1"`).
     pub(crate) fn label(&self) -> &'static str {
-        match self {
-            Self::CleartextH1 => "http/1.1",
-            Self::TlsAuto(obs) => obs.label(),
-            Self::AdaptiveH2c { mode, .. } => match H2cMode::load(mode) {
-                H2cMode::Initial | H2cMode::Confirmed => "h2c",
-                H2cMode::H1VerifyOnce | H2cMode::H1Confirmed => "http/1.1",
-            },
+        match &self.0 {
+            TransportKind::Direct => "http/1.1",
+            TransportKind::TlsAuto(obs) => obs.label(),
+            TransportKind::AdaptiveH2c { state, .. } => state.label(),
         }
     }
 
     /// Human-readable protocol summary for startup lifecycle logging.
     pub(crate) fn startup_proto_label(&self) -> &'static str {
-        match self {
-            Self::CleartextH1 => "HTTP/1.1",
-            Self::TlsAuto(obs) => obs.startup_label(),
-            Self::AdaptiveH2c { mode, .. } => match H2cMode::load(mode) {
-                H2cMode::Initial => "HTTP/2 (h2c, unverified)",
-                H2cMode::Confirmed => "HTTP/2 (h2c)",
-                H2cMode::H1VerifyOnce | H2cMode::H1Confirmed => "HTTP/1.1",
-            },
+        match &self.0 {
+            TransportKind::Direct => "HTTP/1.1",
+            TransportKind::TlsAuto(obs) => obs.startup_label(),
+            TransportKind::AdaptiveH2c { state, .. } => state.startup_label(),
         }
     }
 }
@@ -278,8 +442,23 @@ pub(crate) struct HttpTarget {
 }
 
 impl HttpTarget {
+    pub(crate) const fn new_untracked(upstream: HttpUpstream) -> Self {
+        Self {
+            upstream,
+            transport: HttpTransport::new_untracked(),
+        }
+    }
+
     pub(crate) const fn new_standard(upstream: HttpUpstream) -> Self {
         let transport = HttpTransport::new_standard(upstream.is_tls());
+        Self {
+            upstream,
+            transport,
+        }
+    }
+
+    pub(crate) fn new_el(upstream: HttpUpstream, trust_upstream: bool, https: &Https) -> Self {
+        let transport = HttpTransport::new_el(trust_upstream, upstream.is_tls(), https);
         Self {
             upstream,
             transport,
@@ -295,6 +474,89 @@ pub(crate) struct WsTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn send_records_the_negotiated_version_for_tls_targets_only() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // `TlsAuto` inspects only the response version, so a cleartext HTTP/1.1 peer suffices.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri: http::Uri = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = AbortOnDrop(tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 256];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        }));
+        let client = build_https_client();
+        let request = || {
+            let mut req = Request::new(crate::response::empty_body());
+            *req.uri_mut() = uri.clone();
+            req
+        };
+
+        let tls = HttpTransport::new_standard(true);
+        assert_eq!(tls.startup_proto_label(), "HTTPS (ALPN)");
+        tls.request(&client, request()).await.unwrap();
+        assert_eq!(tls.startup_proto_label(), "HTTP/1.1 (TLS)");
+
+        let cleartext = HttpTransport::new_standard(false);
+        cleartext.request(&client, request()).await.unwrap();
+        assert_eq!(cleartext.startup_proto_label(), "HTTP/1.1");
+    }
+
+    #[test]
+    fn h2c_mode_is_conservative_until_confirmed() {
+        let https = build_https_connector();
+        let el = HttpTransport::new_el(false, false, &https);
+        assert!(!el.uses_h2c_client());
+        assert_eq!(el.label(), "http/1.1");
+        assert_eq!(el.startup_proto_label(), "HTTP/1.1 (unverified)");
+
+        el.set_confirmed_cleartext(true);
+        assert!(el.uses_h2c_client());
+        assert_eq!(el.label(), "h2c");
+        assert_eq!(el.startup_proto_label(), "HTTP/2 (h2c)");
+
+        el.set_confirmed_cleartext(false);
+        assert!(!el.uses_h2c_client());
+        assert_eq!(el.label(), "http/1.1");
+        assert_eq!(el.startup_proto_label(), "HTTP/1.1");
+    }
+
+    #[test]
+    fn wss_connector_advertises_no_alpn_and_ws_stays_plain() {
+        let (_, wss) = build_connectors(true);
+        let tokio_tungstenite::Connector::Rustls(config) = wss else {
+            panic!("wss:// needs a rustls connector");
+        };
+        assert!(config.alpn_protocols.is_empty());
+        assert!(matches!(
+            build_connectors(false).1,
+            tokio_tungstenite::Connector::Plain
+        ));
+    }
 
     #[test]
     fn observed_http_version_distinguishes_unobserved_startup_label() {

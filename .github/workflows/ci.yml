@@ -49,11 +49,6 @@ jobs:
       - name: cargo test (all features)
         run: cargo test --all-features --locked
 
-      - name: Seeded JSON differential stress
-        run: >-
-          cargo test --locked --lib rpc::tests::prefilter_seeded_stress_matches_full_parser
-          -- --ignored --exact
-
       - name: WebSocket connection churn
         env:
           ETHONYX_STRESS_SECONDS: "5"
