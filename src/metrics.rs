@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ::metrics::{Counter, Gauge, Histogram};
+use ::metrics::{Counter, Gauge, Histogram, KeyName, SharedString, Unit};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
 
 pub(crate) const ACTIVE_CONNECTIONS: &str = "ethonyx_active_connections";
@@ -67,37 +67,17 @@ impl ::metrics::HistogramFn for PairHistogram {
 }
 
 impl ::metrics::Recorder for PairRecorder {
-    fn describe_counter(
-        &self,
-        key: ::metrics::KeyName,
-        unit: Option<::metrics::Unit>,
-        description: ::metrics::SharedString,
-    ) {
-        self.primary
-            .describe_counter(key.clone(), unit, description.clone());
-        self.secondary.describe_counter(key, unit, description);
+    // OTel ignores descriptions; forward by move to Prometheus without cloning.
+    fn describe_counter(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        self.primary.describe_counter(key, unit, description);
     }
 
-    fn describe_gauge(
-        &self,
-        key: ::metrics::KeyName,
-        unit: Option<::metrics::Unit>,
-        description: ::metrics::SharedString,
-    ) {
-        self.primary
-            .describe_gauge(key.clone(), unit, description.clone());
-        self.secondary.describe_gauge(key, unit, description);
+    fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        self.primary.describe_gauge(key, unit, description);
     }
 
-    fn describe_histogram(
-        &self,
-        key: ::metrics::KeyName,
-        unit: Option<::metrics::Unit>,
-        description: ::metrics::SharedString,
-    ) {
-        self.primary
-            .describe_histogram(key.clone(), unit, description.clone());
-        self.secondary.describe_histogram(key, unit, description);
+    fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        self.primary.describe_histogram(key, unit, description);
     }
 
     fn register_counter(

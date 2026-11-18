@@ -5,6 +5,41 @@ use serde::de::{MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
+/// Serde's derived struct visitors also accept positional sequences. Enforce
+/// object shape at each JSON-RPC / Beacon boundary while retaining borrowed data.
+pub(crate) struct JsonObject<T>(pub(crate) T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for JsonObject<T> {
+    #[inline]
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Object<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for Object<T> {
+            type Value = JsonObject<T>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, _v: &str) -> Result<Self::Value, E> {
+                // Reject strings without echoing them into `serde_json::Error` so a
+                // multi-MiB malformed payload cannot allocate an unbounded error buffer.
+                Err(E::invalid_type(
+                    serde::de::Unexpected::Other("string"),
+                    &self,
+                ))
+            }
+
+            #[inline]
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                T::deserialize(MapAccessDeserializer::new(map)).map(JsonObject)
+            }
+        }
+        // Use `deserialize_any` rather than `deserialize_map` so non-object strings route
+        // through `visit_str` above instead of `serde_json::peek_invalid_type`.
+        deserializer.deserialize_any(Object(std::marker::PhantomData))
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MockResult {
     Forward,
@@ -31,75 +66,60 @@ impl<'de> Deserialize<'de> for Request<'de> {
             #[serde(default, borrow, deserialize_with = "present_id")]
             id: Option<&'a RawValue>,
         }
-        struct Object;
-        impl<'de> Visitor<'de> for Object {
-            type Value = Request<'de>;
+        // Derive also accepts positional sequences; JSON-RPC requests do not.
+        JsonObject::<Fields<'de>>::deserialize(d)
+            .map(|JsonObject(fields)| Request { id: fields.id })
+    }
+}
 
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON-RPC request object")
-            }
+/// Accept exactly `expected`. Every caller maps a mismatch to "forward upstream", so the
+/// error carries no wording of its own.
+fn expect_str<'de, D: Deserializer<'de>>(d: D, expected: &'static str) -> Result<(), D::Error> {
+    struct Exact(&'static str);
+    impl Visitor<'_> for Exact {
+        type Value = ();
 
-            #[inline]
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                let fields = Fields::deserialize(MapAccessDeserializer::new(map))?;
-                Ok(Request { id: fields.id })
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "the string {:?}", self.0)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
+            if value == self.0 {
+                Ok(())
+            } else {
+                Err(E::custom("unexpected string"))
             }
         }
-        // Derive also accepts positional sequences; JSON-RPC requests do not.
-        d.deserialize_map(Object)
     }
+    d.deserialize_str(Exact(expected))
 }
 
 fn version_2<'de, D: Deserializer<'de>>(d: D) -> Result<(), D::Error> {
-    struct Version;
-    impl serde::de::Visitor<'_> for Version {
-        type Value = ();
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("JSON-RPC version 2.0")
-        }
-        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
-            if value == "2.0" {
-                Ok(())
-            } else {
-                Err(E::custom("unsupported JSON-RPC version"))
-            }
-        }
-    }
-    d.deserialize_str(Version)
+    expect_str(d, "2.0")
 }
 
 fn eth_syncing_method<'de, D: Deserializer<'de>>(d: D) -> Result<(), D::Error> {
-    struct Method;
-    impl serde::de::Visitor<'_> for Method {
-        type Value = ();
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("the eth_syncing method")
-        }
-        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
-            if value == "eth_syncing" {
-                Ok(())
-            } else {
-                Err(E::custom("method requires upstream"))
-            }
-        }
-    }
-    d.deserialize_str(Method)
+    expect_str(d, "eth_syncing")
 }
 
+/// Accept only an empty JSON array (`[]`, optional RFC 8259 whitespace inside) via
+/// borrowed `&RawValue` so oversized string/object/array `params` never copy into
+/// `serde_json`'s `scratch` or `Error` buffers.
 fn empty_params<'de, D: Deserializer<'de>>(d: D) -> Result<(), D::Error> {
     let raw = <&RawValue>::deserialize(d)?;
-    if raw
+    let inner = raw
         .get()
-        .trim_ascii()
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .is_some_and(|inner| inner.trim_ascii().is_empty())
+        .as_bytes()
+        .strip_prefix(b"[")
+        .and_then(|s| s.strip_suffix(b"]"))
+        .ok_or_else(|| serde::de::Error::custom("expected empty params array"))?;
+    if inner
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
     {
         Ok(())
     } else {
-        Err(serde::de::Error::custom(
-            "eth_syncing does not accept parameters",
-        ))
+        Err(serde::de::Error::custom("non-empty params"))
     }
 }
 
@@ -146,7 +166,8 @@ impl<'de> Deserialize<'de> for Batch {
                 while let Some(req) = seq.next_element::<Request<'_>>()? {
                     seen = true;
                     if let Some(id) = req.id {
-                        reply.reserve(reply_len(id) + 1);
+                        // +2 reserves the leading `'['`/',' and the trailing `']'`.
+                        reply.reserve(reply_len(id) + 2);
                         reply.push(if reply.is_empty() { '[' } else { ',' });
                         append_reply(&mut reply, id);
                     }
@@ -166,37 +187,31 @@ impl<'de> Deserialize<'de> for Batch {
 }
 
 pub(crate) fn mock_syncing(bytes: &[u8]) -> MockResult {
-    // A decoded eth_syncing method must occur literally as ASCII bytes or contain
-    // a JSON backslash escape. Absence of BOTH rules out a local reply in a single
-    // byte-level pass without a separate UTF-8 validation scan. Possible matches,
-    // escapes and invalid inputs still go through the complete serde parser.
-    const NEEDLE: &[u8] = b"eth_syncing";
-    if bytes.len() <= 256
-        && !bytes.contains(&b'\\')
-        && !bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE)
-    {
+    let Some(start) = bytes
+        .iter()
+        .position(|&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+    else {
         return MockResult::Forward;
-    }
-    parse_mock_syncing(bytes)
-}
-
-// Kept separate so tests and benchmarks can compare against full validation.
-pub(crate) fn parse_mock_syncing(bytes: &[u8]) -> MockResult {
-    let first = bytes.iter().find(|b| !b.is_ascii_whitespace());
-    if first == Some(&b'[') {
-        // from_slice also validates the closing bracket and trailing input
-        // before a fully local batch can become Reply or Silent.
-        serde_json::from_slice::<Batch>(bytes).map_or(MockResult::Forward, |batch| batch.0)
-    } else {
-        let Ok(req) = serde_json::from_slice::<Request<'_>>(bytes) else {
-            return MockResult::Forward;
-        };
-        let Some(id) = req.id else {
-            return MockResult::Silent;
-        };
-        let mut reply = String::with_capacity(reply_len(id));
-        append_reply(&mut reply, id);
-        MockResult::Reply(reply)
+    };
+    let trimmed = &bytes[start..];
+    match trimmed[0] {
+        b'[' => {
+            // `from_slice` also validates the closing bracket and trailing input
+            // before a fully local batch can become `Reply` or `Silent`.
+            serde_json::from_slice::<Batch>(trimmed).map_or(MockResult::Forward, |batch| batch.0)
+        }
+        b'{' => {
+            let Ok(req) = serde_json::from_slice::<Request<'_>>(trimmed) else {
+                return MockResult::Forward;
+            };
+            let Some(id) = req.id else {
+                return MockResult::Silent;
+            };
+            let mut reply = String::with_capacity(reply_len(id));
+            append_reply(&mut reply, id);
+            MockResult::Reply(reply)
+        }
+        _ => MockResult::Forward,
     }
 }
 
@@ -250,9 +265,18 @@ mod tests {
             r#"{"jsonrpc":"2.0","is_syncing":true,"id":7}"#,
             r#"{"jsonrpc":"2.0","method":"eth_syncing","method":"eth_syncing","id":7}"#,
             r#"{"jsonrpc":"2.0","method":"eth_syncing","metho\u0064":"eth_syncing","id":7}"#,
+            r#"{"jsonrpc":"2.0","params":["0xdeadbeef","latest"],"method":"eth_syncing","id":7}"#,
+            r#"{"jsonrpc":"2.0","params":{},"method":"eth_syncing","id":7}"#,
+            r#"{"jsonrpc":"2.0","params":[INVALID"#,
         ] {
             assert_eq!(mock_syncing(input.as_bytes()), MockResult::Forward);
         }
+        assert_eq!(
+            mock_syncing(
+                b"{\"jsonrpc\":\"2.0\",\"params\":[ \t\r\n ],\"method\":\"eth_syncing\",\"id\":7}"
+            ),
+            MockResult::Reply(r#"{"jsonrpc":"2.0","id":7,"result":false}"#.into())
+        );
     }
 
     #[test]
@@ -358,130 +382,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "sustained seeded differential stress; run explicitly in release mode"]
-    fn prefilter_seeded_stress_matches_full_parser() {
-        fn next(state: &mut u64) -> u64 {
-            *state ^= *state << 13;
-            *state ^= *state >> 7;
-            *state ^= *state << 17;
-            *state
-        }
-        let seeds = [
-            br#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":null}"#.as_slice(),
-            br#"{"jsonrpc":"2.0","meth\u006fd":"eth_\u0073yncing","id":"x\\y"}"#,
-            br#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":900719925474099312345}"#,
-            br#"[{"jsonrpc":"2.0","method":"eth_syncing"},{"jsonrpc":"2.0","method":"eth_call","id":2}]"#,
-            br#"{"jsonrpc":"2.0","method":"eth_call","params":{"method":"eth_syncing"},"id":1}"#,
-            br#"{"jsonrpc":"2.0","method":"eth_syncing","metho\u0064":"eth_call","id":1}"#,
-        ];
-        let mut state = 0x6a09_e667_f3bc_c909;
-        for case in 0..1_000_000 {
-            let mut input = if case % 4 == 0 {
-                let length = (next(&mut state) % 513) as usize;
-                (0..length)
-                    .map(|_| next(&mut state) as u8)
-                    .collect::<Vec<_>>()
-            } else {
-                seeds[(next(&mut state) as usize) % seeds.len()].to_vec()
-            };
-            if case % 8 == 1 {
-                let length = [255, 256, 257, 1024][(next(&mut state) % 4) as usize];
-                input.resize(length, b' ');
-            }
-            for _ in 0..next(&mut state) % 8 {
-                let index = (next(&mut state) as usize) % (input.len() + 1);
-                match next(&mut state) % 4 {
-                    0 if index < input.len() => input[index] = next(&mut state) as u8,
-                    1 => input.insert(index, next(&mut state) as u8),
-                    2 if index < input.len() => {
-                        input.remove(index);
-                    }
-                    _ => input.truncate(index),
-                }
-            }
-            assert_eq!(
-                mock_syncing(&input),
-                parse_mock_syncing(&input),
-                "case={case}, input={input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn prefilter_preserves_escaped_keys_nested_matches_and_invalid_requests() {
-        for input in [
-            r#"{"jsonrpc":"2.0","meth\u006fd":"eth_syncing","id":1}"#,
-            r#"{"jsonrpc":"2.0","method":"\u0065th_syncing","id":null}"#,
-            r#"{"jsonrpc":"2.0","method":"eth_call","params":["eth_syncing"],"id":1}"#,
-            r#"{"jsonrpc":"2.0","params":{"method":"eth_syncing"},"method":"eth_call","id":1}"#,
-            r#"{"method":"eth_blockNumber","id":"eth_syncing","jsonrpc":"2.0"}"#,
-            r#"{"jsonrpc":"2.0","method":"eth_syncing","metho\u0064":"eth_call","id":1}"#,
-            r#"[{"jsonrpc":"2.0","method":"eth_\u0073yncing"}]"#,
-            r#"[{"jsonrpc":"2.0","method":"eth_call"},{"jsonrpc":"2.0","method":"eth_\u0073yncing","id":1}]"#,
-            r#"{"jsonrpc":"2.0","method":"eth_syncing","id":1} garbage"#,
-            r#"{"jsonrpc":"2.0","method":"eth_call","params":"unterminated"#,
-        ] {
-            assert_eq!(
-                mock_syncing(input.as_bytes()),
-                parse_mock_syncing(input.as_bytes()),
-                "{input}"
-            );
-        }
-        assert!(matches!(
-            mock_syncing(br#"{"jsonrpc":"2.0","meth\u006fd":"eth_\u0073yncing","id":1}"#),
-            MockResult::Reply(_)
-        ));
-    }
-
-    #[test]
-    fn prefilter_length_boundary_and_whitespace_do_not_change_results() {
-        for input in [
-            r#"{"jsonrpc":"2.0","method":"eth_syncing","id":1}"#,
-            r#"{"jsonrpc":"2.0","method":"eth_call","id":1}"#,
-            r#"{"jsonrpc":"2.0","method":"eth_\u0073yncing","id":null}"#,
-            r#"[{"jsonrpc":"2.0","method":"eth_syncing"}]"#,
-        ] {
-            for length in [255, 256, 257, 512, 16_384] {
-                for leading in [false, true] {
-                    let padding = " \t\r\n".repeat(length / 4 + 1);
-                    let padding = &padding[..length - input.len()];
-                    let padded = if leading {
-                        format!("{padding}{input}")
-                    } else {
-                        format!("{input}{padding}")
-                    };
-                    assert_eq!(
-                        mock_syncing(padded.as_bytes()),
-                        parse_mock_syncing(padded.as_bytes()),
-                        "length={length}, leading={leading}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn prefilter_matches_full_parser_under_byte_mutations() {
-        // Every possible byte at each position covers malformed JSON, UTF-8,
-        // escaped delimiters, changed field names and duplicate-key boundaries.
-        for seed in [
-            br#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}"#.as_slice(),
-            br#"{"jsonrpc":"2.\u0030","meth\u006fd":"eth_\u0073yncing","id":"x\\y"}"#,
-            br#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#,
-            br#"[{"jsonrpc":"2.0","method":"eth_syncing"},{"jsonrpc":"2.0","method":"eth_call","id":2}]"#,
-        ] {
-            for index in 0..seed.len() {
-                assert_eq!(mock_syncing(&seed[..index]), parse_mock_syncing(&seed[..index]));
-                let mut mutated = seed.to_vec();
-                for byte in 0..=u8::MAX {
-                    mutated[index] = byte;
-                    assert_eq!(mock_syncing(&mutated), parse_mock_syncing(&mutated), "seed={seed:?}, index={index}, byte={byte}");
-                }
-            }
-        }
-    }
-
-    #[test]
     fn preserves_ids_and_decodes_escaped_methods() {
         for id in ["null", "900719925474099312345", r#""a\\b\"c""#, "-1"] {
             let input = format!(r#"{{"jsonrpc":"2.0","method":"eth_\u0073yncing","id":{id}}}"#);
@@ -495,9 +395,12 @@ mod tests {
             );
         }
         assert!(matches!(
+            mock_syncing(br#"{"jsonrpc":"2.0","meth\u006fd":"eth_\u0073yncing","id":1}"#),
+            MockResult::Reply(_)
+        ));
+        assert!(matches!(
             mock_syncing(
-                br#"{"jsonrpc":"2.\u0030","method":"eth_syncing","params":[ 	
- ],"id":0}"#
+                b"{\"jsonrpc\":\"2.\\u0030\",\"method\":\"eth_syncing\",\"params\":[ \t\r\n ],\"id\":0}"
             ),
             MockResult::Reply(_)
         ));
@@ -548,5 +451,35 @@ mod tests {
                 "{input}"
             );
         }
+    }
+
+    #[test]
+    fn oversized_strings_fail_without_echoing_into_serde_errors() {
+        let huge = "a".repeat(4096);
+        let json_str = format!(r#""{huge}""#);
+        let obj_err = serde_json::from_str::<JsonObject<serde::de::IgnoredAny>>(&json_str)
+            .err()
+            .expect("string must not deserialize as JsonObject")
+            .to_string();
+        assert!(
+            obj_err.len() < 128 && !obj_err.contains("aaaaaaaa"),
+            "JsonObject error must not echo string payload, got: {obj_err}"
+        );
+
+        let params_json =
+            format!(r#"{{"jsonrpc":"2.0","params":"{huge}","method":"eth_syncing","id":1}}"#);
+        let params_err = serde_json::from_str::<Request<'_>>(&params_json)
+            .err()
+            .expect("string params must fail")
+            .to_string();
+        assert!(
+            params_err.len() < 128 && !params_err.contains("aaaaaaaa"),
+            "Request params error must not echo string payload, got: {params_err}"
+        );
+        assert_eq!(mock_syncing(params_json.as_bytes()), MockResult::Forward);
+        assert_eq!(
+            mock_syncing(format!("[{json_str}]").as_bytes()),
+            MockResult::Forward
+        );
     }
 }

@@ -26,7 +26,7 @@ nodes and optional **Consensus Layer** (CL) Beacon node pairs (supports both `EL
 
 ## Probes
 
-Three endpoints, split by purpose (Kubernetes `z` convention):
+Four endpoints, split by purpose (Kubernetes `z` convention):
 
 | Endpoint            | Returns                       | Wire to                     | Gates on                                              |
 |---------------------|-------------------------------|-----------------------------|-------------------------------------------------------|
@@ -57,7 +57,7 @@ won't drop every backend out of the load balancer at once.
   "cl_syncing": { "ok": true, "detail": "synced (slot 9412341, distance 0)" } }
 ```
 
-- **Reference block-lag gate (`--el-reference-url`)**: Compares local EL height against one or more peer Ethonyx/EL URLs or external RPCs every `--el-reference-poll-interval` (default `3s`), returning `503` when lag exceeds `--el-max-reference-lag` (default `1` block, so `0–1` blocks pass and `≥ 2` blocks deroute). During a network-wide chain halt (even with a 1-block partial propagation split), nodes stay within `max_lag` and remain `200`. Any round that cannot produce a verified `(reference, causal local)` sample (all references fail, all `chain_id`s mismatch, or local `eth_chainId` / `eth_blockNumber` fails) counts as a missed round: the first missed round retains the last verdict, and two consecutive missed rounds fail open (`200`) so a reference outage never drains healthy nodes.
+- **Reference block-lag gate (`--el-reference-url`)**: Compares local EL height against one or more peer Ethonyx/EL URLs or external JSON-RPC endpoints (which must support JSON-RPC batch requests for `eth_chainId` + `eth_blockNumber`) every `--el-reference-poll-interval` (default `3s`), returning `503` when lag exceeds `--el-max-reference-lag` (default `1` block, so `0–1` blocks pass and `≥ 2` blocks deroute). During a network-wide chain halt (even with a 1-block partial propagation split), nodes stay within `max_lag` and remain `200`. Any round that cannot produce a verified `(reference, causal local)` sample (all references fail, all `chain_id`s mismatch, or local `eth_chainId` / `eth_blockNumber` fails) counts as a missed round: the first missed round retains the last verdict, and two consecutive missed rounds fail open (`200`) so a reference outage never drains healthy nodes (monitor `/healthz` `reference.errors` and alert on `ethonyx_reference_health_status == 0`).
 - **Wall-clock freshness gate (`--readyz-strict`)**: Additionally gates on EL block age (`--el-max-block-age-secs`) and CL slot age (`--cl-max-slot-age-secs`) — choose it when serving strictly at-head data matters more than fleet availability during a chain halt.
 
 ### `/healthz` — state for monitoring
@@ -85,7 +85,7 @@ on chains that do not implement the `net` namespace).
 ```json
 { "mode": "probed",
   "el": { "transport": "h2c", "syncing": false, "peers": 23, "block_number": 21000000, "block_age_secs": 5 },
-  "cl": { "transport": "http/1.1", "syncing": false, "sync_distance": 0, "peers": 78, "head_slot": 9412341, "slot_age_secs": 3 } }
+  "cl": { "transport": "http/1.1", "syncing": false, "is_optimistic": false, "el_offline": false, "sync_distance": 0, "peers": 78, "head_slot": 9412341, "slot_age_secs": 3 } }
 ```
 
 CL slot age is derived from `head_slot * --cl-seconds-per-slot +
@@ -97,7 +97,7 @@ instead of typing both; `--cl-genesis-time 0` omits `cl.slot_age_secs`.
 `/readyz` and `/healthz` don't query upstream per request. A background task
 polls the EL batch and both CL endpoints concurrently, then waits
 `--health-poll-interval` (default 1s; each call
-bounded by `--health-timeout`, including the response body) before the next poll, and the endpoints return
+bounded by `--health-timeout`, including the response body — an `h2c` → HTTP/1.1 probe fallback grants the HTTP/1.1 attempt its own timeout) before the next poll, and the endpoints return
 the latest snapshot instantly — so upstream load is constant regardless of probe
 rate, a slow upstream never blocks a probe, and the poller pauses a full interval
 between polls rather than hammering a struggling node. Block / slot ages are
@@ -105,7 +105,7 @@ recomputed live per request, so they stay accurate between polls. The cache is w
 a real snapshot from its first probe. When `--el-reference-url` is configured, a
 separate background cadence (`--el-reference-poll-interval`, default `3s`) learns
 the local `eth_chainId` first, then queries `eth_chainId` and `eth_blockNumber`
-concurrently on each distinct reference endpoint, reading the local
+in a single 2-element JSON-RPC batch on each distinct reference endpoint, reading the local
 `eth_blockNumber` right after any verified reference that raises the round's
 highest head (one local read in steady state).
 
@@ -122,8 +122,11 @@ Readiness is logged by the poller on transition (becoming not-ready / recovering
 | `custom`    | *(required)*   | *(required)*     |
 
 For a **private / custom beacon chain**, pass `--network custom` together with
-explicit `--cl-genesis-time <unix>` and `--cl-seconds-per-slot <secs>`. The
-sidecar refuses to start if either is missing under `custom`.
+explicit `--cl-genesis-time <unix>` and `--cl-seconds-per-slot <secs>`. When
+CL slot-age tracking is active (polled mode with `--cl-beacon-url` and non-zero
+`--cl-genesis-time`), the sidecar refuses to start if either is missing under
+`custom`; `--trust-upstream` or `--cl-genesis-time 0` disables slot-age tracking
+and does not require them.
 
 ## HTTP/2
 
@@ -181,18 +184,20 @@ already completed shutdown future.
 
 The upstream client auto-negotiates h2 for `https://` upstreams via ALPN. A
 cleartext EL JSON-RPC upstream can't be auto-negotiated, so the health poller
-probes it: it prefers cleartext **h2c** and forwards over HTTP/2 when the upstream
-serves it (geth ≥v1.17, erigon, reth), falling back to HTTP/1.1 otherwise — no
-flag. The verdict starts at h2c and is confirmed by the first poll before traffic
-is served (without logging a false warning against h1-only nodes). A running
-upstream that drops h2c falls back within one poll and performs a one-shot h2c
-re-verification so transient mid-restart fallbacks self-heal automatically, and
-an HTTP/1.1 upstream upgraded to h2c across a restart is promoted automatically.
-The data-plane follows the verdict and never retries across protocols (to avoid
-double-sending a non-idempotent call like `eth_sendRawTransaction`), so while a
-running upstream is switching away from h2c the data-plane can briefly return
-`502`s — up to one poll interval — until the verdict updates. `https://` CL and
-EL upstreams also negotiate h2 via ALPN and report the negotiated transport on
+probes it: it attempts cleartext **h2c** on the first probe and forwards over
+HTTP/2 once confirmed (geth ≥v1.17, erigon, reth), falling back to HTTP/1.1
+otherwise — no flag. Until `h2c` is confirmed by the initial warm-up poll, the
+data-plane stays conservatively on HTTP/1.1 (avoiding false warnings against
+h1-only nodes). A confirmed `h2c` upstream retries once on a non-timeout
+transport error within the same probe timeout so stale pooled sockets or rapid
+pod restarts do not trigger spurious fallbacks; if `h2c` still fails while
+HTTP/1.1 succeeds, it downgrades to HTTP/1.1 within one poll (and once settled on
+HTTP/1.1, stays on HTTP/1.1 until restart). The data-plane
+follows the verdict and never retries across protocols (to avoid double-sending
+a non-idempotent call like `eth_sendRawTransaction`), so while a running
+upstream is switching away from h2c the data-plane can briefly return `502`s —
+up to one poll interval — until the verdict updates. `https://` CL and EL
+upstreams also negotiate h2 via ALPN and report the negotiated transport on
 `/healthz`.
 
 ethonyx does **not** terminate TLS — it serves plaintext and leaves TLS to the
@@ -244,9 +249,9 @@ Structured JSON to stdout. Levels follow a sidecar-appropriate discipline:
 | Level   | What                                                                |
 |---------|---------------------------------------------------------------------|
 | `error` | genuine internal faults                                             |
-| `warn`  | readiness became **not-ready** (LB will deroute); upstream `502` proxy / WS dial errors; connection-limit saturation; `accept()` failed |
-| `info`  | lifecycle (start w/ version / listen / shutdown), readiness **recovered**, the EL upstream h2c↔h1 switch |
-| `debug` | routine activity: each health poll, client connection/body read errors, WS disconnects |
+| `warn`  | readiness became **not-ready** (LB will deroute); upstream `502` proxy / WS dial errors; upstream `h2c → http/1.1` fallback; connection-limit saturation; `accept()` failed |
+| `info`  | lifecycle (start w/ version / listen / shutdown), readiness **recovered** |
+| `debug` | routine activity: each health poll, upstream `h2c` confirmation, client connection/body read errors, WS disconnects |
 | `trace` | fine-grained internal flow (request routing, connection accept / close) |
 
 `info` is reserved for notable, low-frequency events, so a healthy sidecar is
@@ -312,7 +317,7 @@ The following metrics are exposed:
 
 ## OpenTelemetry
 
-If built with the `otel` feature, ethonyx supports exporting traces and metrics to an OTLP endpoint (HTTP protocol).
+If built with the `otel` feature, ethonyx supports exporting traces and metrics to an OTLP endpoint (HTTP protocol). Passing `--otel-endpoint` / `ETHONYX_OTEL_ENDPOINT` (including an empty string) to a default (non-`otel`) build fails fast at startup rather than silently ignoring telemetry configuration.
 
 Pass an HTTP(S) **base URL**, optionally with a path prefix and without a query or fragment.
 Ethonyx appends `/v1/traces` and `/v1/metrics` for the respective signals. The
@@ -387,16 +392,16 @@ When running `ethonyx` against a fallback/secondary node or a commercial paid RP
 
 | Flag                                     | Default | Description                                                                 |
 |------------------------------------------|---------|-----------------------------------------------------------------------------|
-| `--trust-upstream`                       | `false` | Disable background health polling (0 RPC cost) and always report ready/200. |
-| `--mock-cl-subscriptions`                | `false` | Intercept `prepare_beacon_proposer`, `beacon_committee_subscriptions`, and `sync_committee_subscriptions` with `200 OK`. |
+| `--trust-upstream`                       | `false` | Disable background health polling (0 RPC cost) and always report ready/200 (incompatible with `--readyz-strict` / `--el-reference-url`). |
+| `--mock-cl-subscriptions`                | `false` | Intercept `prepare_beacon_proposer`, `beacon_committee_subscriptions`, and `sync_committee_subscriptions` with `200 OK` (requires `--cl-beacon-url`). |
 | `--mock-eth-syncing`                     | `false` | Statically mock `eth_syncing` JSON-RPC (HTTP & WebSocket) with `result: false`. |
-| `--mock-cl-node-health`                  | `false` | Intercept `GET /eth/v1/node/health` locally with `200 OK`.                  |
-| `--cl-mev-relay-url`                     | `none`  | Optional upstream MEV Relay URL (`ETHONYX_CL_MEV_RELAY_URL`).                |
+| `--mock-cl-node-health`                  | `false` | Intercept `GET/HEAD /eth/v1/node/health` locally (`200`/`206`/`503`, or `200 OK` with `--trust-upstream`; requires `--cl-beacon-url`). |
+| `--cl-mev-relay-url`                     | `none`  | Optional upstream MEV Relay URL (`ETHONYX_CL_MEV_RELAY_URL`; requires `--cl-beacon-url`). |
 
 - **`--trust-upstream`**: When enabled, `ethonyx` trusts the upstream node and skips background EL/CL health polling (consuming zero Compute Units / API credits on commercial providers). `/healthz` reports `"mode": "trusted"` with only the active `transport` per layer (no fabricated peer or block numbers), and `/metrics` omits unpolled upstream gauges.
 - **`--mock-cl-subscriptions`**: Intercepts `POST /eth/v1/validator/prepare_beacon_proposer`, `POST /eth/v1/validator/beacon_committee_subscriptions`, and `POST /eth/v1/validator/sync_committee_subscriptions` requests (sent periodically by SSV Node / Validator Clients) and returns `HTTP 200 OK` (`{"code":200,"message":"success"}`) locally, shielding against 400 errors from commercial providers that block write-only validator APIs.
 - **`--mock-eth-syncing`**: Intercepts `eth_syncing` JSON-RPC calls over HTTP POST and WebSocket frames locally (`result: false`), shielding commercial providers from downstream client sync polls.
-- **`--mock-cl-node-health`**: Intercepts `GET/HEAD /eth/v1/node/health` requests locally and returns `HTTP 200 OK` (Beacon API standard node health), shielding commercial providers from beacon node health probes.
+- **`--mock-cl-node-health`**: Intercepts `GET/HEAD /eth/v1/node/health` requests locally using ethonyx's cached readiness state (`200` ready, `206` syncing while both layers are reachable, `503` unhealthy/stale; always `200 OK` under `--trust-upstream`), shielding commercial providers from beacon node health probes.
 - **`--cl-mev-relay-url`**: When configured (e.g., `https://boost-relay-hoodi.flashbots.net`), `ethonyx` intercepts `POST /eth/v1/validator/register_validator` requests from validator clients (such as SSV Node), rewrites the request path to `/eth/v1/builder/validators`, and forwards them directly to the specified MEV Relay.
 
 With `--trust-upstream`, cleartext HTTP uses HTTP/1.1 because health-based h2c
@@ -450,19 +455,16 @@ installs all of the above plus the cross-compile targets automatically.
 Run the longer correctness checks explicitly:
 
 ```sh
-cargo test --release --locked --lib rpc::tests::prefilter_seeded_stress_matches_full_parser \
-  -- --ignored --exact
 ETHONYX_STRESS_SECONDS=60 cargo test --release --locked --test integration \
   websocket::websocket_sustained_churn_preserves_replies_and_releases_upstreams \
   -- --ignored --exact --nocapture
 ```
 
-The JSON check compares one million deterministic inputs with the full parser.
 The WebSocket check uses 16 concurrent clients, orderly and abrupt disconnects,
 binary messages, notifications and mock/forwarded calls; the duration applies
 to each of the two mock modes. It verifies that all upstream connections are
-released. CI runs the JSON check and a shorter five-second-per-mode churn check
-on Linux, macOS and Windows.
+released. CI runs a shorter five-second-per-mode churn check on Linux, macOS
+and Windows.
 
 ## Release
 
@@ -480,7 +482,7 @@ cargo release patch --execute   # 0.1.0 → 0.1.1
 # or: cargo release 0.5.0  --execute    explicit
 ```
 
-This runs `cargo test --locked` as a gate, then bumps `Cargo.toml` + `Cargo.lock`,
+This runs `cargo test --locked --all-features` as a gate, then bumps `Cargo.toml` + `Cargo.lock`,
 commits as `chore: release vX.Y.Z`, tags `vX.Y.Z`, and pushes both. The `v*` tag
 push triggers `.github/workflows/release.yml`, which:
 
@@ -521,7 +523,7 @@ so notices can include code that the final binary does not use. When changing
 Rust or the native toolchain, also review [the musl notice](licenses/README.md).
 
 `cargo-release` is configured under `[package.metadata.release]` in `Cargo.toml`
-(main-branch only, no crates.io publish, `cargo test --locked` as pre-hook).
+(main-branch only, no crates.io publish, `cargo test --locked --all-features` as pre-hook).
 
 ## License
 

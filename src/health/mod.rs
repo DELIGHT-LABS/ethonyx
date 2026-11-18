@@ -7,8 +7,7 @@ mod fetch;
 mod probe;
 mod reference;
 
-pub(crate) use eval::HealthSource;
-pub(crate) use probe::{HealthPoller, channel};
+pub(crate) use probe::{HealthPoller, HealthSource, warm};
 
 use std::fmt;
 
@@ -25,10 +24,7 @@ use eval::{
     ClSyncEval, ElSyncEval, FreshEval, Probe, ReadinessEval, ReferenceLagEval, evaluate_readiness,
     now_unix,
 };
-
-const TRUSTED_READY_JSON: &[u8] = br#"{"status":"ready","el_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"},"cl_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"}}"#;
-const TRUSTED_READY_EL_ONLY_JSON: &[u8] =
-    br#"{"status":"ready","el_syncing":{"ok":true,"detail":"trusted upstream (unpolled)"}}"#;
+use fetch::MethodError;
 
 /// Serializes a [`fmt::Display`] value directly into the JSON output stream via
 /// [`serde::Serializer::collect_str`] without allocating an intermediate `String`.
@@ -37,41 +33,6 @@ struct DisplayJson<D>(D);
 impl<D: fmt::Display> Serialize for DisplayJson<D> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(&self.0)
-    }
-}
-
-/// Fixed-capacity stack list of borrowed probe errors so `/healthz` serializes
-/// outage reports without per-request `Vec` or `format!` `String` allocations.
-struct ErrorList<'a, const N: usize> {
-    items: [&'a str; N],
-    len: usize,
-}
-
-impl<const N: usize> Default for ErrorList<'_, N> {
-    fn default() -> Self {
-        Self {
-            items: [""; N],
-            len: 0,
-        }
-    }
-}
-
-impl<'a, const N: usize> ErrorList<'a, N> {
-    const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn push(&mut self, err: &'a str) {
-        if let Some(slot) = self.items.get_mut(self.len) {
-            *slot = err;
-            self.len += 1;
-        }
-    }
-}
-
-impl<const N: usize> Serialize for ErrorList<'_, N> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(&self.items[..self.len])
     }
 }
 
@@ -123,8 +84,8 @@ struct ElHealth<'a> {
     block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     block_age_secs: Option<u64>,
-    #[serde(skip_serializing_if = "ErrorList::is_empty")]
-    errors: ErrorList<'a, 3>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<DisplayJson<MethodError<'a>>>,
 }
 
 #[derive(Serialize, Default)]
@@ -146,8 +107,8 @@ struct ClHealth<'a> {
     head_slot: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     slot_age_secs: Option<u64>,
-    #[serde(skip_serializing_if = "ErrorList::is_empty")]
-    errors: ErrorList<'a, 2>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<DisplayJson<MethodError<'a>>>,
 }
 
 #[derive(Serialize)]
@@ -156,8 +117,8 @@ struct ReferenceHealth<'a> {
     block_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     block_lag: Option<u64>,
-    #[serde(skip_serializing_if = "<[Box<str>]>::is_empty")]
-    errors: &'a [Box<str>],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    errors: &'a [String],
 }
 
 /// `/readyz` view: the load-balancer readiness verdict. Defaults to sync status
@@ -165,11 +126,12 @@ struct ReferenceHealth<'a> {
 /// `--el-reference-url` is configured); freshness fields appear only under
 /// `--readyz-strict`. Peer count is intentionally never part of readiness.
 #[derive(Serialize)]
-struct ReadyReport<'a> {
+#[serde(bound = "")]
+struct ReadyReport<'a, E: fmt::Display = ElSyncEval<'a>, C: fmt::Display = ClSyncEval<'a>> {
     status: &'static str,
-    el_syncing: Check<ElSyncEval<'a>>,
+    el_syncing: Check<E>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cl_syncing: Option<Check<ClSyncEval<'a>>>,
+    cl_syncing: Option<Check<C>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     el_reference_lag: Option<Check<ReferenceLagEval>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,8 +141,7 @@ struct ReadyReport<'a> {
 }
 
 impl<'a> ReadyReport<'a> {
-    fn from_eval(eval: ReadinessEval<'a>) -> Self {
-        let ready = eval.is_ready();
+    fn from_eval(eval: ReadinessEval<'a>, ready: bool) -> Self {
         Self {
             status: if ready { "ready" } else { "not_ready" },
             el_syncing: Check::new(eval.el_sync.is_ok(), eval.el_sync),
@@ -189,6 +150,18 @@ impl<'a> ReadyReport<'a> {
             el_block_fresh: eval.el_block_fresh.map(|f| Check::new(f.is_ok(), f)),
             cl_slot_fresh: eval.cl_slot_fresh.map(|f| Check::new(f.is_ok(), f)),
         }
+    }
+}
+
+fn trusted_ready(has_cl: bool) -> ReadyReport<'static, &'static str, &'static str> {
+    const DETAIL: &str = "trusted upstream (unpolled)";
+    ReadyReport {
+        status: "ready",
+        el_syncing: Check::new(true, DETAIL),
+        cl_syncing: has_cl.then_some(Check::new(true, DETAIL)),
+        el_reference_lag: None,
+        el_block_fresh: None,
+        cl_slot_fresh: None,
     }
 }
 
@@ -207,14 +180,14 @@ pub(crate) fn report(state: &AppState, head: bool) -> Response<ResBody> {
             let snap = trusted_snapshot(el_transport, cl_transport);
             json_response(StatusCode::OK, &snap)
         }
-        HealthSource::Polled(rx) => {
+        HealthSource::Polled { rx, policy } => {
             // Clone the `Arc`-backed `Probe` handle so the `watch::Ref` read lock is released before serialization.
             let probe = rx.borrow().clone();
             let snap = build_snapshot(
                 &probe,
                 el_transport,
                 cl_transport,
-                state.opts.slot_clock,
+                policy.slot_clock,
                 now_unix(),
             );
             json_response(StatusCode::OK, &snap)
@@ -253,23 +226,19 @@ pub(crate) fn ready(state: &AppState, head: bool) -> Response<ResBody> {
     match (&state.health, head) {
         (HealthSource::Trusted, true) => empty_json_response(StatusCode::OK),
         (HealthSource::Trusted, false) => {
-            let raw = if state.cl.is_some() {
-                TRUSTED_READY_JSON
-            } else {
-                TRUSTED_READY_EL_ONLY_JSON
-            };
-            raw_json_response(StatusCode::OK, Bytes::from_static(raw))
+            json_response(StatusCode::OK, &trusted_ready(state.cl.is_some()))
         }
-        (HealthSource::Polled(rx), true) => {
+        (HealthSource::Polled { rx, policy }, true) => {
             let probe = rx.borrow();
-            let ready = evaluate_readiness(&state.opts, &probe).is_ready();
+            let ready = evaluate_readiness(*policy, &probe).is_ready();
             empty_json_response(ready_status(ready))
         }
-        (HealthSource::Polled(rx), false) => {
+        (HealthSource::Polled { rx, policy }, false) => {
             // Clone the `Arc`-backed `Probe` handle so the `watch::Ref` read lock is released before serialization.
             let probe = rx.borrow().clone();
-            let eval = evaluate_readiness(&state.opts, &probe);
-            json_response(ready_status(eval.is_ready()), &ReadyReport::from_eval(eval))
+            let eval = evaluate_readiness(*policy, &probe);
+            let ready = eval.is_ready();
+            json_response(ready_status(ready), &ReadyReport::from_eval(eval, ready))
         }
     }
 }
@@ -286,9 +255,9 @@ pub(crate) fn ready(state: &AppState, head: bool) -> Response<ResBody> {
 pub(crate) fn node_health(state: &AppState) -> Response<ResBody> {
     let code = match &state.health {
         HealthSource::Trusted => StatusCode::OK,
-        HealthSource::Polled(rx) => {
+        HealthSource::Polled { rx, policy } => {
             let probe = rx.borrow();
-            classify_node_health(evaluate_readiness(&state.opts, &probe))
+            classify_node_health(evaluate_readiness(*policy, &probe))
         }
     };
     empty_json_response(code)
@@ -334,28 +303,38 @@ fn build_snapshot<'a>(
         transport: el_transport,
         ..ElHealth::default()
     };
-    match &local.el_syncing {
-        Ok(ElSyncingResult::Synced(false)) => el.syncing = Some(false),
-        Ok(ElSyncingResult::Synced(true)) => el.syncing = Some(true),
-        Ok(ElSyncingResult::Syncing {
-            current_block,
-            highest_block,
-        }) => {
-            el.syncing = Some(true);
-            el.sync_distance = Some(highest_block.saturating_sub(*current_block));
+    match &local.el {
+        Ok(batch) => {
+            match &batch.syncing {
+                Ok(ElSyncingResult::Synced) => el.syncing = Some(false),
+                Ok(ElSyncingResult::SyncingBool) => el.syncing = Some(true),
+                Ok(ElSyncingResult::SyncingProgress { distance, .. }) => {
+                    el.syncing = Some(true);
+                    el.sync_distance = Some(*distance);
+                }
+                Err(e) => el.errors.push(DisplayJson(MethodError("eth_syncing", e))),
+            }
+            match &batch.peers {
+                Ok(peers) => el.peers = *peers,
+                Err(e) => el.errors.push(DisplayJson(MethodError("net_peerCount", e))),
+            }
+            match &batch.block {
+                Ok(block) => {
+                    el.block_number = Some(block.number);
+                    el.block_age_secs = Some(block.age(now));
+                }
+                Err(e) => el
+                    .errors
+                    .push(DisplayJson(MethodError("eth_getBlockByNumber", e))),
+            }
         }
-        Err(e) => el.errors.push(e),
-    }
-    match &local.el_peers {
-        Ok(peers) => el.peers = *peers,
-        Err(e) => el.errors.push(e),
-    }
-    match &local.el_block {
-        Ok(block) => {
-            el.block_number = Some(block.number);
-            el.block_age_secs = Some(now.saturating_sub(block.timestamp));
+        Err(e) => {
+            el.errors.extend([
+                DisplayJson(MethodError("eth_syncing", e)),
+                DisplayJson(MethodError("net_peerCount", e)),
+                DisplayJson(MethodError("eth_getBlockByNumber", e)),
+            ]);
         }
-        Err(e) => el.errors.push(e),
     }
 
     let cl = cl_transport
@@ -374,11 +353,13 @@ fn build_snapshot<'a>(
                     cl.head_slot = Some(s.head_slot);
                     cl.slot_age_secs = slot_clock.map(|clock| clock.slot_age(s.head_slot, now));
                 }
-                Err(e) => cl.errors.push(e),
+                Err(e) => cl.errors.push(DisplayJson(MethodError("node/syncing", e))),
             }
             match &cl_probe.peers {
                 Ok(n) => cl.peers = Some(*n),
-                Err(e) => cl.errors.push(e),
+                Err(e) => cl
+                    .errors
+                    .push(DisplayJson(MethodError("node/peer_count", e))),
             }
             cl
         });
@@ -405,8 +386,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::cl::ClStatus;
-    use super::el::ElBlockResult;
+    use super::el::{ElBatchResult, ElBlockResult};
     use super::eval::{ClProbe, LocalProbe};
+    use super::fetch::HealthError;
     use super::reference::{ReferenceProbe, ReferenceSample, ReferenceState};
     use super::*;
 
@@ -414,19 +396,70 @@ mod tests {
         Probe {
             local: Arc::new(local),
             reference: reference.map(Arc::new),
-            published_ready: None,
         }
+    }
+
+    const fn synced_cl() -> ClStatus {
+        ClStatus {
+            head_slot: 100,
+            sync_distance: 0,
+            is_syncing: false,
+            is_optimistic: false,
+            el_offline: false,
+        }
+    }
+
+    const fn syncing_cl() -> ClStatus {
+        ClStatus {
+            head_slot: 50,
+            sync_distance: 50,
+            is_syncing: true,
+            is_optimistic: true,
+            el_offline: false,
+        }
+    }
+
+    fn mk_dual_probe(
+        el_syncing: Result<ElSyncingResult, HealthError>,
+        el_block: Result<ElBlockResult, HealthError>,
+        cl_status: Result<ClStatus, HealthError>,
+        reference: Option<ReferenceProbe>,
+    ) -> Probe {
+        let el_peers = match &el_syncing {
+            Ok(_) => Ok(Some(10)),
+            Err(e) => Err(e.clone()),
+        };
+        let cl_peers = match &cl_status {
+            Ok(_) => Ok(10),
+            Err(e) => Err(e.clone()),
+        };
+        mk_probe(
+            LocalProbe {
+                el: Ok(ElBatchResult {
+                    syncing: el_syncing,
+                    peers: el_peers,
+                    block: el_block,
+                }),
+                cl: Some(ClProbe {
+                    status: cl_status,
+                    peers: cl_peers,
+                }),
+            },
+            reference,
+        )
     }
 
     #[test]
     fn snapshot_reports_numeric_values_when_healthy_and_omits_disabled_layers() {
         let probe = mk_probe(
             LocalProbe {
-                el_syncing: Ok(ElSyncingResult::Synced(false)),
-                el_peers: Ok(Some(0x10)),
-                el_block: Ok(ElBlockResult {
-                    number: 5,
-                    timestamp: 0x3e2,
+                el: Ok(ElBatchResult {
+                    syncing: Ok(ElSyncingResult::Synced),
+                    peers: Ok(Some(0x10)),
+                    block: Ok(ElBlockResult {
+                        number: 5,
+                        timestamp: 0x3e2,
+                    }),
                 }),
                 cl: Some(ClProbe {
                     status: Ok(ClStatus {
@@ -444,7 +477,7 @@ mod tests {
                     block_number: 6,
                     block_lag: 1,
                 }),
-                errors: Box::new([]),
+                errors: Vec::new(),
             }),
         );
         let snap = build_snapshot(
@@ -477,11 +510,13 @@ mod tests {
         // EL-only probe with unsupported `net_peerCount` omits `cl`, `reference`, and `el.peers`.
         let el_only = mk_probe(
             LocalProbe {
-                el_syncing: Ok(ElSyncingResult::Synced(false)),
-                el_peers: Ok(None),
-                el_block: Ok(ElBlockResult {
-                    number: 5,
-                    timestamp: 0x3e2,
+                el: Ok(ElBatchResult {
+                    syncing: Ok(ElSyncingResult::Synced),
+                    peers: Ok(None),
+                    block: Ok(ElBlockResult {
+                        number: 5,
+                        timestamp: 0x3e2,
+                    }),
                 }),
                 cl: None,
             },
@@ -499,17 +534,19 @@ mod tests {
     fn snapshot_records_errors_and_omits_values_on_failure() {
         let probe = mk_probe(
             LocalProbe {
-                el_syncing: Err("eth_syncing: timeout".into()),
-                el_peers: Err("net_peerCount: http 500".into()),
-                el_block: Err("eth_getBlockByNumber: timeout".into()),
+                el: Ok(ElBatchResult {
+                    syncing: Err(HealthError::Timeout),
+                    peers: Err(HealthError::HttpStatus(StatusCode::INTERNAL_SERVER_ERROR)),
+                    block: Err(HealthError::Timeout),
+                }),
                 cl: Some(ClProbe {
-                    status: Err("node/syncing: http 404".into()),
-                    peers: Err("node/peer_count: http 404".into()),
+                    status: Err(HealthError::HttpStatus(StatusCode::NOT_FOUND)),
+                    peers: Err(HealthError::HttpStatus(StatusCode::NOT_FOUND)),
                 }),
             },
             Some(ReferenceProbe {
                 state: ReferenceState::Unavailable,
-                errors: Box::new([Box::from("https://ref.example.com/<redacted>: timeout")]),
+                errors: vec!["https://ref.example.com/<redacted>: timeout".into()],
             }),
         );
         let snap = build_snapshot(
@@ -528,13 +565,16 @@ mod tests {
             json["el"]["errors"],
             serde_json::json!([
                 "eth_syncing: timeout",
-                "net_peerCount: http 500",
+                "net_peerCount: http 500 Internal Server Error",
                 "eth_getBlockByNumber: timeout"
             ])
         );
         assert_eq!(
             json["cl"]["errors"],
-            serde_json::json!(["node/syncing: http 404", "node/peer_count: http 404"])
+            serde_json::json!([
+                "node/syncing: http 404 Not Found",
+                "node/peer_count: http 404 Not Found"
+            ])
         );
         assert_eq!(
             json["reference"],
@@ -543,14 +583,22 @@ mod tests {
             })
         );
 
-        // Capacity overflow saturates without panicking under `panic = "abort"`.
-        let mut small = ErrorList::<2>::default();
-        small.push("a: 1");
-        small.push("b: 2");
-        small.push("c: 3");
+        let batch_err = mk_probe(
+            LocalProbe {
+                el: Err(HealthError::Timeout),
+                cl: None,
+            },
+            None,
+        );
+        let batch_json =
+            serde_json::to_value(build_snapshot(&batch_err, "http/1.1", None, None, 1300)).unwrap();
         assert_eq!(
-            serde_json::to_value(&small).unwrap(),
-            serde_json::json!(["a: 1", "b: 2"])
+            batch_json["el"]["errors"],
+            serde_json::json!([
+                "eth_syncing: timeout",
+                "net_peerCount: timeout",
+                "eth_getBlockByNumber: timeout"
+            ])
         );
     }
 
@@ -558,12 +606,14 @@ mod tests {
     fn snapshot_reports_el_sync_distance_while_syncing() {
         let probe = mk_probe(
             LocalProbe {
-                el_syncing: Ok(ElSyncingResult::Syncing {
-                    current_block: 0x10,
-                    highest_block: 0x20,
+                el: Ok(ElBatchResult {
+                    syncing: Ok(ElSyncingResult::SyncingProgress {
+                        current_block: 0x10,
+                        distance: 0x10,
+                    }),
+                    peers: Err(HealthError::Timeout),
+                    block: Err(HealthError::Timeout),
                 }),
-                el_peers: Err("skip".into()),
-                el_block: Err("skip".into()),
                 cl: None,
             },
             None,
@@ -577,11 +627,13 @@ mod tests {
     fn snapshot_omits_cl_slot_age_when_genesis_disabled() {
         let probe = mk_probe(
             LocalProbe {
-                el_syncing: Ok(ElSyncingResult::Synced(false)),
-                el_peers: Ok(Some(0x10)),
-                el_block: Ok(ElBlockResult {
-                    number: 5,
-                    timestamp: 0x3e2,
+                el: Ok(ElBatchResult {
+                    syncing: Ok(ElSyncingResult::Synced),
+                    peers: Ok(Some(0x10)),
+                    block: Ok(ElBlockResult {
+                        number: 5,
+                        timestamp: 0x3e2,
+                    }),
                 }),
                 cl: Some(ClProbe {
                     status: Ok(ClStatus {
@@ -608,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_snapshot_reports_mode_and_omits_unpolled_or_disabled_fields() {
+    fn trusted_snapshot_and_ready_json_match_expected_schema() {
         for el in ["http/1.1", "h2"] {
             let el_only = serde_json::to_value(trusted_snapshot(el, None)).unwrap();
             assert_eq!(
@@ -630,47 +682,46 @@ mod tests {
                 );
             }
         }
+        assert_eq!(
+            serde_json::to_value(trusted_ready(true)).unwrap(),
+            serde_json::json!({
+                "status": "ready",
+                "el_syncing": { "ok": true, "detail": "trusted upstream (unpolled)" },
+                "cl_syncing": { "ok": true, "detail": "trusted upstream (unpolled)" },
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(trusted_ready(false)).unwrap(),
+            serde_json::json!({
+                "status": "ready",
+                "el_syncing": { "ok": true, "detail": "trusted upstream (unpolled)" },
+            })
+        );
     }
 
     #[test]
     fn node_health_returns_206_only_when_both_layers_reachable_and_syncing() {
-        use clap::Parser;
-
-        let default_opts =
-            crate::Config::parse_from(["ethonyx", "--el-http-url", "http://127.0.0.1:8545"])
-                .parse_validated()
-                .unwrap()
-                .opts;
-        let strict_opts = crate::config::RuntimeOpts {
+        let default_policy = crate::config::HealthPolicy {
+            el_max_reference_lag: 1,
+            strict: None,
+            slot_clock: None,
+        };
+        let strict_policy = crate::config::HealthPolicy {
             strict: Some(crate::config::StrictFreshness {
                 el_max_block_age_secs: 60,
                 cl_max_slot_age_secs: 60,
             }),
-            ..default_opts
+            ..default_policy
         };
-        let strict_clock_opts = crate::config::RuntimeOpts {
+        let strict_clock_policy = crate::config::HealthPolicy {
             slot_clock: SlotClock::new(1000, 12),
-            ..strict_opts
+            ..strict_policy
         };
 
-        let synced_el = ElSyncingResult::Synced(false);
-        let syncing_el = ElSyncingResult::Syncing {
+        let synced_el = ElSyncingResult::Synced;
+        let syncing_el = ElSyncingResult::SyncingProgress {
             current_block: 10,
-            highest_block: 20,
-        };
-        let synced_cl = ClStatus {
-            head_slot: 100,
-            sync_distance: 0,
-            is_syncing: false,
-            is_optimistic: false,
-            el_offline: false,
-        };
-        let syncing_cl = ClStatus {
-            head_slot: 50,
-            sync_distance: 50,
-            is_syncing: true,
-            is_optimistic: true,
-            el_offline: false,
+            distance: 10,
         };
         let fresh_block = ElBlockResult {
             number: 10,
@@ -682,208 +733,138 @@ mod tests {
         };
 
         // 1. Ready -> 200 OK (default and strict with fresh block)
-        let ready_probe = mk_probe(
-            LocalProbe {
-                el_syncing: Ok(synced_el),
-                el_peers: Ok(Some(10)),
-                el_block: Ok(fresh_block),
-                cl: Some(ClProbe {
-                    status: Ok(synced_cl),
-                    peers: Ok(10),
-                }),
-            },
-            None,
-        );
+        let ready_probe = mk_dual_probe(Ok(synced_el), Ok(fresh_block), Ok(synced_cl()), None);
         assert_eq!(
-            classify_node_health(evaluate_readiness(&default_opts, &ready_probe)),
+            classify_node_health(evaluate_readiness(default_policy, &ready_probe)),
             StatusCode::OK
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(&strict_opts, &ready_probe)),
+            classify_node_health(evaluate_readiness(strict_policy, &ready_probe)),
             StatusCode::OK
         );
 
         // 2. EL syncing + CL reachable -> 206 Partial Content (even when block is stale/missing
         // under --readyz-strict, CL reports `is_optimistic: true`, or node lags behind reference!)
-        let el_sync_probe = mk_probe(
-            LocalProbe {
-                el_syncing: Ok(syncing_el),
-                el_peers: Ok(Some(10)),
-                el_block: Err("latest block not yet populated".into()),
-                cl: Some(ClProbe {
-                    status: Ok(ClStatus {
-                        is_optimistic: true,
-                        ..synced_cl
-                    }),
-                    peers: Ok(10),
-                }),
-            },
+        let el_sync_probe = mk_dual_probe(
+            Ok(syncing_el),
+            Err(HealthError::decode_msg("latest block not yet populated")),
+            Ok(ClStatus {
+                is_optimistic: true,
+                ..synced_cl()
+            }),
             Some(ReferenceProbe {
                 state: ReferenceState::Active(ReferenceSample {
                     block_number: 500,
                     block_lag: 490,
                 }),
-                errors: Box::new([]),
+                errors: Vec::new(),
             }),
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(&default_opts, &el_sync_probe)),
+            classify_node_health(evaluate_readiness(default_policy, &el_sync_probe)),
             StatusCode::PARTIAL_CONTENT
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(&strict_opts, &el_sync_probe)),
+            classify_node_health(evaluate_readiness(strict_policy, &el_sync_probe)),
             StatusCode::PARTIAL_CONTENT
         );
 
-        let el_sync_bool_probe = mk_probe(
-            LocalProbe {
-                el_syncing: Ok(ElSyncingResult::Synced(true)),
-                el_peers: Ok(Some(10)),
-                el_block: Ok(stale_block),
-                cl: Some(ClProbe {
-                    status: Ok(synced_cl),
-                    peers: Ok(10),
-                }),
-            },
+        let el_sync_bool_probe = mk_dual_probe(
+            Ok(ElSyncingResult::SyncingBool),
+            Ok(stale_block),
+            Ok(synced_cl()),
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(&default_opts, &el_sync_bool_probe)),
+            classify_node_health(evaluate_readiness(default_policy, &el_sync_bool_probe)),
             StatusCode::PARTIAL_CONTENT
         );
 
         // 3. EL syncing + CL down -> 503 Service Unavailable (must NOT mask CL crash as 206)
-        let cl_down_probe = mk_probe(
-            LocalProbe {
-                el_syncing: Ok(syncing_el),
-                el_peers: Ok(Some(10)),
-                el_block: Ok(stale_block),
-                cl: Some(ClProbe {
-                    status: Err("connection refused".into()),
-                    peers: Err("connection refused".into()),
-                }),
-            },
+        let cl_down_probe = mk_dual_probe(
+            Ok(syncing_el),
+            Ok(stale_block),
+            Err(HealthError::Transport("connection refused".into())),
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(&default_opts, &cl_down_probe)),
+            classify_node_health(evaluate_readiness(default_policy, &cl_down_probe)),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
         // 4. CL syncing + EL down -> 503 Service Unavailable (must NOT mask EL crash as 206)
-        let el_down_probe = mk_probe(
-            LocalProbe {
-                el_syncing: Err("timeout".into()),
-                el_peers: Err("timeout".into()),
-                el_block: Err("timeout".into()),
-                cl: Some(ClProbe {
-                    status: Ok(syncing_cl),
-                    peers: Ok(10),
-                }),
-            },
+        let el_down_probe = mk_dual_probe(
+            Err(HealthError::Timeout),
+            Err(HealthError::Timeout),
+            Ok(syncing_cl()),
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(&default_opts, &el_down_probe)),
+            classify_node_health(evaluate_readiness(default_policy, &el_down_probe)),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
         // 5. CL syncing + EL reachable under --readyz-strict -> 206, unless EL claims synced with unreadable block -> 503
-        let cl_sync_probe = mk_probe(
-            LocalProbe {
-                el_syncing: Ok(synced_el),
-                el_peers: Ok(Some(10)),
-                el_block: Ok(stale_block),
-                cl: Some(ClProbe {
-                    status: Ok(syncing_cl),
-                    peers: Ok(10),
-                }),
-            },
-            None,
-        );
+        let cl_sync_probe = mk_dual_probe(Ok(synced_el), Ok(stale_block), Ok(syncing_cl()), None);
         assert_eq!(
-            classify_node_health(evaluate_readiness(&strict_clock_opts, &cl_sync_probe)),
+            classify_node_health(evaluate_readiness(strict_clock_policy, &cl_sync_probe)),
             StatusCode::PARTIAL_CONTENT
         );
-        let strict_block_err_probe = mk_probe(
-            LocalProbe {
-                el_syncing: Ok(synced_el),
-                el_peers: Ok(Some(10)),
-                el_block: Err("rpc error".into()),
-                cl: Some(ClProbe {
-                    status: Ok(syncing_cl),
-                    peers: Ok(10),
-                }),
-            },
+        let strict_block_err_probe = mk_dual_probe(
+            Ok(synced_el),
+            Err(HealthError::Rpc("rpc error".into())),
+            Ok(syncing_cl()),
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(&strict_opts, &strict_block_err_probe)),
+            classify_node_health(evaluate_readiness(strict_policy, &strict_block_err_probe)),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
         // 6. Silent stall (`is_optimistic: true` while neither layer is syncing), `el_offline: true`,
         // or reference lag while synced -> 503 Service Unavailable.
-        let silent_optimistic_probe = mk_probe(
-            LocalProbe {
-                el_syncing: Ok(synced_el),
-                el_peers: Ok(Some(10)),
-                el_block: Ok(fresh_block),
-                cl: Some(ClProbe {
-                    status: Ok(ClStatus {
-                        is_optimistic: true,
-                        ..synced_cl
-                    }),
-                    peers: Ok(10),
-                }),
-            },
+        let silent_optimistic_probe = mk_dual_probe(
+            Ok(synced_el),
+            Ok(fresh_block),
+            Ok(ClStatus {
+                is_optimistic: true,
+                ..synced_cl()
+            }),
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(&default_opts, &silent_optimistic_probe)),
+            classify_node_health(evaluate_readiness(default_policy, &silent_optimistic_probe)),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
-        let el_offline_probe = mk_probe(
-            LocalProbe {
-                el_syncing: Ok(syncing_el),
-                el_peers: Ok(Some(10)),
-                el_block: Ok(fresh_block),
-                cl: Some(ClProbe {
-                    status: Ok(ClStatus {
-                        el_offline: true,
-                        ..syncing_cl
-                    }),
-                    peers: Ok(10),
-                }),
-            },
+        let el_offline_probe = mk_dual_probe(
+            Ok(syncing_el),
+            Ok(fresh_block),
+            Ok(ClStatus {
+                el_offline: true,
+                ..syncing_cl()
+            }),
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(&default_opts, &el_offline_probe)),
+            classify_node_health(evaluate_readiness(default_policy, &el_offline_probe)),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
-        let lagging_synced_probe = mk_probe(
-            LocalProbe {
-                el_syncing: Ok(synced_el),
-                el_peers: Ok(Some(10)),
-                el_block: Ok(fresh_block),
-                cl: Some(ClProbe {
-                    status: Ok(synced_cl),
-                    peers: Ok(10),
-                }),
-            },
+        let lagging_synced_probe = mk_dual_probe(
+            Ok(synced_el),
+            Ok(fresh_block),
+            Ok(synced_cl()),
             Some(ReferenceProbe {
                 state: ReferenceState::Active(ReferenceSample {
                     block_number: 12,
                     block_lag: 2,
                 }),
-                errors: Box::new([]),
+                errors: Vec::new(),
             }),
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(&default_opts, &lagging_synced_probe)),
+            classify_node_health(evaluate_readiness(default_policy, &lagging_synced_probe)),
             StatusCode::SERVICE_UNAVAILABLE
         );
     }

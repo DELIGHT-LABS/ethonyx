@@ -16,8 +16,11 @@ impl Telemetry {
 }
 
 pub(crate) fn parse_config_endpoint(
-    _cfg: &crate::Config,
+    cfg: &crate::Config,
 ) -> Result<Option<crate::upstream::HttpUpstream>, crate::BoxError> {
+    if cfg.otel_endpoint.is_some() {
+        return Err("--otel-endpoint requires building ethonyx with the `otel` feature".into());
+    }
     Ok(None)
 }
 
