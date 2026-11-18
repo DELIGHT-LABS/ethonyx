@@ -9,6 +9,8 @@ async fn shutdown_releases_upgraded_websocket_connections() {
     let upstream = ws_echo_upstream().await;
     for mocking in ["false", "true"] {
         let proxy = EthonyxHandle::start(&[
+            "--el-http-url",
+            "http://127.0.0.1:8545",
             "--trust-upstream",
             "--mock-eth-syncing",
             mocking,
@@ -63,7 +65,13 @@ async fn shutdown_releases_upgraded_websocket_connections() {
 async fn shutdown_waits_for_websocket_peer_close() {
     let upstream = ws_echo_upstream().await;
     let mut proxy = EthonyxHandle::start_with_grace(
-        &["--trust-upstream", "--el-ws-url", &upstream],
+        &[
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+            "--el-ws-url",
+            &upstream,
+        ],
         Duration::from_secs(3),
     )
     .await;
@@ -91,7 +99,13 @@ async fn shutdown_waits_for_websocket_peer_close() {
 async fn shutdown_bounds_an_unresponsive_websocket_peer() {
     let upstream = ws_echo_upstream().await;
     let proxy = EthonyxHandle::start_with_grace(
-        &["--trust-upstream", "--el-ws-url", &upstream],
+        &[
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+            "--el-ws-url",
+            &upstream,
+        ],
         Duration::from_secs(1),
     )
     .await;
@@ -140,7 +154,14 @@ async fn shutdown_releases_a_stalled_http_response_body() {
         assert!(matches!(end, Ok(0) | Err(_)), "{end:?}");
         let _ = closed_tx.send(());
     });
-    let proxy = EthonyxHandle::start(&["--trust-upstream", "--cl-beacon-url", &upstream]).await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        "http://127.0.0.1:8545",
+        "--trust-upstream",
+        "--cl-beacon-url",
+        &upstream,
+    ])
+    .await;
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -177,6 +198,8 @@ async fn shutdown_already_ready_does_not_wait_for_a_new_watch_event() {
             "ethonyx",
             "--listen",
             "127.0.0.1:0",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
             "--trust-upstream",
             "--shutdown-grace",
             "0",
@@ -227,8 +250,17 @@ async fn shutdown_during_h2_ws_handshake(complete_handshake: bool, grace: Durati
         }
         let _ = closed_tx.send(());
     });
-    let mut proxy =
-        EthonyxHandle::start_with_grace(&["--trust-upstream", "--el-ws-url", &url], grace).await;
+    let mut proxy = EthonyxHandle::start_with_grace(
+        &[
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+            "--el-ws-url",
+            &url,
+        ],
+        grace,
+    )
+    .await;
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -347,7 +379,13 @@ async fn shutdown_sends_going_away_close_frame_to_active_h1_and_h2_websockets() 
 
     let upstream = ws_echo_upstream().await;
     let mut proxy = EthonyxHandle::start_with_grace(
-        &["--trust-upstream", "--el-ws-url", &upstream],
+        &[
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+            "--el-ws-url",
+            &upstream,
+        ],
         Duration::from_secs(1),
     )
     .await;

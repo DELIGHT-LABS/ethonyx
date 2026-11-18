@@ -7,7 +7,7 @@ use crate::BoxError;
 use crate::lifecycle::Lifecycle;
 use crate::response::{ResBody, empty_body, text_response, uri_too_long_response};
 use crate::state::AppState;
-use crate::transport::configure_tcp_stream;
+use crate::transport::{WsTarget, configure_tcp_stream};
 use http::{Method, Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -189,6 +189,7 @@ fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
 pub(crate) async fn upgrade<P: Send + 'static>(
     req: Request<Incoming>,
     mode: WsMode,
+    ws: &WsTarget,
     state: &AppState,
     lifecycle: &Lifecycle,
     acquire_permit: impl FnOnce() -> Option<P>,
@@ -205,7 +206,7 @@ pub(crate) async fn upgrade<P: Send + 'static>(
         }
     };
     let inbound_uri = std::mem::take(req.uri_mut());
-    let Ok(upstream_uri) = state.el_ws.rewrite_uri(inbound_uri) else {
+    let Ok(upstream_uri) = ws.upstream.rewrite_uri(inbound_uri) else {
         return Ok(uri_too_long_response());
     };
     let Some(permit) = acquire_permit() else {
@@ -215,10 +216,10 @@ pub(crate) async fn upgrade<P: Send + 'static>(
         ));
     };
     let on_upgrade = hyper::upgrade::on(&mut req);
-    let ws_req = build_ws_request(req, upstream_uri, &state.el_ws, mode);
-    let io_timeout = state.cfg.proxy_timeout;
+    let ws_req = build_ws_request(req, upstream_uri, &ws.upstream, mode);
+    let io_timeout = state.opts.proxy_timeout;
     let dial = async {
-        let tcp = tokio::net::TcpStream::connect(state.el_ws.dial_target())
+        let tcp = tokio::net::TcpStream::connect(ws.upstream.dial_target())
             .await
             .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
         configure_tcp_stream(&tcp);
@@ -226,7 +227,7 @@ pub(crate) async fn upgrade<P: Send + 'static>(
             ws_req,
             WriteProgressIo::new(tcp),
             Some(ws_config()),
-            Some(state.ws_tls.clone()),
+            Some(ws.tls.clone()),
         )
         .await
     };
@@ -273,7 +274,7 @@ pub(crate) async fn upgrade<P: Send + 'static>(
             .insert(http::header::SEC_WEBSOCKET_PROTOCOL, protocol);
     }
     let lifecycle = lifecycle.clone();
-    let mock_enabled = state.cfg.mock_eth_syncing;
+    let mock_enabled = state.opts.mock_eth_syncing;
     let ws_slot = state.metrics.ws_slot();
     tokio::spawn(lifecycle.run_with(move |shutdown| async move {
         let _permit = permit;

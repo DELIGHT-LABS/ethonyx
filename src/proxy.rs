@@ -21,7 +21,8 @@ use crate::metrics::{UpstreamLayer, classify_method};
 use crate::response::{
     ResBody, empty_body, full_body, raw_json_response, text_response, uri_too_long_response,
 };
-use crate::state::{AppState, HttpTarget};
+use crate::state::{AppState, ClState};
+use crate::transport::{HttpTarget, WsTarget};
 use crate::websocket::WsMode;
 
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -100,8 +101,9 @@ impl Connection {
         req: Request<Incoming>,
     ) -> Result<Response<ResBody>, Infallible> {
         // The same decision drives routing, metrics and access logs. GET/HEAD
-        // probes and invalid targets return locally without upstream metrics/spans.
-        let target = match classify_request(&req) {
+        // probes, unconfigured CL/WS routes, and invalid targets return locally
+        // without upstream metrics/spans.
+        let forward = match classify_request(&req) {
             Route::Probe(probe) => return Ok(probe.response(req.method(), &self.state)),
             Route::Reject => {
                 return Ok(text_response(
@@ -109,9 +111,17 @@ impl Connection {
                     Bytes::from_static(b"invalid request target"),
                 ));
             }
-            Route::Proxy(target) => target,
+            Route::Proxy(target) => {
+                let Some(forward) = Forward::resolve(target, &self.state) else {
+                    return Ok(text_response(
+                        StatusCode::NOT_FOUND,
+                        Bytes::from_static(b"not found"),
+                    ));
+                };
+                forward
+            }
         };
-        let (layer, upstream_proto) = target.layer_and_proto();
+        let (layer, upstream_proto) = forward.layer_and_proto();
         let upstream_type = layer.as_str();
         let (method_idx, method_label) = classify_method(req.method());
         let version = req.version();
@@ -133,7 +143,7 @@ impl Connection {
             tracing::Span::none()
         };
         let start = std::time::Instant::now();
-        let res = route(req, &self, target).instrument(span).await;
+        let res = route(req, &self, forward).instrument(span).await;
         let response = res.unwrap_or_else(|e| {
             warn!(
                 upstream = upstream_type,
@@ -178,16 +188,6 @@ enum Target {
     Cl,
     El,
     WebSocket(WsMode),
-}
-
-impl Target {
-    const fn layer_and_proto(self) -> (UpstreamLayer, &'static str) {
-        match self {
-            Self::Cl => (UpstreamLayer::Cl, "HTTP"),
-            Self::El => (UpstreamLayer::El, "HTTP"),
-            Self::WebSocket(_) => (UpstreamLayer::El, "WS"),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,34 +280,64 @@ pub(crate) fn is_cl_path(path: &str) -> bool {
     }
 }
 
+/// A [`Target`] bound to the configured upstream it requires.
+#[derive(Clone, Copy)]
+enum Forward<'a> {
+    Cl(&'a ClState),
+    El,
+    WebSocket(WsMode, &'a WsTarget),
+}
+
+impl<'a> Forward<'a> {
+    fn resolve(target: Target, state: &'a AppState) -> Option<Self> {
+        Some(match target {
+            Target::Cl => Self::Cl(state.cl.as_ref()?),
+            Target::El => Self::El,
+            Target::WebSocket(mode) => Self::WebSocket(mode, state.el_ws.as_ref()?),
+        })
+    }
+
+    const fn layer_and_proto(self) -> (UpstreamLayer, &'static str) {
+        match self {
+            Self::Cl(_) => (UpstreamLayer::Cl, "HTTP"),
+            Self::El => (UpstreamLayer::El, "HTTP"),
+            Self::WebSocket(..) => (UpstreamLayer::El, "WS"),
+        }
+    }
+}
+
 async fn route(
     req: Request<Incoming>,
     connection: &Arc<Connection>,
-    target: Target,
+    forward: Forward<'_>,
 ) -> Result<Response<ResBody>, BoxError> {
     let state = &connection.state;
     trace!(method = %req.method(), path = req.uri().path(), "routing request");
-    match target {
-        Target::Cl => proxy_cl(req, state).await,
-        Target::WebSocket(mode) => {
-            crate::websocket::upgrade(req, mode, state, &connection.lifecycle, || {
+    match forward {
+        Forward::Cl(cl) => proxy_cl(req, state, cl).await,
+        Forward::WebSocket(mode, ws) => {
+            crate::websocket::upgrade(req, mode, ws, state, &connection.lifecycle, || {
                 connection.acquire_ws_permit(mode)
             })
             .await
         }
-        Target::El => proxy_el(req, state).await,
+        Forward::El => proxy_el(req, state).await,
     }
 }
 
-async fn proxy_cl(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
+async fn proxy_cl(
+    req: Request<Incoming>,
+    state: &AppState,
+    cl: &ClState,
+) -> Result<Response<ResBody>, BoxError> {
     if (req.method() == Method::GET || req.method() == Method::HEAD)
         && req.uri().path() == "/eth/v1/node/health"
-        && state.cfg.mock_cl_node_health
+        && cl.mock_node_health
     {
         return Ok(health::node_health(state));
     }
     if req.method() == Method::POST
-        && state.cfg.mock_cl_subscriptions
+        && cl.mock_subscriptions
         && matches!(
             req.uri().path(),
             "/eth/v1/validator/prepare_beacon_proposer"
@@ -315,7 +345,7 @@ async fn proxy_cl(req: Request<Incoming>, state: &AppState) -> Result<Response<R
                 | "/eth/v1/validator/sync_committee_subscriptions"
         )
     {
-        if let Err(err) = drain_limited(req.into_body(), state.cfg.proxy_timeout).await {
+        if let Err(err) = drain_limited(req.into_body(), state.opts.proxy_timeout).await {
             return Ok(err.into_response());
         }
         return Ok(raw_json_response(
@@ -326,7 +356,7 @@ async fn proxy_cl(req: Request<Incoming>, state: &AppState) -> Result<Response<R
     let (mut parts, body) = req.into_parts();
     let target = if parts.method == Method::POST
         && parts.uri.path() == "/eth/v1/validator/register_validator"
-        && let Some(ref mev) = state.cl_mev_relay
+        && let Some(ref mev) = cl.mev_relay
     {
         let Ok(replaced) =
             crate::upstream::replace_uri_path(parts.uri, "/eth/v1/builder/validators")
@@ -336,15 +366,15 @@ async fn proxy_cl(req: Request<Incoming>, state: &AppState) -> Result<Response<R
         parts.uri = replaced;
         mev
     } else {
-        &state.cl
+        &cl.beacon
     };
     execute_upstream(parts, box_incoming(body), state, target).await
 }
 
 async fn proxy_el(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
-    let (parts, body) = if req.method() == Method::POST && state.cfg.mock_eth_syncing {
+    let (parts, body) = if req.method() == Method::POST && state.opts.mock_eth_syncing {
         let (parts, body) = req.into_parts();
-        let bytes = match collect_limited(body, state.cfg.proxy_timeout).await {
+        let bytes = match collect_limited(body, state.opts.proxy_timeout).await {
             Ok(bytes) => bytes,
             Err(err) => return Ok(err.into_response()),
         };
@@ -457,7 +487,7 @@ async fn execute_upstream(
     let upstream_req = Request::from_parts(parts, body);
     let client = target.transport.select_client(&state.client);
 
-    let resp = tokio::time::timeout(state.cfg.proxy_timeout, client.request(upstream_req))
+    let resp = tokio::time::timeout(state.opts.proxy_timeout, client.request(upstream_req))
         .await
         .map_err(|_| -> BoxError { "upstream timeout".into() })??;
 
@@ -467,8 +497,8 @@ async fn execute_upstream(
     sanitize_response_headers(resp_parts.status, &mut resp_parts.headers);
     let idle_timeout = response_idle_timeout(
         &resp_parts.headers,
-        state.cfg.proxy_timeout,
-        state.cfg.sse_idle_timeout,
+        state.opts.proxy_timeout,
+        state.opts.sse_idle_timeout,
     );
     let body = IdleTimeoutBody::new(resp_body, idle_timeout).boxed_unsync();
     Ok(Response::from_parts(resp_parts, body))
@@ -896,19 +926,22 @@ mod tests {
         use clap::Parser;
         use tokio::sync::mpsc;
 
-        let cfg =
-            crate::Config::parse_from(["ethonyx", "--trust-upstream", "--max-connections", "2"]);
+        let cfg = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+            "--max-connections",
+            "2",
+        ]);
         let parsed = cfg.parse_validated().unwrap();
-        let state = Arc::new(
-            AppState::new(
-                &cfg,
-                parsed.upstreams,
-                false,
-                health::HealthSource::Trusted,
-                crate::metrics::ServerMetrics::new(None),
-            )
-            .unwrap(),
-        );
+        let state = Arc::new(AppState::new(
+            parsed.opts,
+            parsed.upstreams,
+            false,
+            health::HealthSource::Trusted,
+            crate::metrics::ServerMetrics::new(None),
+        ));
         let sem = Arc::clone(&state.conn_limit);
         let tcp_permit = Arc::new(sem.clone().try_acquire_owned().unwrap());
         let (_shutdown_tx, shutdown_rx) = crate::lifecycle::channel();

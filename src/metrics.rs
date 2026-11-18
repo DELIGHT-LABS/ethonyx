@@ -187,7 +187,7 @@ pub(crate) struct ServerMetrics {
     duration: [OnceLock<Histogram>; 2],
     /// `[upstream: EL=0 | CL=1][method: POST=0 | GET=1 | CONNECT=2 | HEAD=3][status: 8 hot codes]`
     requests: [[[OnceLock<Counter>; 8]; 4]; 2],
-    health: HealthMetrics,
+    health: [OnceLock<Gauge>; HealthGauge::COUNT],
 }
 
 impl ServerMetrics {
@@ -207,7 +207,7 @@ impl ServerMetrics {
             saturated: OnceLock::new(),
             duration: Default::default(),
             requests: Default::default(),
-            health: HealthMetrics::default(),
+            health: Default::default(),
         }
     }
 
@@ -298,8 +298,12 @@ impl ServerMetrics {
         }
     }
 
-    pub(crate) fn record_health(&self, sample: HealthSample) {
-        self.health.record(&self.recorder, sample);
+    /// Set one health gauge. Its handle is registered on first use, so a gauge that is
+    /// never set (a disabled layer, or everything under `--trust-upstream`) never appears.
+    pub(crate) fn set_health(&self, gauge: HealthGauge, value: f64) {
+        self.health[gauge as usize]
+            .get_or_init(|| self.recorder.with(|| gauge.register()))
+            .set(value);
     }
 }
 
@@ -349,88 +353,41 @@ const fn classify_status(status: u16) -> (Option<usize>, &'static str) {
     }
 }
 
+/// Every gauge the health poller sets; the only place their series names appear.
+#[repr(usize)]
 #[derive(Clone, Copy)]
-pub(crate) struct ClSlotSample {
-    pub(crate) sync_distance: u64,
-    pub(crate) head_slot: u64,
+pub(crate) enum HealthGauge {
+    ElHealth = 0,
+    ElPeers,
+    ElSyncDistance,
+    ElBlockNumber,
+    ClHealth,
+    ClPeers,
+    ClSyncDistance,
+    ClSlotNumber,
+    ReferenceHealth,
+    ReferenceBlockNumber,
+    // Must remain last; `Self::COUNT` is derived from this variant.
+    ReferenceBlockLag,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct HealthSample {
-    pub(crate) el_ok: bool,
-    pub(crate) cl_ok: bool,
-    pub(crate) el_peers: f64,
-    pub(crate) cl_peers: f64,
-    pub(crate) el_distance: f64,
-    pub(crate) cl_status: Option<ClSlotSample>,
-    pub(crate) el_block: Option<u64>,
-}
+impl HealthGauge {
+    const COUNT: usize = Self::ReferenceBlockLag as usize + 1;
 
-/// Lazily cached gauge handles for background health polling while keeping
-/// gauges unregistered under `--trust-upstream`.
-#[derive(Default)]
-struct HealthMetrics {
-    el_health: OnceLock<Gauge>,
-    cl_health: OnceLock<Gauge>,
-    el_peers: OnceLock<Gauge>,
-    cl_peers: OnceLock<Gauge>,
-    el_distance: OnceLock<Gauge>,
-    cl_distance: OnceLock<Gauge>,
-    slot_number: OnceLock<Gauge>,
-    block_number: OnceLock<Gauge>,
-}
-
-impl HealthMetrics {
-    fn record(&self, recorder: &LocalRecorder, sample: HealthSample) {
-        self.el_health
-            .get_or_init(|| {
-                recorder
-                    .with(|| ::metrics::gauge!("ethonyx_upstream_health_status", "layer" => "el"))
-            })
-            .set(if sample.el_ok { 1.0 } else { 0.0 });
-        self.cl_health
-            .get_or_init(|| {
-                recorder
-                    .with(|| ::metrics::gauge!("ethonyx_upstream_health_status", "layer" => "cl"))
-            })
-            .set(if sample.cl_ok { 1.0 } else { 0.0 });
-
-        self.el_peers
-            .get_or_init(|| {
-                recorder.with(|| ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "el"))
-            })
-            .set(sample.el_peers);
-        self.cl_peers
-            .get_or_init(|| {
-                recorder.with(|| ::metrics::gauge!("ethonyx_upstream_peers", "layer" => "cl"))
-            })
-            .set(sample.cl_peers);
-
-        self.el_distance
-            .get_or_init(|| {
-                recorder
-                    .with(|| ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "el"))
-            })
-            .set(sample.el_distance);
-
-        let cl_dist_gauge = self.cl_distance.get_or_init(|| {
-            recorder.with(|| ::metrics::gauge!("ethonyx_upstream_sync_distance", "layer" => "cl"))
-        });
-        if let Some(cl) = sample.cl_status {
-            cl_dist_gauge.set(cl.sync_distance as f64);
-            self.slot_number
-                .get_or_init(|| recorder.with(|| ::metrics::gauge!("ethonyx_upstream_slot_number")))
-                .set(cl.head_slot as f64);
-        } else {
-            cl_dist_gauge.set(0.0);
-        }
-
-        if let Some(block_num) = sample.el_block {
-            self.block_number
-                .get_or_init(|| {
-                    recorder.with(|| ::metrics::gauge!("ethonyx_upstream_block_number"))
-                })
-                .set(block_num as f64);
+    fn register(self) -> Gauge {
+        use ::metrics::gauge;
+        match self {
+            Self::ElHealth => gauge!("ethonyx_upstream_health_status", "layer" => "el"),
+            Self::ElPeers => gauge!("ethonyx_upstream_peers", "layer" => "el"),
+            Self::ElSyncDistance => gauge!("ethonyx_upstream_sync_distance", "layer" => "el"),
+            Self::ElBlockNumber => gauge!("ethonyx_upstream_block_number"),
+            Self::ClHealth => gauge!("ethonyx_upstream_health_status", "layer" => "cl"),
+            Self::ClPeers => gauge!("ethonyx_upstream_peers", "layer" => "cl"),
+            Self::ClSyncDistance => gauge!("ethonyx_upstream_sync_distance", "layer" => "cl"),
+            Self::ClSlotNumber => gauge!("ethonyx_upstream_slot_number"),
+            Self::ReferenceHealth => gauge!("ethonyx_reference_health_status"),
+            Self::ReferenceBlockNumber => gauge!("ethonyx_reference_block_number"),
+            Self::ReferenceBlockLag => gauge!("ethonyx_reference_block_lag"),
         }
     }
 }
@@ -494,29 +451,37 @@ mod tests {
             414,
             Duration::from_millis(1),
         );
-        m1.record_health(HealthSample {
-            el_ok: true,
-            cl_ok: false,
-            el_peers: 4.0,
-            cl_peers: 8.0,
-            el_distance: 0.0,
-            cl_status: Some(ClSlotSample {
-                sync_distance: 2,
-                head_slot: 99,
-            }),
-            el_block: Some(1234),
-        });
+        for (gauge, value) in [
+            (HealthGauge::ElBlockNumber, 1234.0),
+            (HealthGauge::ReferenceHealth, 1.0),
+            (HealthGauge::ReferenceBlockNumber, 1235.0),
+            (HealthGauge::ReferenceBlockLag, 1.0),
+        ] {
+            m1.set_health(gauge, value);
+        }
 
         let r1 = m1.render_prometheus();
         assert!(r1.contains("ethonyx_connection_limit_saturated_total 1"));
         assert!(r1.contains("status=\"200\""));
         assert!(r1.contains("status=\"414\""));
         assert!(r1.contains("ethonyx_upstream_block_number 1234"));
+        assert!(r1.contains("ethonyx_reference_health_status 1"));
+        assert!(r1.contains("ethonyx_reference_block_number 1235"));
+        assert!(r1.contains("ethonyx_reference_block_lag 1"));
 
         let r2 = m2.render_prometheus();
         assert!(
             r2.is_empty(),
             "second ServerMetrics instance must not share series from m1, got:\n{r2}"
         );
+
+        // A gauge that is never set is never registered.
+        m2.set_health(HealthGauge::ElBlockNumber, 50.0);
+        let r2_el_only = m2.render_prometheus();
+        assert!(r2_el_only.contains("ethonyx_upstream_block_number 50"));
+        assert!(!r2_el_only.contains("layer=\"cl\""));
+        assert!(!r2_el_only.contains("ethonyx_upstream_slot_number"));
+        assert!(!r2_el_only.contains("ethonyx_upstream_peers"));
+        assert!(!r2_el_only.contains("ethonyx_reference_"));
     }
 }

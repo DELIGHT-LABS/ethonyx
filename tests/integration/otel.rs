@@ -213,6 +213,8 @@ async fn bind_failure_is_not_swallowed_by_shutdown_with_unresponsive_otel_collec
         "ethonyx",
         "--listen",
         &occupied_addr.to_string(),
+        "--el-http-url",
+        "http://127.0.0.1:8545",
         "--trust-upstream",
         "--otel-endpoint",
         &collector_url,

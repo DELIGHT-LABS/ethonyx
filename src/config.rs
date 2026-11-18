@@ -7,6 +7,10 @@ use clap::{Parser, ValueEnum};
 use crate::BoxError;
 use crate::upstream::{HttpUpstream, RedactedUrl, WsUpstream, parse_canonical_port};
 
+const DEFAULT_CL_MAX_SLOT_AGE_SECS: u64 = 60;
+const DEFAULT_EL_MAX_REFERENCE_LAG: u64 = 1;
+const DEFAULT_EL_REFERENCE_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Network {
     Mainnet,
@@ -36,7 +40,39 @@ impl Network {
     }
 }
 
-#[derive(Clone, Parser)]
+/// An upstream URL exactly as given on the command line or in the environment.
+/// Its [`fmt::Debug`] output redacts credentials, non-root paths, queries, and
+/// fragments so [`Config`] (or individual URL fields) can be logged safely.
+#[derive(Clone)]
+pub struct UrlArg(String);
+
+impl From<String> for UrlArg {
+    fn from(raw: String) -> Self {
+        Self(raw)
+    }
+}
+
+impl From<&str> for UrlArg {
+    fn from(raw: &str) -> Self {
+        Self(String::from(raw))
+    }
+}
+
+impl std::ops::Deref for UrlArg {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for UrlArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&RedactedUrl(&self.0), f)
+    }
+}
+
+#[derive(Clone, Debug, Parser)]
 #[command(
     version,
     about = "Ethonyx — Ethereum EL/CL reverse proxy & health-check sidecar"
@@ -52,46 +88,58 @@ pub struct Config {
     )]
     pub listen: Vec<String>,
 
-    /// Execution-layer JSON-RPC over HTTP upstream URL.
-    #[arg(
-        long,
-        env = "ETHONYX_EL_HTTP_URL",
-        default_value = "http://127.0.0.1:8545"
-    )]
-    pub el_http_url: String,
+    /// Execution-layer JSON-RPC over HTTP upstream URL (required).
+    #[arg(long, env = "ETHONYX_EL_HTTP_URL")]
+    pub el_http_url: UrlArg,
 
-    /// Execution-layer JSON-RPC over WebSocket upstream URL.
-    #[arg(long, env = "ETHONYX_EL_WS_URL", default_value = "ws://127.0.0.1:8546")]
-    pub el_ws_url: String,
+    /// Optional Execution-layer JSON-RPC over WebSocket upstream URL.
+    /// Omit to disable WebSocket forwarding (HTTP-only EL mode).
+    #[arg(long, env = "ETHONYX_EL_WS_URL")]
+    pub el_ws_url: Option<UrlArg>,
 
-    /// Consensus-layer Beacon API upstream URL (REST, /eth/v1/...).
-    #[arg(
-        long,
-        env = "ETHONYX_CL_BEACON_URL",
-        default_value = "http://127.0.0.1:5052"
-    )]
-    pub cl_beacon_url: String,
+    /// Optional Consensus-layer Beacon API upstream URL (REST, /eth/v1/...).
+    /// Omit to run in EL-only mode (L2, Cosmos EVM, non-Beacon chains).
+    #[arg(long, env = "ETHONYX_CL_BEACON_URL")]
+    pub cl_beacon_url: Option<UrlArg>,
 
     /// Optional Consensus-layer MEV Relay / MEV-Boost upstream URL (REST, /eth/v1/builder/validators).
     /// When specified, POST /eth/v1/validator/register_validator requests are rewritten to
-    /// /eth/v1/builder/validators and routed to this URL.
+    /// /eth/v1/builder/validators and routed to this URL. Requires `--cl-beacon-url`.
     #[arg(long, env = "ETHONYX_CL_MEV_RELAY_URL")]
-    pub cl_mev_relay_url: Option<String>,
+    pub cl_mev_relay_url: Option<UrlArg>,
 
-    /// Beacon network. Selects defaults for cl-genesis-time / cl-seconds-per-slot.
+    /// Beacon network (defaults to `mainnet` when `--cl-beacon-url` is set).
+    /// Selects defaults for cl-genesis-time / cl-seconds-per-slot.
     /// Use `custom` for private chains and pass both values explicitly.
-    #[arg(long, env = "ETHONYX_NETWORK", value_enum, default_value_t = Network::Mainnet)]
-    pub network: Network,
+    #[arg(long, env = "ETHONYX_NETWORK", value_enum)]
+    pub network: Option<Network>,
+
+    /// Reference Execution-layer JSON-RPC HTTP upstream URL(s) used to gate `/readyz`
+    /// on block-height lag. Repeat the flag or comma-separate for multiple peers/RPCs.
+    #[arg(long, env = "ETHONYX_EL_REFERENCE_URL", value_delimiter = ',')]
+    pub el_reference_url: Vec<UrlArg>,
+
+    /// Maximum allowed EL block lag behind the highest valid `--el-reference-url`
+    /// before `/readyz` returns 503 (defaults to 1 block when `--el-reference-url` is set;
+    /// increase on sub-second block chains to account for P2P propagation spread).
+    #[arg(long, env = "ETHONYX_EL_MAX_REFERENCE_LAG")]
+    pub el_max_reference_lag: Option<u64>,
+
+    /// Interval between background `--el-reference-url` polls (seconds; defaults to 3
+    /// when `--el-reference-url` is set; must be at least 1).
+    #[arg(long, env = "ETHONYX_EL_REFERENCE_POLL_INTERVAL", value_parser = parse_secs)]
+    pub el_reference_poll_interval: Option<Duration>,
 
     /// Maximum EL block age (seconds) used to gate `/readyz` under
     /// `--readyz-strict`. `/healthz` always reports the raw age regardless.
     #[arg(long, env = "ETHONYX_EL_MAX_BLOCK_AGE_SECS", default_value_t = 60)]
     pub el_max_block_age_secs: u64,
 
-    /// Maximum CL head_slot age (seconds, wall-clock) used to gate `/readyz`
-    /// under `--readyz-strict`. `/healthz` always reports the raw age regardless.
-    #[arg(long, env = "ETHONYX_CL_MAX_SLOT_AGE_SECS", default_value_t = 60)]
-    pub cl_max_slot_age_secs: u64,
+    /// Maximum CL head_slot age (seconds, wall-clock; defaults to 60 when `--cl-beacon-url`
+    /// is set) used to gate `/readyz` under `--readyz-strict`. `/healthz` always reports
+    /// the raw age regardless.
+    #[arg(long, env = "ETHONYX_CL_MAX_SLOT_AGE_SECS")]
+    pub cl_max_slot_age_secs: Option<u64>,
 
     /// Also gate `/readyz` on EL block / CL slot freshness, not just sync status.
     /// Off by default so a network-wide stall (or a peer dip) does not drain the
@@ -213,10 +261,10 @@ pub struct Config {
     /// OpenTelemetry collector endpoint (HTTP) for exporting traces/metrics.
     #[cfg(feature = "otel")]
     #[arg(long, env = "ETHONYX_OTEL_ENDPOINT")]
-    pub otel_endpoint: Option<String>,
+    pub otel_endpoint: Option<UrlArg>,
 }
 
-/// Validated beacon-chain slot timing (`None` when `--cl-genesis-time 0` disables slot-age checks).
+/// Validated beacon-chain slot timing (`None` in EL-only mode or when `--cl-genesis-time 0` disables slot-age checks).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SlotClock {
     genesis_time: NonZeroU64,
@@ -324,58 +372,100 @@ impl fmt::Display for ListenAddr {
     }
 }
 
+/// Strict wall-clock freshness thresholds enabled by `--readyz-strict`.
+#[derive(Clone, Copy)]
+pub(crate) struct StrictFreshness {
+    pub(crate) el_max_block_age_secs: u64,
+    pub(crate) cl_max_slot_age_secs: u64,
+}
+
 /// Scalar runtime options retained by [`crate::state::AppState`] after startup
 /// so heap-allocated CLI URL/listen strings in [`Config`] can be freed early.
 #[derive(Clone, Copy)]
 pub(crate) struct RuntimeOpts {
-    pub(crate) el_max_block_age_secs: u64,
-    pub(crate) cl_max_slot_age_secs: u64,
+    pub(crate) el_max_reference_lag: u64,
+    pub(crate) strict: Option<StrictFreshness>,
+    pub(crate) slot_clock: Option<SlotClock>,
     pub(crate) health_timeout: Duration,
     pub(crate) proxy_timeout: Duration,
     pub(crate) sse_idle_timeout: Duration,
     pub(crate) max_connections: usize,
-    pub(crate) readyz_strict: bool,
     pub(crate) mock_eth_syncing: bool,
-    pub(crate) mock_cl_subscriptions: bool,
-    pub(crate) mock_cl_node_health: bool,
 }
 
-impl RuntimeOpts {
-    pub(crate) const fn from_config(cfg: &Config) -> Self {
-        Self {
-            el_max_block_age_secs: cfg.el_max_block_age_secs,
-            cl_max_slot_age_secs: cfg.cl_max_slot_age_secs,
-            health_timeout: cfg.health_timeout,
-            proxy_timeout: cfg.proxy_timeout,
-            sse_idle_timeout: cfg.sse_idle_timeout,
-            max_connections: cfg.max_connections,
-            readyz_strict: cfg.readyz_strict,
-            mock_eth_syncing: cfg.mock_eth_syncing,
-            mock_cl_subscriptions: cfg.mock_cl_subscriptions,
-            mock_cl_node_health: cfg.mock_cl_node_health,
+pub(crate) struct ValidatedCl {
+    pub(crate) beacon: HttpUpstream,
+    pub(crate) mev_relay: Option<HttpUpstream>,
+    pub(crate) syncing_uri: http::Uri,
+    pub(crate) peer_count_uri: http::Uri,
+    pub(crate) mock_subscriptions: bool,
+    pub(crate) mock_node_health: bool,
+}
+
+pub(crate) struct ValidatedReference {
+    pub(crate) upstreams: Box<[HttpUpstream]>,
+    pub(crate) poll_interval: Duration,
+}
+
+pub(crate) enum HealthMode {
+    Trusted,
+    Polled {
+        interval: Duration,
+        reference: Option<ValidatedReference>,
+    },
+}
+
+impl HealthMode {
+    pub(crate) const fn reference_count(&self) -> usize {
+        match self {
+            Self::Polled {
+                reference: Some(r), ..
+            } => r.upstreams.len(),
+            Self::Trusted
+            | Self::Polled {
+                reference: None, ..
+            } => 0,
         }
     }
 }
 
 pub(crate) struct ValidatedUpstreams {
     pub(crate) el_http: HttpUpstream,
-    pub(crate) el_ws: WsUpstream,
-    pub(crate) cl_beacon: HttpUpstream,
-    pub(crate) cl_mev_relay: Option<HttpUpstream>,
-    pub(crate) slot_clock: Option<SlotClock>,
+    pub(crate) el_ws: Option<WsUpstream>,
+    pub(crate) cl: Option<ValidatedCl>,
 }
 
 pub(crate) struct ParsedConfig {
     pub(crate) listen: Vec<ListenAddr>,
+    pub(crate) opts: RuntimeOpts,
     pub(crate) upstreams: ValidatedUpstreams,
+    pub(crate) health: HealthMode,
     pub(crate) otel_endpoint: Option<HttpUpstream>,
 }
 
+fn reject_flags_when(cond: bool, flags: &[(&str, bool)], reason: &str) -> Result<(), BoxError> {
+    if cond {
+        for &(flag, given) in flags {
+            if given {
+                return Err(format!("{flag} {reason}").into());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Config {
-    pub const fn resolve_cl_genesis_time(&self) -> Result<u64, &'static str> {
+    const fn resolved_network(&self) -> Network {
+        match self.network {
+            Some(net) => net,
+            None => Network::Mainnet,
+        }
+    }
+
+    const fn resolve_cl_genesis_time(&self) -> Result<u64, &'static str> {
         match self.cl_genesis_time {
             Some(t) => Ok(t),
-            None => match self.network.preset_genesis_time() {
+            None => match self.resolved_network().preset_genesis_time() {
                 Some(t) => Ok(t),
                 None => Err(
                     "--network custom requires --cl-genesis-time (use 0 to disable slot-age check)",
@@ -384,10 +474,10 @@ impl Config {
         }
     }
 
-    pub const fn resolve_cl_seconds_per_slot(&self) -> Result<u64, &'static str> {
+    const fn resolve_cl_seconds_per_slot(&self) -> Result<u64, &'static str> {
         let secs = match self.cl_seconds_per_slot {
             Some(s) => s,
-            None => match self.network.preset_seconds_per_slot() {
+            None => match self.resolved_network().preset_seconds_per_slot() {
                 Some(s) => s,
                 None => return Err("--network custom requires --cl-seconds-per-slot"),
             },
@@ -407,11 +497,6 @@ impl Config {
         if self.listen.is_empty() {
             return Err("no listen addresses configured".into());
         }
-        let listen = self
-            .listen
-            .iter()
-            .map(|raw| ListenAddr::parse(raw))
-            .collect::<Result<Vec<_>, _>>()?;
         if self.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(format!(
                 "max-connections must be at most {}",
@@ -419,111 +504,176 @@ impl Config {
             )
             .into());
         }
-        if self.health_poll_interval.is_zero() {
-            return Err("health-poll-interval must be at least 1 second".into());
-        }
-        if self.health_timeout.is_zero() {
-            return Err("health-timeout must be at least 1 second".into());
-        }
-        if self.proxy_timeout.is_zero() {
-            return Err("proxy-timeout must be at least 1 second".into());
-        }
-        for (name, dur) in [
-            ("health-poll-interval", self.health_poll_interval),
-            ("health-timeout", self.health_timeout),
-            ("proxy-timeout", self.proxy_timeout),
-            ("sse-idle-timeout", self.sse_idle_timeout),
-            ("shutdown-grace", self.shutdown_grace),
+        for (name, dur, allow_zero) in [
+            (
+                "health-poll-interval",
+                Some(self.health_poll_interval),
+                false,
+            ),
+            ("health-timeout", Some(self.health_timeout), false),
+            ("proxy-timeout", Some(self.proxy_timeout), false),
+            (
+                "el-reference-poll-interval",
+                self.el_reference_poll_interval,
+                false,
+            ),
+            ("sse-idle-timeout", Some(self.sse_idle_timeout), true),
+            ("shutdown-grace", Some(self.shutdown_grace), true),
         ] {
-            if dur > MAX_TIMEOUT {
-                return Err(format!("{name} must be at most {MAX_TIMEOUT_SECS} seconds").into());
+            if let Some(dur) = dur {
+                if !allow_zero && dur.is_zero() {
+                    return Err(format!("{name} must be at least 1 second").into());
+                }
+                if dur > MAX_TIMEOUT {
+                    return Err(format!("{name} must be at most {MAX_TIMEOUT_SECS} seconds").into());
+                }
             }
         }
-        let cl_genesis_time = self.resolve_cl_genesis_time()?;
-        let cl_seconds_per_slot = self.resolve_cl_seconds_per_slot()?;
+        reject_flags_when(
+            self.cl_beacon_url.is_none(),
+            &[
+                ("--network", self.network.is_some()),
+                ("--cl-mev-relay-url", self.cl_mev_relay_url.is_some()),
+                ("--cl-genesis-time", self.cl_genesis_time.is_some()),
+                ("--cl-seconds-per-slot", self.cl_seconds_per_slot.is_some()),
+                (
+                    "--cl-max-slot-age-secs",
+                    self.cl_max_slot_age_secs.is_some(),
+                ),
+                ("--mock-cl-subscriptions", self.mock_cl_subscriptions),
+                ("--mock-cl-node-health", self.mock_cl_node_health),
+            ],
+            "requires --cl-beacon-url",
+        )?;
+        reject_flags_when(
+            self.el_reference_url.is_empty(),
+            &[
+                (
+                    "--el-max-reference-lag",
+                    self.el_max_reference_lag.is_some(),
+                ),
+                (
+                    "--el-reference-poll-interval",
+                    self.el_reference_poll_interval.is_some(),
+                ),
+            ],
+            "requires --el-reference-url",
+        )?;
+        reject_flags_when(
+            self.trust_upstream,
+            &[
+                ("--readyz-strict", self.readyz_strict),
+                ("--el-reference-url", !self.el_reference_url.is_empty()),
+            ],
+            "cannot be combined with --trust-upstream",
+        )?;
+
+        let listen = self
+            .listen
+            .iter()
+            .map(|raw| ListenAddr::parse(raw))
+            .collect::<Result<Vec<_>, _>>()?;
         let el_http = HttpUpstream::parse("--el-http-url", &self.el_http_url)?;
-        let el_ws = WsUpstream::parse("--el-ws-url", &self.el_ws_url)?;
-        let cl_beacon = HttpUpstream::parse("--cl-beacon-url", &self.cl_beacon_url)?;
-        let cl_mev_relay = self
-            .cl_mev_relay_url
+        let el_ws = self
+            .el_ws_url
             .as_deref()
-            .map(|u| HttpUpstream::parse("--cl-mev-relay-url", u))
+            .map(|u| WsUpstream::parse("--el-ws-url", u))
             .transpose()?;
+        let (cl, slot_clock) = match self.cl_beacon_url.as_deref() {
+            Some(raw_beacon) => {
+                let cl_genesis_time = self.resolve_cl_genesis_time()?;
+                let cl_seconds_per_slot = self.resolve_cl_seconds_per_slot()?;
+                let beacon = HttpUpstream::parse("--cl-beacon-url", raw_beacon)?;
+                let syncing_uri = beacon
+                    .rewrite_uri(http::Uri::from_static("/eth/v1/node/syncing"))
+                    .map_err(|e| format!("invalid --cl-beacon-url ({}): {e}", beacon.redacted()))?;
+                let peer_count_uri = beacon
+                    .rewrite_uri(http::Uri::from_static("/eth/v1/node/peer_count"))
+                    .map_err(|e| format!("invalid --cl-beacon-url ({}): {e}", beacon.redacted()))?;
+                let mev_relay = self
+                    .cl_mev_relay_url
+                    .as_deref()
+                    .map(|u| HttpUpstream::parse("--cl-mev-relay-url", u))
+                    .transpose()?;
+                (
+                    Some(ValidatedCl {
+                        beacon,
+                        mev_relay,
+                        syncing_uri,
+                        peer_count_uri,
+                        mock_subscriptions: self.mock_cl_subscriptions,
+                        mock_node_health: self.mock_cl_node_health,
+                    }),
+                    SlotClock::new(cl_genesis_time, cl_seconds_per_slot),
+                )
+            }
+            None => (None, None),
+        };
+        let health = if self.trust_upstream {
+            HealthMode::Trusted
+        } else {
+            let reference = if self.el_reference_url.is_empty() {
+                None
+            } else {
+                let mut upstreams = Vec::with_capacity(self.el_reference_url.len());
+                for raw in &self.el_reference_url {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        return Err("invalid --el-reference-url: entry must not be empty".into());
+                    }
+                    let parsed = HttpUpstream::parse("--el-reference-url", trimmed)?;
+                    if !parsed.same_endpoint(&el_http)
+                        && !upstreams
+                            .iter()
+                            .any(|existing: &HttpUpstream| existing.same_endpoint(&parsed))
+                    {
+                        upstreams.push(parsed);
+                    }
+                }
+                if upstreams.is_empty() {
+                    return Err(
+                        "--el-reference-url must include at least one endpoint distinct from --el-http-url"
+                            .into(),
+                    );
+                }
+                Some(ValidatedReference {
+                    upstreams: upstreams.into_boxed_slice(),
+                    poll_interval: self
+                        .el_reference_poll_interval
+                        .unwrap_or(DEFAULT_EL_REFERENCE_POLL_INTERVAL),
+                })
+            };
+            HealthMode::Polled {
+                interval: self.health_poll_interval,
+                reference,
+            }
+        };
         let otel_endpoint = crate::otel::parse_config_endpoint(self)?;
+        let strict = self.readyz_strict.then_some(StrictFreshness {
+            el_max_block_age_secs: self.el_max_block_age_secs,
+            cl_max_slot_age_secs: self
+                .cl_max_slot_age_secs
+                .unwrap_or(DEFAULT_CL_MAX_SLOT_AGE_SECS),
+        });
+        let opts = RuntimeOpts {
+            el_max_reference_lag: self
+                .el_max_reference_lag
+                .unwrap_or(DEFAULT_EL_MAX_REFERENCE_LAG),
+            strict,
+            slot_clock,
+            health_timeout: self.health_timeout,
+            proxy_timeout: self.proxy_timeout,
+            sse_idle_timeout: self.sse_idle_timeout,
+            max_connections: self.max_connections,
+            mock_eth_syncing: self.mock_eth_syncing,
+        };
         Ok(ParsedConfig {
             listen,
-            upstreams: ValidatedUpstreams {
-                el_http,
-                el_ws,
-                cl_beacon,
-                cl_mev_relay,
-                slot_clock: SlotClock::new(cl_genesis_time, cl_seconds_per_slot),
-            },
+            opts,
+            upstreams: ValidatedUpstreams { el_http, el_ws, cl },
+            health,
             otel_endpoint,
         })
-    }
-}
-
-impl fmt::Debug for Config {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            listen,
-            el_http_url,
-            el_ws_url,
-            cl_beacon_url,
-            cl_mev_relay_url,
-            network,
-            el_max_block_age_secs,
-            cl_max_slot_age_secs,
-            readyz_strict,
-            cl_genesis_time,
-            cl_seconds_per_slot,
-            health_timeout,
-            health_poll_interval,
-            log_level,
-            access_log,
-            trust_upstream,
-            mock_eth_syncing,
-            mock_cl_subscriptions,
-            mock_cl_node_health,
-            proxy_timeout,
-            sse_idle_timeout,
-            max_connections,
-            shutdown_grace,
-            #[cfg(feature = "otel")]
-            otel_endpoint,
-        } = self;
-
-        let mut ds = f.debug_struct("Config");
-        ds.field("listen", listen)
-            .field("el_http_url", &RedactedUrl(el_http_url))
-            .field("el_ws_url", &RedactedUrl(el_ws_url))
-            .field("cl_beacon_url", &RedactedUrl(cl_beacon_url))
-            .field(
-                "cl_mev_relay_url",
-                &cl_mev_relay_url.as_deref().map(RedactedUrl),
-            )
-            .field("network", network)
-            .field("el_max_block_age_secs", el_max_block_age_secs)
-            .field("cl_max_slot_age_secs", cl_max_slot_age_secs)
-            .field("readyz_strict", readyz_strict)
-            .field("cl_genesis_time", cl_genesis_time)
-            .field("cl_seconds_per_slot", cl_seconds_per_slot)
-            .field("health_timeout", health_timeout)
-            .field("health_poll_interval", health_poll_interval)
-            .field("log_level", log_level)
-            .field("access_log", access_log)
-            .field("trust_upstream", trust_upstream)
-            .field("mock_eth_syncing", mock_eth_syncing)
-            .field("mock_cl_subscriptions", mock_cl_subscriptions)
-            .field("mock_cl_node_health", mock_cl_node_health)
-            .field("proxy_timeout", proxy_timeout)
-            .field("sse_idle_timeout", sse_idle_timeout)
-            .field("max_connections", max_connections)
-            .field("shutdown_grace", shutdown_grace);
-        #[cfg(feature = "otel")]
-        ds.field("otel_endpoint", &otel_endpoint.as_deref().map(RedactedUrl));
-        ds.finish()
     }
 }
 
@@ -574,48 +724,96 @@ mod tests {
 
     fn parse(extra: &[&str]) -> Config {
         let mut argv = vec!["ethonyx"];
+        if !extra.contains(&"--el-http-url") {
+            argv.extend_from_slice(&["--el-http-url", "http://127.0.0.1:8545"]);
+        }
         argv.extend_from_slice(extra);
         Config::try_parse_from(argv).expect("clap parse")
     }
 
     #[test]
     fn explicit_genesis_overrides_network_preset() {
-        let cfg = parse(&["--network", "hoodi", "--cl-genesis-time", "999"]);
-        assert_eq!(cfg.resolve_cl_genesis_time().unwrap(), 999);
+        let parsed = parse(&[
+            "--cl-beacon-url",
+            "http://127.0.0.1:5052",
+            "--network",
+            "hoodi",
+            "--cl-genesis-time",
+            "999",
+        ])
+        .parse_validated()
+        .unwrap();
+        assert_eq!(parsed.opts.slot_clock, SlotClock::new(999, 12));
     }
 
     #[test]
     fn network_preset_used_when_genesis_not_provided() {
-        let cfg = parse(&["--network", "sepolia"]);
-        assert_eq!(cfg.resolve_cl_genesis_time().unwrap(), 1_655_733_600);
-        assert_eq!(cfg.resolve_cl_seconds_per_slot().unwrap(), 12);
+        let parsed = parse(&[
+            "--cl-beacon-url",
+            "http://127.0.0.1:5052",
+            "--network",
+            "sepolia",
+        ])
+        .parse_validated()
+        .unwrap();
+        assert_eq!(parsed.opts.slot_clock, SlotClock::new(1_655_733_600, 12));
     }
 
     #[test]
     fn custom_without_genesis_fails() {
-        let cfg = parse(&["--network", "custom"]);
-        assert!(cfg.resolve_cl_genesis_time().is_err());
-        assert!(cfg.resolve_cl_seconds_per_slot().is_err());
+        assert!(
+            parse(&[
+                "--cl-beacon-url",
+                "http://127.0.0.1:5052",
+                "--network",
+                "custom",
+            ])
+            .validate()
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "--cl-beacon-url",
+                "http://127.0.0.1:5052",
+                "--network",
+                "custom",
+                "--cl-genesis-time",
+                "1700000000",
+            ])
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
     fn custom_with_explicit_values_resolves() {
-        let cfg = parse(&[
+        let parsed = parse(&[
+            "--cl-beacon-url",
+            "http://127.0.0.1:5052",
             "--network",
             "custom",
             "--cl-genesis-time",
             "1700000000",
             "--cl-seconds-per-slot",
             "6",
-        ]);
-        assert_eq!(cfg.resolve_cl_genesis_time().unwrap(), 1_700_000_000);
-        assert_eq!(cfg.resolve_cl_seconds_per_slot().unwrap(), 6);
+        ])
+        .parse_validated()
+        .unwrap();
+        assert_eq!(parsed.opts.slot_clock, SlotClock::new(1_700_000_000, 6));
     }
 
     #[test]
     fn cl_genesis_zero_disables_check_but_still_resolves() {
-        let cfg = parse(&["--cl-genesis-time", "0"]);
-        assert_eq!(cfg.resolve_cl_genesis_time().unwrap(), 0);
+        let parsed = parse(&[
+            "--cl-beacon-url",
+            "http://127.0.0.1:5052",
+            "--cl-genesis-time",
+            "0",
+        ])
+        .parse_validated()
+        .unwrap();
+        assert!(parsed.upstreams.cl.is_some());
+        assert_eq!(parsed.opts.slot_clock, None);
     }
 
     #[test]
@@ -679,7 +877,14 @@ mod tests {
 
     #[test]
     fn log_level_rejects_unknown_value() {
-        assert!(Config::try_parse_from(["ethonyx", "--log-level", "bogus"]).is_err());
+        let argv = [
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--log-level",
+        ];
+        assert!(Config::try_parse_from(argv.into_iter().chain(["info"])).is_ok());
+        assert!(Config::try_parse_from(argv.into_iter().chain(["bogus"])).is_err());
     }
 
     #[test]
@@ -706,6 +911,8 @@ mod tests {
             "https://cl.example.com?api_key=CL_API_KEY",
             "--cl-mev-relay-url",
             "https://relay:MEV_PASS@mev.example.com/MEV_TOKEN",
+            "--el-reference-url",
+            "https://ref1:REF1_PASS@ref1.example.com/v2/REF1_KEY,https://ref2.example.com?apikey=REF2_KEY",
             #[cfg(feature = "otel")]
             "--otel-endpoint",
             #[cfg(feature = "otel")]
@@ -722,6 +929,9 @@ mod tests {
             "CL_API_KEY",
             "MEV_PASS",
             "MEV_TOKEN",
+            "REF1_PASS",
+            "REF1_KEY",
+            "REF2_KEY",
             "OTEL_PASS",
             "OTEL_PATH",
         ] {
@@ -731,6 +941,135 @@ mod tests {
         assert!(dbg.contains("wss://<redacted>@ws.example.com/<redacted>"));
         assert!(dbg.contains("https://cl.example.com/<redacted>"));
         assert!(dbg.contains("https://<redacted>@mev.example.com/<redacted>"));
+        assert!(dbg.contains("https://<redacted>@ref1.example.com/<redacted>"));
+        assert!(dbg.contains("https://ref2.example.com/<redacted>"));
+
+        let from_str = UrlArg::from("https://rpc.example.com/SECRET");
+        assert_eq!(
+            format!("{from_str:?}"),
+            "\"https://rpc.example.com/<redacted>\""
+        );
+    }
+
+    #[test]
+    fn mode_prerequisite_and_reference_dedup_guards() {
+        // `--el-http-url` has no implicit default, while `--listen` defaults to `0.0.0.0:8547`
+        // and `--el-ws-url` / `--cl-beacon-url` / `--el-reference-url` default to disabled (`None`).
+        assert!(Config::try_parse_from(["ethonyx"]).is_err());
+        assert!(Config::try_parse_from(["ethonyx", "--el-ws-url", "ws://127.0.0.1:8546"]).is_err());
+
+        let bare_cfg = parse(&[]);
+        assert_eq!(bare_cfg.listen, vec!["0.0.0.0:8547"]);
+        let bare = bare_cfg.parse_validated().unwrap();
+        assert!(bare.upstreams.el_ws.is_none());
+        assert!(bare.upstreams.cl.is_none());
+        assert_eq!(bare.health.reference_count(), 0);
+        assert!(bare.opts.strict.is_none());
+        assert!(bare.opts.slot_clock.is_none());
+
+        // CL-specific flags require `--cl-beacon-url`.
+        for args in [
+            &["--network", "hoodi"][..],
+            &["--cl-mev-relay-url", "http://127.0.0.1:18550"],
+            &["--cl-genesis-time", "0"],
+            &["--cl-seconds-per-slot", "12"],
+            &["--cl-max-slot-age-secs", "30"],
+            &["--mock-cl-subscriptions"],
+            &["--mock-cl-node-health"],
+        ] {
+            let err = parse(args).validate().unwrap_err().to_string();
+            assert!(
+                err.contains("requires --cl-beacon-url"),
+                "{args:?} -> {err}"
+            );
+        }
+
+        // Reference-specific flags require `--el-reference-url`.
+        for args in [
+            &["--el-max-reference-lag", "2"][..],
+            &["--el-reference-poll-interval", "5"],
+        ] {
+            let err = parse(args).validate().unwrap_err().to_string();
+            assert!(
+                err.contains("requires --el-reference-url"),
+                "{args:?} -> {err}"
+            );
+        }
+
+        // `--trust-upstream` rejects polling-only flags.
+        for args in [
+            &["--trust-upstream", "--readyz-strict"][..],
+            &[
+                "--trust-upstream",
+                "--el-reference-url",
+                "http://127.0.0.1:9545",
+            ],
+        ] {
+            let err = parse(args).validate().unwrap_err().to_string();
+            assert!(err.contains("--trust-upstream"), "{args:?} -> {err}");
+        }
+
+        // Empty reference entries and all-self copy-paste mistakes are rejected.
+        for val in [
+            "",
+            "   ",
+            "http://127.0.0.1:9545,",
+            "http://127.0.0.1:8545",
+            "HTTP://127.0.0.1:8545/",
+        ] {
+            assert!(
+                parse(&["--el-reference-url", val]).validate().is_err(),
+                "must reject {val:?}"
+            );
+        }
+
+        // Shared ConfigMap self-URLs matching `--el-http-url` are stripped, case/default-port
+        // duplicates collapse, and `/v1` vs `/v1/` remain distinct.
+        let deduped = parse(&[
+            "--el-http-url",
+            "http://node-1.local:80",
+            "--el-reference-url",
+            "http://NODE-1.local, http://node-2.local:80/v1, HTTP://Node-2.local/v1, http://node-2.local/v1/",
+        ])
+        .parse_validated()
+        .unwrap();
+        let HealthMode::Polled {
+            reference: Some(refs),
+            ..
+        } = deduped.health
+        else {
+            panic!("expected polled reference mode");
+        };
+        assert_eq!(refs.upstreams.len(), 2);
+        assert_eq!(refs.upstreams[0].uri(), "http://node-2.local:80/v1");
+        assert_eq!(refs.upstreams[1].uri(), "http://node-2.local/v1/");
+        assert_eq!(refs.poll_interval, Duration::from_secs(3));
+
+        // With `--cl-beacon-url` present, slot duration `0` and `wss://` MEV schemes still fail validation.
+        assert!(
+            parse(&[
+                "--cl-beacon-url",
+                "http://127.0.0.1:5052",
+                "--cl-seconds-per-slot",
+                "0"
+            ])
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be at least 1")
+        );
+        assert!(
+            parse(&[
+                "--cl-beacon-url",
+                "http://127.0.0.1:5052",
+                "--cl-mev-relay-url",
+                "wss://127.0.0.1:18550"
+            ])
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("scheme must be http or https")
+        );
     }
 
     #[test]
@@ -836,7 +1175,13 @@ mod tests {
         #[cfg(target_os = "linux")]
         let named = "[fe80::1%lo]:0";
 
-        let cfg = Config::parse_from(["ethonyx", "--listen", "[fe80::1%1]:0"]);
+        let cfg = Config::parse_from([
+            "ethonyx",
+            "--listen",
+            "[fe80::1%1]:0",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+        ]);
         let validated = cfg.parse_validated().unwrap();
         let addr = &validated.listen[0];
         let resolved: Vec<_> = tokio::net::lookup_host((&*addr.host, addr.port))
@@ -847,7 +1192,13 @@ mod tests {
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            let cfg = Config::parse_from(["ethonyx", "--listen", named]);
+            let cfg = Config::parse_from([
+                "ethonyx",
+                "--listen",
+                named,
+                "--el-http-url",
+                "http://127.0.0.1:8545",
+            ]);
             let validated = cfg.parse_validated().unwrap();
             let addr = &validated.listen[0];
             let resolved: Vec<_> = tokio::net::lookup_host((&*addr.host, addr.port))

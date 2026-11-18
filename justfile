@@ -17,6 +17,9 @@ fmt:
 run:
     cargo run --release -- \
         --listen 127.0.0.1:8547 \
+        --el-http-url http://127.0.0.1:8545 \
+        --el-ws-url ws://127.0.0.1:8546 \
+        --cl-beacon-url http://127.0.0.1:5052 \
         --network mainnet
 
 # Dry-run a release (no changes applied). Levels: patch | minor | major | X.Y.Z

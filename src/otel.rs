@@ -451,18 +451,24 @@ mod tests {
         let tcp_guard = server_metrics.active_tcp();
         // Open and immediately drop a WS connection to verify symmetrical +1 / -1.
         drop(server_metrics.ws_slot().activate());
-        server_metrics.record_health(crate::metrics::HealthSample {
-            el_ok: true,
-            cl_ok: true,
-            el_peers: 8.0,
-            cl_peers: 12.0,
-            el_distance: 0.0,
-            cl_status: Some(crate::metrics::ClSlotSample {
-                sync_distance: 0,
-                head_slot: 42,
-            }),
-            el_block: Some(100),
-        });
+        {
+            use crate::metrics::HealthGauge as G;
+            for (gauge, value) in [
+                (G::ElHealth, 1.0),
+                (G::ElPeers, 8.0),
+                (G::ElSyncDistance, 0.0),
+                (G::ElBlockNumber, 100.0),
+                (G::ClHealth, 1.0),
+                (G::ClPeers, 12.0),
+                (G::ClSyncDistance, 0.0),
+                (G::ClSlotNumber, 42.0),
+                (G::ReferenceHealth, 1.0),
+                (G::ReferenceBlockNumber, 100.0),
+                (G::ReferenceBlockLag, 0.0),
+            ] {
+                server_metrics.set_health(gauge, value);
+            }
+        }
 
         provider.force_flush().unwrap();
         // Dropping `tcp_guard` exercises the retained `PairGauge` handle.
@@ -508,6 +514,19 @@ mod tests {
                 .2
                 .contains(&(vec![KeyValue::new("layer", "cl")], 12.0))
         );
+
+        for (metric_name, expected_val) in [
+            ("ethonyx_reference_health_status", 1.0),
+            ("ethonyx_reference_block_number", 100.0),
+            ("ethonyx_reference_block_lag", 0.0),
+        ] {
+            let exported = snapshots
+                .iter()
+                .find(|(name, _, _)| name == metric_name)
+                .unwrap_or_else(|| panic!("{metric_name} exported"));
+            assert_eq!(exported.1, "gauge");
+            assert!(exported.2.contains(&(Vec::new(), expected_val)));
+        }
     }
 
     #[test]

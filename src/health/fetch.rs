@@ -1,7 +1,6 @@
 //! Bounded upstream probe fetch, probe error types, and the JSON object guard.
 
 use std::fmt;
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -9,9 +8,9 @@ use http::Request;
 use http_body_util::BodyExt;
 
 use crate::response::ResBody;
-use crate::transport::{HttpTransport, ProxyClient};
+use crate::transport::{HttpTarget, HttpTransport, ProxyClient};
 
-pub(crate) type ProbeError = Arc<str>;
+pub(crate) type ProbeError = Box<str>;
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
@@ -24,11 +23,10 @@ pub(super) enum HealthError {
 }
 
 impl HealthError {
-    pub(super) fn into_probe_error(self) -> ProbeError {
-        match self {
-            Self::Timeout => Arc::from("timeout"),
-            other => Arc::from(other.to_string()),
-        }
+    /// The form every probe result stores, `"<method>: <detail>"`, so each view
+    /// prints the same text without attaching the method name again.
+    pub(super) fn during(&self, method: &str) -> ProbeError {
+        format!("{method}: {self}").into_boxed_str()
     }
 }
 
@@ -53,8 +51,8 @@ pub(super) const fn is_transport(e: &HealthError) -> bool {
     matches!(e, HealthError::Transport(_) | HealthError::Timeout)
 }
 
-/// Borrowed transport context shared by EL and CL health probe requests so leaf
-/// probe modules stay independent of [`crate::state::AppState`].
+/// Borrowed transport context shared by EL, CL, and reference health probe requests
+/// so leaf probe modules stay independent of [`crate::state::AppState`].
 #[derive(Clone, Copy)]
 pub(super) struct ProbeTarget<'a> {
     pub(super) client: &'a ProxyClient,
@@ -62,17 +60,29 @@ pub(super) struct ProbeTarget<'a> {
     pub(super) timeout: Duration,
 }
 
-impl ProbeTarget<'_> {
+impl<'a> ProbeTarget<'a> {
+    pub(super) const fn from_target(
+        client: &'a ProxyClient,
+        target: &'a HttpTarget,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            client,
+            transport: &target.transport,
+            timeout,
+        }
+    }
+
     /// Send a prepared probe request within `self.timeout`, record any TLS
     /// negotiated protocol version as soon as response headers arrive, and return
-    /// the body of a successful response.
+    /// the body of a successful (`2xx`) response (capped at 10 MiB).
     pub(super) async fn fetch_bytes(self, req: Request<ResBody>) -> Result<Bytes, HealthError> {
         tokio::time::timeout(self.timeout, async {
             let resp = self
                 .client
                 .request(req)
                 .await
-                .map_err(|e| HealthError::Transport(Arc::from(e.to_string())))?;
+                .map_err(|e| HealthError::Transport(e.to_string().into_boxed_str()))?;
             self.transport.record_version(resp.version());
             if !resp.status().is_success() {
                 return Err(HealthError::HttpStatus(resp.status()));
@@ -81,7 +91,7 @@ impl ProbeTarget<'_> {
                 .collect()
                 .await
                 .map(|c| c.to_bytes())
-                .map_err(|e| HealthError::Decode(Arc::from(e.to_string())))
+                .map_err(|e| HealthError::Decode(e.to_string().into_boxed_str()))
         })
         .await
         .map_err(|_| HealthError::Timeout)?
