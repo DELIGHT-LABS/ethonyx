@@ -1,27 +1,22 @@
 use std::sync::Arc;
 
-use http::Uri;
 use tokio::sync::Semaphore;
 
-use crate::config::{RuntimeOpts, ValidatedUpstreams};
+use crate::config::{ProxyOpts, ValidatedUpstreams};
 use crate::health::HealthSource;
 use crate::metrics::ServerMetrics;
-use crate::transport::{
-    HttpTarget, HttpTransport, ProxyClient, WsTarget, build_client, build_connectors,
-};
+use crate::transport::{HttpTarget, ProxyClient, WsTarget, build_client, build_connectors};
 use crate::upstream::WsUpstream;
 
 pub(crate) struct ClState {
     pub(crate) beacon: HttpTarget,
     pub(crate) mev_relay: Option<HttpTarget>,
-    pub(crate) syncing_uri: Uri,
-    pub(crate) peer_count_uri: Uri,
     pub(crate) mock_subscriptions: bool,
     pub(crate) mock_node_health: bool,
 }
 
 pub(crate) struct AppState {
-    pub(crate) opts: RuntimeOpts,
+    pub(crate) opts: ProxyOpts,
     /// Default client: HTTP/1.1 for cleartext, h2 via ALPN for `https`. Serves
     /// the CL Beacon/MEV/Reference hops, and the EL hop unless cleartext `h2c` is active.
     pub(crate) client: ProxyClient,
@@ -36,7 +31,7 @@ pub(crate) struct AppState {
 
 impl AppState {
     pub(crate) fn new(
-        opts: RuntimeOpts,
+        opts: ProxyOpts,
         upstreams: ValidatedUpstreams,
         otel_enabled: bool,
         health: HealthSource,
@@ -46,11 +41,8 @@ impl AppState {
         let trust_upstream = matches!(health, HealthSource::Trusted);
 
         let (https, ws_tls) = build_connectors(el_ws.as_ref().is_some_and(WsUpstream::is_tls));
-        let client = build_client(https.clone());
-        let el = HttpTarget {
-            transport: HttpTransport::new_el(trust_upstream, el_http.is_tls(), https),
-            upstream: el_http,
-        };
+        let el = HttpTarget::new_el(el_http, trust_upstream, &https);
+        let client = build_client(https);
         let el_ws = el_ws.map(|upstream| WsTarget {
             upstream,
             tls: ws_tls,
@@ -58,8 +50,6 @@ impl AppState {
         let cl = cl.map(|cl| ClState {
             beacon: HttpTarget::new_standard(cl.beacon),
             mev_relay: cl.mev_relay.map(HttpTarget::new_standard),
-            syncing_uri: cl.syncing_uri,
-            peer_count_uri: cl.peer_count_uri,
             mock_subscriptions: cl.mock_subscriptions,
             mock_node_health: cl.mock_node_health,
         });

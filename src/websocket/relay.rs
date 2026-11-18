@@ -74,7 +74,9 @@ impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteProgressIo
 
 pub(super) trait HasWriteProgress {
     fn take_write_progress(&mut self, min_bytes: usize) -> bool;
-    fn reset_write_progress(&mut self);
+    fn reset_write_progress(&mut self) {
+        let _ = self.take_write_progress(0);
+    }
 }
 
 impl<I> HasWriteProgress for WriteProgressIo<I> {
@@ -86,10 +88,6 @@ impl<I> HasWriteProgress for WriteProgressIo<I> {
             false
         }
     }
-
-    fn reset_write_progress(&mut self) {
-        self.written = 0;
-    }
 }
 
 impl<S: HasWriteProgress> HasWriteProgress for tokio_tungstenite::MaybeTlsStream<S> {
@@ -98,14 +96,6 @@ impl<S: HasWriteProgress> HasWriteProgress for tokio_tungstenite::MaybeTlsStream
             Self::Plain(s) => s.take_write_progress(min_bytes),
             Self::Rustls(tls) => tls.get_mut().0.take_write_progress(min_bytes),
             _ => false,
-        }
-    }
-
-    fn reset_write_progress(&mut self) {
-        match self {
-            Self::Plain(s) => s.reset_write_progress(),
-            Self::Rustls(tls) => tls.get_mut().0.reset_write_progress(),
-            _ => {}
         }
     }
 }
@@ -163,7 +153,6 @@ struct WsEndpoint<S> {
     ws: WebSocketStream<S>,
     side: Side,
     intercept_mock: bool,
-    forward_ping: bool,
     outbound: OutboundState,
     local_reply: Option<Message>,
     deadline: LazyDeadline,
@@ -176,7 +165,6 @@ impl<S: RelayIo> WsEndpoint<S> {
             ws,
             side,
             intercept_mock: false,
-            forward_ping: false,
             outbound: OutboundState::Idle,
             local_reply: None,
             deadline: LazyDeadline::new(),
@@ -186,11 +174,6 @@ impl<S: RelayIo> WsEndpoint<S> {
 
     const fn with_mock_syncing(mut self, enabled: bool) -> Self {
         self.intercept_mock = enabled;
-        self
-    }
-
-    const fn with_ping_forwarding(mut self) -> Self {
-        self.forward_ping = true;
         self
     }
 
@@ -401,7 +384,7 @@ where
                         // L7 load balancers / NATs in front of ethonyx observe traffic
                         // without adding per-connection proxy timers. Client's Pong is
                         // absorbed locally when it arrives.
-                        if src.forward_ping {
+                        if matches!(src.side, Side::Upstream) {
                             dst.try_queue_idle_ping(cx, payload)?;
                         }
                     }
@@ -470,8 +453,7 @@ pub(super) async fn bridge_ws<C, U>(
 {
     let mut client =
         WsEndpoint::new(client_ws, Side::Client, io_timeout).with_mock_syncing(mock_enabled);
-    let mut upstream =
-        WsEndpoint::new(upstream_ws, Side::Upstream, io_timeout).with_ping_forwarding();
+    let mut upstream = WsEndpoint::new(upstream_ws, Side::Upstream, io_timeout);
 
     // Phase 1: full-duplex relay with a single steady-state `Notify` registration.
     let Some(reason) = ({

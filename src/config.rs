@@ -230,7 +230,7 @@ pub struct Config {
     )]
     pub mock_cl_subscriptions: bool,
 
-    /// Statically mock GET /eth/v1/node/health requests locally with 200 OK.
+    /// Serve GET/HEAD /eth/v1/node/health locally from ethonyx health state (200/206/503; 200 under --trust-upstream).
     #[arg(
         long,
         env = "ETHONYX_MOCK_CL_NODE_HEALTH",
@@ -379,25 +379,28 @@ pub(crate) struct StrictFreshness {
     pub(crate) cl_max_slot_age_secs: u64,
 }
 
-/// Scalar runtime options retained by [`crate::state::AppState`] after startup
-/// so heap-allocated CLI URL/listen strings in [`Config`] can be freed early.
+/// Scalar data-plane proxy options retained by [`crate::state::AppState`] after
+/// startup so heap-allocated CLI URL/listen strings in [`Config`] can be freed early.
 #[derive(Clone, Copy)]
-pub(crate) struct RuntimeOpts {
-    pub(crate) el_max_reference_lag: u64,
-    pub(crate) strict: Option<StrictFreshness>,
-    pub(crate) slot_clock: Option<SlotClock>,
-    pub(crate) health_timeout: Duration,
+pub(crate) struct ProxyOpts {
     pub(crate) proxy_timeout: Duration,
     pub(crate) sse_idle_timeout: Duration,
     pub(crate) max_connections: usize,
     pub(crate) mock_eth_syncing: bool,
 }
 
+/// Health readiness and freshness evaluation thresholds owned by polled health state
+/// (absent when `--trust-upstream` disables background polling).
+#[derive(Clone, Copy)]
+pub(crate) struct HealthPolicy {
+    pub(crate) el_max_reference_lag: u64,
+    pub(crate) strict: Option<StrictFreshness>,
+    pub(crate) slot_clock: Option<SlotClock>,
+}
+
 pub(crate) struct ValidatedCl {
     pub(crate) beacon: HttpUpstream,
     pub(crate) mev_relay: Option<HttpUpstream>,
-    pub(crate) syncing_uri: http::Uri,
-    pub(crate) peer_count_uri: http::Uri,
     pub(crate) mock_subscriptions: bool,
     pub(crate) mock_node_health: bool,
 }
@@ -407,24 +410,51 @@ pub(crate) struct ValidatedReference {
     pub(crate) poll_interval: Duration,
 }
 
+pub(crate) struct ClProbeUris {
+    pub(crate) syncing: http::Uri,
+    pub(crate) peer_count: http::Uri,
+}
+
+impl ClProbeUris {
+    fn from_beacon(beacon: &HttpUpstream) -> Result<Self, BoxError> {
+        let probe_uri = |path: &'static str| -> Result<http::Uri, BoxError> {
+            beacon
+                .rewrite_uri(http::Uri::from_static(path))
+                .map_err(|e| format!("invalid --cl-beacon-url ({}): {e}", beacon.redacted()).into())
+        };
+        Ok(Self {
+            syncing: probe_uri("/eth/v1/node/syncing")?,
+            peer_count: probe_uri("/eth/v1/node/peer_count")?,
+        })
+    }
+}
+
+pub(crate) struct PolledHealth {
+    pub(crate) interval: Duration,
+    pub(crate) timeout: Duration,
+    pub(crate) policy: HealthPolicy,
+    pub(crate) cl_uris: Option<ClProbeUris>,
+    pub(crate) reference: Option<ValidatedReference>,
+}
+
 pub(crate) enum HealthMode {
     Trusted,
-    Polled {
-        interval: Duration,
-        reference: Option<ValidatedReference>,
-    },
+    Polled(Box<PolledHealth>),
 }
 
 impl HealthMode {
-    pub(crate) const fn reference_count(&self) -> usize {
+    pub(crate) fn reference_count(&self) -> usize {
         match self {
-            Self::Polled {
-                reference: Some(r), ..
-            } => r.upstreams.len(),
-            Self::Trusted
-            | Self::Polled {
-                reference: None, ..
-            } => 0,
+            Self::Polled(p) => p.reference.as_ref().map_or(0, |r| r.upstreams.len()),
+            Self::Trusted => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn policy(&self) -> Option<HealthPolicy> {
+        match self {
+            Self::Trusted => None,
+            Self::Polled(p) => Some(p.policy),
         }
     }
 }
@@ -437,7 +467,7 @@ pub(crate) struct ValidatedUpstreams {
 
 pub(crate) struct ParsedConfig {
     pub(crate) listen: Vec<ListenAddr>,
-    pub(crate) opts: RuntimeOpts,
+    pub(crate) opts: ProxyOpts,
     pub(crate) upstreams: ValidatedUpstreams,
     pub(crate) health: HealthMode,
     pub(crate) otel_endpoint: Option<HttpUpstream>,
@@ -522,7 +552,7 @@ impl Config {
         ] {
             if let Some(dur) = dur {
                 if !allow_zero && dur.is_zero() {
-                    return Err(format!("{name} must be at least 1 second").into());
+                    return Err(format!("{name} must be greater than zero").into());
                 }
                 if dur > MAX_TIMEOUT {
                     return Err(format!("{name} must be at most {MAX_TIMEOUT_SECS} seconds").into());
@@ -584,12 +614,6 @@ impl Config {
                 let cl_genesis_time = self.resolve_cl_genesis_time()?;
                 let cl_seconds_per_slot = self.resolve_cl_seconds_per_slot()?;
                 let beacon = HttpUpstream::parse("--cl-beacon-url", raw_beacon)?;
-                let syncing_uri = beacon
-                    .rewrite_uri(http::Uri::from_static("/eth/v1/node/syncing"))
-                    .map_err(|e| format!("invalid --cl-beacon-url ({}): {e}", beacon.redacted()))?;
-                let peer_count_uri = beacon
-                    .rewrite_uri(http::Uri::from_static("/eth/v1/node/peer_count"))
-                    .map_err(|e| format!("invalid --cl-beacon-url ({}): {e}", beacon.redacted()))?;
                 let mev_relay = self
                     .cl_mev_relay_url
                     .as_deref()
@@ -599,8 +623,6 @@ impl Config {
                     Some(ValidatedCl {
                         beacon,
                         mev_relay,
-                        syncing_uri,
-                        peer_count_uri,
                         mock_subscriptions: self.mock_cl_subscriptions,
                         mock_node_health: self.mock_cl_node_health,
                     }),
@@ -643,25 +665,32 @@ impl Config {
                         .unwrap_or(DEFAULT_EL_REFERENCE_POLL_INTERVAL),
                 })
             };
-            HealthMode::Polled {
+            let cl_uris = cl
+                .as_ref()
+                .map(|c| ClProbeUris::from_beacon(&c.beacon))
+                .transpose()?;
+            let policy = HealthPolicy {
+                el_max_reference_lag: self
+                    .el_max_reference_lag
+                    .unwrap_or(DEFAULT_EL_MAX_REFERENCE_LAG),
+                strict: self.readyz_strict.then_some(StrictFreshness {
+                    el_max_block_age_secs: self.el_max_block_age_secs,
+                    cl_max_slot_age_secs: self
+                        .cl_max_slot_age_secs
+                        .unwrap_or(DEFAULT_CL_MAX_SLOT_AGE_SECS),
+                }),
+                slot_clock,
+            };
+            HealthMode::Polled(Box::new(PolledHealth {
                 interval: self.health_poll_interval,
+                timeout: self.health_timeout,
+                policy,
+                cl_uris,
                 reference,
-            }
+            }))
         };
         let otel_endpoint = crate::otel::parse_config_endpoint(self)?;
-        let strict = self.readyz_strict.then_some(StrictFreshness {
-            el_max_block_age_secs: self.el_max_block_age_secs,
-            cl_max_slot_age_secs: self
-                .cl_max_slot_age_secs
-                .unwrap_or(DEFAULT_CL_MAX_SLOT_AGE_SECS),
-        });
-        let opts = RuntimeOpts {
-            el_max_reference_lag: self
-                .el_max_reference_lag
-                .unwrap_or(DEFAULT_EL_MAX_REFERENCE_LAG),
-            strict,
-            slot_clock,
-            health_timeout: self.health_timeout,
+        let opts = ProxyOpts {
             proxy_timeout: self.proxy_timeout,
             sse_idle_timeout: self.sse_idle_timeout,
             max_connections: self.max_connections,
@@ -743,7 +772,10 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        assert_eq!(parsed.opts.slot_clock, SlotClock::new(999, 12));
+        assert_eq!(
+            parsed.health.policy().unwrap().slot_clock,
+            SlotClock::new(999, 12)
+        );
     }
 
     #[test]
@@ -756,7 +788,10 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        assert_eq!(parsed.opts.slot_clock, SlotClock::new(1_655_733_600, 12));
+        assert_eq!(
+            parsed.health.policy().unwrap().slot_clock,
+            SlotClock::new(1_655_733_600, 12)
+        );
     }
 
     #[test]
@@ -799,7 +834,10 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        assert_eq!(parsed.opts.slot_clock, SlotClock::new(1_700_000_000, 6));
+        assert_eq!(
+            parsed.health.policy().unwrap().slot_clock,
+            SlotClock::new(1_700_000_000, 6)
+        );
     }
 
     #[test]
@@ -813,7 +851,7 @@ mod tests {
         .parse_validated()
         .unwrap();
         assert!(parsed.upstreams.cl.is_some());
-        assert_eq!(parsed.opts.slot_clock, None);
+        assert_eq!(parsed.health.policy().unwrap().slot_clock, None);
     }
 
     #[test]
@@ -964,8 +1002,9 @@ mod tests {
         assert!(bare.upstreams.el_ws.is_none());
         assert!(bare.upstreams.cl.is_none());
         assert_eq!(bare.health.reference_count(), 0);
-        assert!(bare.opts.strict.is_none());
-        assert!(bare.opts.slot_clock.is_none());
+        let bare_policy = bare.health.policy().unwrap();
+        assert!(bare_policy.strict.is_none());
+        assert!(bare_policy.slot_clock.is_none());
 
         // CL-specific flags require `--cl-beacon-url`.
         for args in [
@@ -1033,13 +1072,10 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        let HealthMode::Polled {
-            reference: Some(refs),
-            ..
-        } = deduped.health
-        else {
+        let HealthMode::Polled(polled) = deduped.health else {
             panic!("expected polled reference mode");
         };
+        let refs = polled.reference.expect("expected reference upstreams");
         assert_eq!(refs.upstreams.len(), 2);
         assert_eq!(refs.upstreams[0].uri(), "http://node-2.local:80/v1");
         assert_eq!(refs.upstreams[1].uri(), "http://node-2.local/v1/");

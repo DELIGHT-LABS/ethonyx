@@ -1,9 +1,33 @@
 //! Shared JSON-RPC inspection for HTTP and WebSocket mock requests.
 //! Mixed batches are forwarded intact; only entirely local batches are handled.
 
-use serde::de::{MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
+
+/// Serde's derived struct visitors also accept positional sequences. Enforce
+/// object shape at each JSON-RPC / Beacon boundary while retaining borrowed data.
+pub(crate) struct JsonObject<T>(pub(crate) T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for JsonObject<T> {
+    #[inline]
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Object<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for Object<T> {
+            type Value = JsonObject<T>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            #[inline]
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                T::deserialize(MapAccessDeserializer::new(map)).map(JsonObject)
+            }
+        }
+        deserializer.deserialize_map(Object(std::marker::PhantomData))
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MockResult {
@@ -31,76 +55,64 @@ impl<'de> Deserialize<'de> for Request<'de> {
             #[serde(default, borrow, deserialize_with = "present_id")]
             id: Option<&'a RawValue>,
         }
-        struct Object;
-        impl<'de> Visitor<'de> for Object {
-            type Value = Request<'de>;
+        // Derive also accepts positional sequences; JSON-RPC requests do not.
+        JsonObject::<Fields<'de>>::deserialize(d)
+            .map(|JsonObject(fields)| Request { id: fields.id })
+    }
+}
 
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON-RPC request object")
-            }
+/// Accept exactly `expected`. Every caller maps a mismatch to "forward upstream", so the
+/// error carries no wording of its own.
+fn expect_str<'de, D: Deserializer<'de>>(d: D, expected: &'static str) -> Result<(), D::Error> {
+    struct Exact(&'static str);
+    impl Visitor<'_> for Exact {
+        type Value = ();
 
-            #[inline]
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                let fields = Fields::deserialize(MapAccessDeserializer::new(map))?;
-                Ok(Request { id: fields.id })
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "the string {:?}", self.0)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
+            if value == self.0 {
+                Ok(())
+            } else {
+                Err(E::custom("unexpected string"))
             }
         }
-        // Derive also accepts positional sequences; JSON-RPC requests do not.
-        d.deserialize_map(Object)
     }
+    d.deserialize_str(Exact(expected))
 }
 
 fn version_2<'de, D: Deserializer<'de>>(d: D) -> Result<(), D::Error> {
-    struct Version;
-    impl serde::de::Visitor<'_> for Version {
-        type Value = ();
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("JSON-RPC version 2.0")
-        }
-        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
-            if value == "2.0" {
-                Ok(())
-            } else {
-                Err(E::custom("unsupported JSON-RPC version"))
-            }
-        }
-    }
-    d.deserialize_str(Version)
+    expect_str(d, "2.0")
 }
 
 fn eth_syncing_method<'de, D: Deserializer<'de>>(d: D) -> Result<(), D::Error> {
-    struct Method;
-    impl serde::de::Visitor<'_> for Method {
-        type Value = ();
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("the eth_syncing method")
-        }
-        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
-            if value == "eth_syncing" {
-                Ok(())
-            } else {
-                Err(E::custom("method requires upstream"))
-            }
-        }
-    }
-    d.deserialize_str(Method)
+    expect_str(d, "eth_syncing")
 }
 
 fn empty_params<'de, D: Deserializer<'de>>(d: D) -> Result<(), D::Error> {
-    let raw = <&RawValue>::deserialize(d)?;
-    if raw
-        .get()
-        .trim_ascii()
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .is_some_and(|inner| inner.trim_ascii().is_empty())
-    {
-        Ok(())
-    } else {
-        Err(serde::de::Error::custom(
-            "eth_syncing does not accept parameters",
-        ))
+    struct RejectAny;
+    impl<'de> DeserializeSeed<'de> for RejectAny {
+        type Value = ();
+        fn deserialize<D2: Deserializer<'de>>(self, _: D2) -> Result<(), D2::Error> {
+            Err(serde::de::Error::custom(
+                "eth_syncing does not accept parameters",
+            ))
+        }
     }
+    struct EmptySeq;
+    impl<'de> Visitor<'de> for EmptySeq {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an empty params array")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            seq.next_element_seed(RejectAny)?;
+            Ok(())
+        }
+    }
+    d.deserialize_seq(EmptySeq)
 }
 
 fn present_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<&'de RawValue>, D::Error> {
@@ -146,7 +158,8 @@ impl<'de> Deserialize<'de> for Batch {
                 while let Some(req) = seq.next_element::<Request<'_>>()? {
                     seen = true;
                     if let Some(id) = req.id {
-                        reply.reserve(reply_len(id) + 1);
+                        // +2 reserves the leading `'['`/',' and the trailing `']'`.
+                        reply.reserve(reply_len(id) + 2);
                         reply.push(if reply.is_empty() { '[' } else { ',' });
                         append_reply(&mut reply, id);
                     }
@@ -180,8 +193,8 @@ pub(crate) fn mock_syncing(bytes: &[u8]) -> MockResult {
     parse_mock_syncing(bytes)
 }
 
-// Kept separate so tests and benchmarks can compare against full validation.
-pub(crate) fn parse_mock_syncing(bytes: &[u8]) -> MockResult {
+// Kept separate so unit tests can compare the prefilter against full validation.
+fn parse_mock_syncing(bytes: &[u8]) -> MockResult {
     let first = bytes.iter().find(|b| !b.is_ascii_whitespace());
     if first == Some(&b'[') {
         // from_slice also validates the closing bracket and trailing input
@@ -250,9 +263,18 @@ mod tests {
             r#"{"jsonrpc":"2.0","is_syncing":true,"id":7}"#,
             r#"{"jsonrpc":"2.0","method":"eth_syncing","method":"eth_syncing","id":7}"#,
             r#"{"jsonrpc":"2.0","method":"eth_syncing","metho\u0064":"eth_syncing","id":7}"#,
+            r#"{"jsonrpc":"2.0","params":["0xdeadbeef","latest"],"method":"eth_syncing","id":7}"#,
+            r#"{"jsonrpc":"2.0","params":{},"method":"eth_syncing","id":7}"#,
+            r#"{"jsonrpc":"2.0","params":[INVALID"#,
         ] {
             assert_eq!(mock_syncing(input.as_bytes()), MockResult::Forward);
         }
+        assert_eq!(
+            mock_syncing(
+                b"{\"jsonrpc\":\"2.0\",\"params\":[ \t\r\n ],\"method\":\"eth_syncing\",\"id\":7}"
+            ),
+            MockResult::Reply(r#"{"jsonrpc":"2.0","id":7,"result":false}"#.into())
+        );
     }
 
     #[test]

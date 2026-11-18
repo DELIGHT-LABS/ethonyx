@@ -108,15 +108,12 @@ impl Connection {
             Route::Reject => {
                 return Ok(text_response(
                     StatusCode::BAD_REQUEST,
-                    Bytes::from_static(b"invalid request target"),
+                    "invalid request target",
                 ));
             }
             Route::Proxy(target) => {
                 let Some(forward) = Forward::resolve(target, &self.state) else {
-                    return Ok(text_response(
-                        StatusCode::NOT_FOUND,
-                        Bytes::from_static(b"not found"),
-                    ));
+                    return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
                 };
                 forward
             }
@@ -151,7 +148,7 @@ impl Connection {
                 error = %e,
                 "upstream proxy error"
             );
-            text_response(StatusCode::BAD_GATEWAY, Bytes::from_static(b"bad gateway"))
+            text_response(StatusCode::BAD_GATEWAY, "bad gateway")
         });
         let elapsed = start.elapsed();
         let status = response.status().as_u16();
@@ -204,14 +201,7 @@ impl Probe {
         match self {
             Self::Health => health::report(state, head),
             Self::Ready => health::ready(state, head),
-            Self::Live => text_response(
-                StatusCode::OK,
-                if head {
-                    Bytes::new()
-                } else {
-                    Bytes::from_static(b"ok")
-                },
-            ),
+            Self::Live => text_response(StatusCode::OK, if head { "" } else { "ok" }),
             Self::Metrics => {
                 let body = if head {
                     empty_body()
@@ -258,26 +248,15 @@ fn classify_request<B>(req: &Request<B>) -> Route {
     }
 }
 
-pub(crate) fn is_cl_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    if bytes.first() != Some(&b'/') {
+fn is_cl_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
         return false;
-    }
-    let remainder = &bytes[1..];
-    let len = remainder
-        .iter()
-        .position(|&b| b == b'/')
-        .unwrap_or(remainder.len());
-    let segment = &remainder[..len];
-    match segment.len() {
-        3 => segment == b"eth",
-        4 => segment == b"teku",
-        5 => segment == b"prysm",
-        6 => segment == b"nimbus",
-        8 => segment == b"lodestar",
-        10 => segment == b"lighthouse",
-        _ => false,
-    }
+    };
+    let segment = rest.split_once('/').map_or(rest, |(first, _)| first);
+    matches!(
+        segment,
+        "eth" | "teku" | "prysm" | "nimbus" | "lodestar" | "lighthouse"
+    )
 }
 
 /// A [`Target`] bound to the configured upstream it requires.
@@ -394,12 +373,12 @@ async fn proxy_el(req: Request<Incoming>, state: &AppState) -> Result<Response<R
 #[derive(Clone, Copy)]
 struct BodyReadError {
     status: StatusCode,
-    message: &'static [u8],
+    message: &'static str,
 }
 
 impl BodyReadError {
     fn into_response(self) -> Response<ResBody> {
-        text_response(self.status, Bytes::from_static(self.message))
+        text_response(self.status, self.message)
     }
 }
 
@@ -407,13 +386,13 @@ fn map_limited_body_error(err: BoxError) -> BodyReadError {
     if err.is::<http_body_util::LengthLimitError>() {
         BodyReadError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: b"request body exceeds limit",
+            message: "request body exceeds limit",
         }
     } else {
         debug!(error = %err, "failed to read request body");
         BodyReadError {
             status: StatusCode::BAD_REQUEST,
-            message: b"failed to read request body",
+            message: "failed to read request body",
         }
     }
 }
@@ -427,7 +406,7 @@ where
         Ok(Err(err)) => Err(map_limited_body_error(err)),
         Err(_) => Err(BodyReadError {
             status: StatusCode::REQUEST_TIMEOUT,
-            message: b"request body timed out",
+            message: "request body timed out",
         }),
     }
 }
@@ -456,7 +435,7 @@ async fn collect_limited(body: Incoming, timeout: Duration) -> Result<Bytes, Bod
 fn try_mock_eth_syncing(bytes: &[u8]) -> Option<Response<ResBody>> {
     match crate::rpc::mock_syncing(bytes) {
         crate::rpc::MockResult::Forward => None,
-        crate::rpc::MockResult::Silent => Some(text_response(StatusCode::NO_CONTENT, Bytes::new())),
+        crate::rpc::MockResult::Silent => Some(text_response(StatusCode::NO_CONTENT, "")),
         crate::rpc::MockResult::Reply(body) => {
             Some(raw_json_response(StatusCode::OK, Bytes::from(body)))
         }
@@ -485,13 +464,13 @@ async fn execute_upstream(
     // (h1 for cleartext, h2 via ALPN for an https upstream).
     parts.version = Version::HTTP_11;
     let upstream_req = Request::from_parts(parts, body);
-    let client = target.transport.select_client(&state.client);
 
-    let resp = tokio::time::timeout(state.opts.proxy_timeout, client.request(upstream_req))
-        .await
-        .map_err(|_| -> BoxError { "upstream timeout".into() })??;
-
-    target.transport.record_version(resp.version());
+    let resp = tokio::time::timeout(
+        state.opts.proxy_timeout,
+        target.transport.request(&state.client, upstream_req),
+    )
+    .await
+    .map_err(|_| -> BoxError { "upstream timeout".into() })??;
 
     let (mut resp_parts, resp_body) = resp.into_parts();
     sanitize_response_headers(resp_parts.status, &mut resp_parts.headers);

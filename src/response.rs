@@ -32,17 +32,14 @@ pub(crate) fn empty_json_response(code: StatusCode) -> Response<ResBody> {
     raw_json_response(code, Bytes::new())
 }
 
-pub(crate) fn text_response(code: StatusCode, msg: impl Into<Bytes>) -> Response<ResBody> {
+pub(crate) fn text_response(code: StatusCode, msg: &'static str) -> Response<ResBody> {
     Response::builder()
         .status(code)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(full_body(msg.into()))
+        .body(full_body(Bytes::from_static(msg.as_bytes())))
         .expect("response builder")
 }
 
 pub(crate) fn uri_too_long_response() -> Response<ResBody> {
-    text_response(
-        StatusCode::URI_TOO_LONG,
-        Bytes::from_static(b"request URI too long"),
-    )
+    text_response(StatusCode::URI_TOO_LONG, "request URI too long")
 }
