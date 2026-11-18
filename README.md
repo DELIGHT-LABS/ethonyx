@@ -6,22 +6,23 @@
 [![Rust 1.99+](https://img.shields.io/badge/rust-1.99%2B-blue.svg)](rust-toolchain.toml)
 
 Lightweight Rust reverse proxy and health-check sidecar for Ethereum **Execution Layer** (EL)
-and **Consensus Layer** (CL) node pairs.
+nodes and optional **Consensus Layer** (CL) Beacon node pairs (supports both `EL + CL` and
+`EL-only` deployments such as L2s and Cosmos EVM chains).
 
 ## Routing
 
 | Request                              | Forwarded to        |
 |--------------------------------------|---------------------|
 | `GET/HEAD /livez`                    | 200 OK (process liveness) |
-| `GET/HEAD /readyz`                   | EL + CL readiness gate (200 / 503) |
-| `GET/HEAD /healthz`                  | EL + CL state snapshot (always 200) |
+| `GET/HEAD /readyz`                   | Readiness gate (200 / 503; data-plane queries always pass through) |
+| `GET/HEAD /healthz`                  | State snapshot (always 200) |
 | `GET/HEAD /metrics`                  | Prometheus metrics scrape endpoint |
-| `GET/HEAD /eth/v1/node/health`       | ethonyx node health (200 / 206 / 503) if `--mock-cl-node-health` set, else `--cl-beacon-url` |
-| `POST /eth/v1/validator/register_validator` | `--cl-mev-relay-url` (rewritten to `/eth/v1/builder/validators`) if set, else `--cl-beacon-url` |
-| `POST /eth/v1/validator/{prepare_beacon_proposer, beacon_committee_subscriptions, sync_committee_subscriptions}` | `200 OK` if `--mock-cl-subscriptions` set, else `--cl-beacon-url` |
-| `/eth/...`, `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...` | `--cl-beacon-url`   |
-| `Upgrade: websocket`                 | `--el-ws-url`       |
-| everything else (JSON-RPC `POST /`)  | `--el-http-url`     |
+| `GET/HEAD /eth/v1/node/health`       | ethonyx node health (200 / 206 / 503) if `--mock-cl-node-health` set, else `--cl-beacon-url` (`404` in EL-only mode) |
+| `POST /eth/v1/validator/register_validator` | `--cl-mev-relay-url` (rewritten to `/eth/v1/builder/validators`) if set, else `--cl-beacon-url` (`404` in EL-only mode) |
+| `POST /eth/v1/validator/{prepare_beacon_proposer, beacon_committee_subscriptions, sync_committee_subscriptions}` | `200 OK` if `--mock-cl-subscriptions` set, else `--cl-beacon-url` (`404` in EL-only mode) |
+| `/eth/...`, `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...` | `--cl-beacon-url` (`404` when `--cl-beacon-url` is omitted) |
+| `Upgrade: websocket` / H2 Extended `CONNECT` | `--el-ws-url` (`404` when `--el-ws-url` is omitted) |
+| everything else (JSON-RPC `POST /`)  | `--el-http-url` *(required)* |
 
 ## Probes
 
@@ -30,41 +31,42 @@ Three endpoints, split by purpose (Kubernetes `z` convention):
 | Endpoint            | Returns                       | Wire to                     | Gates on                                              |
 |---------------------|-------------------------------|-----------------------------|-------------------------------------------------------|
 | `GET/HEAD /livez`   | always `200`, body `ok`       | liveness probe (restart)    | nothing — only that the process is up; no upstream call |
-| `GET/HEAD /readyz`  | `200` ready / `503` not ready | readiness probe (LB gate)   | EL + CL **sync status** (plus freshness with `--readyz-strict`) |
+| `GET/HEAD /readyz`  | `200` ready / `503` not ready | readiness probe (LB gate)   | EL sync + readable `latest` block, optional CL sync + Engine API (`!is_optimistic && !el_offline`), optional `--el-reference-url` block lag, plus freshness with `--readyz-strict` |
 | `GET/HEAD /healthz` | always `200` + JSON snapshot  | monitoring / alerting / curl | nothing — reports state, never judges                 |
 | `GET/HEAD /metrics` | Prometheus metrics text format | Prometheus scraper          | nothing — metrics scraper                             |
 
-`/livez` and `/readyz` differ exactly when the node is up but not serving yet
-(startup, mid-sync, or an upstream is down): `/livez` stays `200` (don't restart
-me) while `/readyz` returns `503` (don't route to me). Once synced, both are
-`200`. So **default `/readyz` is `/livez` plus an EL+CL sync check.**
+`/livez` and `/readyz` differ when the node is up but should not receive load-balanced
+traffic (startup, mid-sync, Engine API stall, or lagging behind peers): `/livez` stays
+`200` (don't restart me) while `/readyz` returns `503` (route around me). Direct HTTP
+JSON-RPC, WebSocket, and REST requests continue to pass through unconditionally even
+while `/readyz` is `503`.
 
 ### `/readyz` — the traffic gate
 
-Gates **only on EL + CL sync status** by default. A caught-up node reports
-`eth_syncing == false` even when the chain stalls network-wide, so a chain
-incident (or a fleet-wide peer dip) won't drop every backend out of the load
-balancer at once — which would turn a chain incident into a total RPC outage.
-Sync status is the node-local signal that tells "this node can serve" apart from
-"this node is behind its peers".
+Gates on **EL sync + readable `latest` block** (and **CL sync + `!is_optimistic && !el_offline`**
+when `--cl-beacon-url` is configured). A caught-up node reports `eth_syncing == false`
+even when the chain stalls network-wide, so a chain incident (or a fleet-wide peer dip)
+won't drop every backend out of the load balancer at once.
 
 ```jsonc
-// 200 — synced. el_block_fresh / cl_slot_fresh appear only under --readyz-strict.
+// 200 — synced. `cl_syncing` appears when `--cl-beacon-url` is set;
+// `el_reference_lag` appears when `--el-reference-url` is set;
+// `el_block_fresh` / `cl_slot_fresh` appear only under `--readyz-strict`.
 { "status": "ready",
-  "el_syncing": { "ok": true, "detail": "synced" },
+  "el_syncing": { "ok": true, "detail": "synced (block 21000000)" },
   "cl_syncing": { "ok": true, "detail": "synced (slot 9412341, distance 0)" } }
 ```
 
-`--readyz-strict` additionally gates on EL block age (`--el-max-block-age-secs`)
-and CL slot age (`--cl-max-slot-age-secs`) — choose it when serving strictly
-at-head data matters more than fleet availability during a stall.
+- **Reference block-lag gate (`--el-reference-url`)**: Compares local EL height against one or more peer Ethonyx/EL URLs or external RPCs every `--el-reference-poll-interval` (default `3s`), returning `503` when lag exceeds `--el-max-reference-lag` (default `1` block, so `0–1` blocks pass and `≥ 2` blocks deroute). During a network-wide chain halt (even with a 1-block partial propagation split), nodes stay within `max_lag` and remain `200`. Any round that cannot produce a verified `(reference, causal local)` sample (all references fail, all `chain_id`s mismatch, or local `eth_chainId` / `eth_blockNumber` fails) counts as a missed round: the first missed round retains the last verdict, and two consecutive missed rounds fail open (`200`) so a reference outage never drains healthy nodes.
+- **Wall-clock freshness gate (`--readyz-strict`)**: Additionally gates on EL block age (`--el-max-block-age-secs`) and CL slot age (`--cl-max-slot-age-secs`) — choose it when serving strictly at-head data matters more than fleet availability during a chain halt.
 
 ### `/healthz` — state for monitoring
 
-Always `200`. Reports each live EL/CL value as a machine-readable field for your
-monitoring stack to threshold; it applies no thresholds and renders no verdict.
+Always `200`. Reports each live EL (and optional CL / Reference) value as a machine-readable
+field for your monitoring stack to threshold; it applies no thresholds and renders no verdict.
 A signal whose upstream call failed is omitted and the error is recorded under
-that layer's `errors` array.
+that layer's `errors` array (`net_peerCount` `-32601 Method not found` is silently omitted
+on chains that do not implement the `net` namespace).
 
 | Field                                              | Source                                |
 |----------------------------------------------------|---------------------------------------|
@@ -74,10 +76,11 @@ that layer's `errors` array.
 | `el.sync_distance` (while syncing)                 | EL `eth_syncing` highest − current    |
 | `el.peers`                                         | EL `net_peerCount`                    |
 | `el.block_number` / `el.block_age_secs`            | EL `eth_getBlockByNumber("latest")`   |
-| `cl.syncing` / `cl.sync_distance` / `cl.head_slot` | Beacon `/eth/v1/node/syncing`         |
-| `cl.slot_age_secs`                                 | Beacon `head_slot` vs. wall-clock     |
+| `cl.syncing` / `cl.is_optimistic` / `cl.el_offline` | Beacon `/eth/v1/node/syncing`         |
+| `cl.sync_distance` / `cl.head_slot` / `cl.slot_age_secs` | Beacon `head_slot` vs. wall-clock |
 | `cl.peers`                                         | Beacon `/eth/v1/node/peer_count`      |
-| `el.errors` / `cl.errors`                          | any upstream call that failed         |
+| `reference.block_number` / `reference.block_lag`   | highest verified `--el-reference-url` `eth_blockNumber` |
+| `el.errors` / `cl.errors` / `reference.errors`     | any upstream or reference call that failed |
 
 ```json
 { "mode": "probed",
@@ -98,9 +101,13 @@ bounded by `--health-timeout`, including the response body) before the next poll
 the latest snapshot instantly — so upstream load is constant regardless of probe
 rate, a slow upstream never blocks a probe, and the poller pauses a full interval
 between polls rather than hammering a struggling node. Block / slot ages are
-recomputed live per request, so they stay accurate between polls. The cache is
-warmed by one poll before the listener accepts, so the process serves a real
-snapshot from its first probe.
+recomputed live per request, so they stay accurate between polls. The cache is warmed by one poll before the listener accepts, so the process serves
+a real snapshot from its first probe. When `--el-reference-url` is configured, a
+separate background cadence (`--el-reference-poll-interval`, default `3s`) learns
+the local `eth_chainId` first, then queries `eth_chainId` and `eth_blockNumber`
+concurrently on each distinct reference endpoint, reading the local
+`eth_blockNumber` right after any verified reference that raises the round's
+highest head (one local read in steady state).
 
 Readiness is logged by the poller on transition (becoming not-ready / recovering)
 — once per change, bounded to the poll rate and emitted even if nothing probes
@@ -126,9 +133,10 @@ supported, covering the common "TLS-terminating LB / mesh forwards h2c to the
 backend" shape (Envoy, Istio, HAProxy `proto h2`); plain HTTP/1.1 and the
 HTTP/1.1 WebSocket upgrade are unchanged.
 
-WebSocket works over both transports: the HTTP/1.1 `Upgrade` handshake and
-HTTP/2 Extended CONNECT (RFC 8441, `:protocol=websocket`). Either is bridged to
-the upstream's HTTP/1.1 WebSocket (`--el-ws-url`).
+WebSocket works over both transports when `--el-ws-url` is configured: the HTTP/1.1
+`Upgrade` handshake and HTTP/2 Extended CONNECT (RFC 8441, `:protocol=websocket`).
+Either is bridged to the upstream's HTTP/1.1 WebSocket (`--el-ws-url`); when
+`--el-ws-url` is omitted, WebSocket upgrade requests return `404 Not Found`.
 
 Subprotocol offers from all request header lines are combined, and the selected
 protocol is relayed from the upstream. Unsupported extensions, including
@@ -192,6 +200,11 @@ LB / service mesh in front.
 
 ## Usage
 
+`--el-http-url` is required; all other upstream endpoints (`--el-ws-url`,
+`--cl-beacon-url`, `--cl-mev-relay-url`, `--el-reference-url`, `--otel-endpoint`)
+have no implicit defaults and are enabled only when explicitly provided (`--listen`
+defaults to `0.0.0.0:8547`):
+
 ```sh
 ethonyx \
   --listen 0.0.0.0:8547 \
@@ -200,7 +213,11 @@ ethonyx \
   --cl-beacon-url http://127.0.0.1:5052
 ```
 
-Every flag also accepts an `ETHONYX_*` env var (see `ethonyx --help`).
+Every flag also accepts an `ETHONYX_*` env var (see `ethonyx --help`). To disable an
+optional upstream via environment variables, leave the variable unset rather than
+setting an empty string (`""`), which is rejected as a malformed URL; if a reference
+URL's query string itself contains a comma, pass repeated `--el-reference-url` CLI
+flags rather than comma-delimiting.
 
 ### Multi-port listen
 
@@ -284,11 +301,14 @@ The following metrics are exposed:
 - `ethonyx_connection_limit_saturated_total`: Total number of inbound TCP accepts queued or HTTP/2 Extended `CONNECT` WebSocket streams rejected due to `--max-connections` saturation.
 - `ethonyx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`).
 - `ethonyx_proxy_request_duration_seconds`: Latency histogram of upstream proxied requests (labeled by `upstream`).
-- `ethonyx_upstream_peers`: Number of peers reported by upstream nodes (labeled by `layer` as `el` or `cl`).
+- `ethonyx_upstream_peers`: Number of peers reported by upstream nodes (labeled by `layer`: `layer="el"` is omitted when `net_peerCount` is unsupported, and `layer="cl"` is omitted when CL is disabled).
 - `ethonyx_upstream_sync_distance`: Remaining sync distance in blocks or slots (labeled by `layer` as `el` or `cl`).
 - `ethonyx_upstream_block_number`: Latest execution layer block number.
-- `ethonyx_upstream_slot_number`: Latest consensus layer head slot number.
+- `ethonyx_upstream_slot_number`: Latest consensus layer head slot number (registered only when `--cl-beacon-url` is set).
 - `ethonyx_upstream_health_status`: Upstream health status (1 = healthy/synced, 0 = degraded/down, labeled by `layer`).
+- `ethonyx_reference_health_status`: Reference lag-sample status (`1` = verified `(block_number, block_lag)` sample obtained this round, `0` = degraded/unavailable; registered only when `--el-reference-url` is set).
+- `ethonyx_reference_block_number`: Highest verified block number from the latest `--el-reference-url` sample (retains its last value across fail-open outages; filter alerts with `ethonyx_reference_health_status == 1`).
+- `ethonyx_reference_block_lag`: Local EL block lag from the latest `--el-reference-url` sample (retains its last value across fail-open outages; filter alerts with `ethonyx_reference_health_status == 1`).
 
 ## OpenTelemetry
 
@@ -342,22 +362,24 @@ WantedBy=multi-user.target
 For testnets, set `--network hoodi` (or `sepolia` / `holesky`). For a private
 chain: `--network custom --cl-genesis-time <unix> --cl-seconds-per-slot 12`.
 
-### Readiness tuning
+### Readiness & reference block-lag tuning
 
-`/readyz` is sync-only by default and needs no tuning — it tracks whether the
-node is caught up to its peers. Add `--readyz-strict` if you also want it to
-fail when the node stops advancing at head; freshness then gates on:
+`/readyz` gates on sync status (and CL Engine API health when `--cl-beacon-url` is set).
+To deroute slow or silently stalled nodes without draining the fleet during a chain halt,
+point `--el-reference-url` at your peer nodes (or external reference RPCs):
 
-| Flag                      | Default | Gates `/readyz` on            |
-|---------------------------|---------|-------------------------------|
-| `--el-max-block-age-secs` | `60`    | EL latest-block wall-clock age |
-| `--cl-max-slot-age-secs`  | `60`    | CL head-slot wall-clock age    |
+| Flag                           | Default | Gates `/readyz` on                                    |
+|--------------------------------|---------|-------------------------------------------------------|
+| `--el-reference-url`           | `none`  | Comma-separated / repeatable peer or reference EL URLs |
+| `--el-max-reference-lag`       | `1`     | Max allowed EL block lag behind highest valid reference |
+| `--el-reference-poll-interval` | `3`     | Reference poll interval in seconds                    |
+| `--el-max-block-age-secs`      | `60`    | EL latest-block wall-clock age (with `--readyz-strict`) |
+| `--cl-max-slot-age-secs`       | `60`    | CL head-slot wall-clock age (with `--readyz-strict`)  |
 
-These two flags are inert without `--readyz-strict`; `/healthz` always reports
-the raw age regardless. On young testnets or low-traffic private chains, widen
-them (e.g. `120`) so normal slot gaps don't flap readiness. Peer counts no
-longer gate anything — `/healthz` simply reports the live count for your
-monitoring stack to threshold.
+- **Peer-only vs. external reference URLs**: Listing peer Ethonyx/EL URLs (never the cluster's own frontend LB VIP) in a shared ConfigMap is safe even when a node's own URL is included (entries matching `--el-http-url` are stripped at startup, and pod-DNS self-entries evaluate to `lag == 0`), ensuring the highest peer stays `200 Ready` in Kubernetes `Service` pools (which do not fail open when 0 pods are ready). Mixing in an external commercial RPC can drain all local pods if the entire local cluster falls behind that external provider — pair external references with load-balancer panic-mode fail-open where appropriate.
+- **Sub-second block chains**: On chains with `< 1s` block times (e.g. Arbitrum `250ms`, Sei `400ms`), raise `--el-max-reference-lag` (e.g. `3–8`) so normal P2P propagation and asynchronous poll-window spread do not flap readiness.
+- **EL-only mode**: Omit `--cl-beacon-url` on non-Beacon chains; configure `--el-reference-url` or `--readyz-strict` if you want silent EL stalls to fail `/readyz`.
+- `--el-max-block-age-secs` and `--cl-max-slot-age-secs` remain inert without `--readyz-strict`; `/healthz` always reports the raw age regardless. Peer counts never gate readiness.
 
 ### Trusted / Commercial Endpoint & Data-Plane Mocking Tuning
 

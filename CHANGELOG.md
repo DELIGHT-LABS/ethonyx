@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add multi-endpoint Reference EL block-lag readiness gating (`--el-reference-url` / `ETHONYX_EL_REFERENCE_URL`, `--el-max-reference-lag` default `1`, `--el-reference-poll-interval` default `3s`) with shared ConfigMap self-URL stripping (`--el-http-url` matches excluded at startup), per-round `eth_chainId` verification and automatic recovery, causal `eth_blockNumber` pairing, unified two-strike fail-open (`Active` → `Retained` → `Unavailable`), `/healthz` `reference` snapshot, and `ethonyx_reference_{health_status,block_number,block_lag}` metrics while keeping data-plane queries unobstructed.
 - Add `--sse-idle-timeout` (`ETHONYX_SSE_IDLE_TIMEOUT`, default `900` seconds, `0` = disabled) to keep long-lived Beacon SSE (`text/event-stream`) subscriptions open across quiet intervals while bounding stalled normal HTTP response bodies by `--proxy-timeout`.
 - Add `--max-connections` (`ETHONYX_MAX_CONNECTIONS`, default `4096`, `0` = unlimited) shared semaphore backpressure across all `--listen` ports, HTTP/1.1, HTTP/2, HTTP/1.1 upgraded WebSockets, and concurrent HTTP/2 Extended `CONNECT` WebSocket streams (with `ethonyx_connection_limit_saturated_total`), plus a `15s` initial protocol-preface read timeout and `65s` HTTP/1.1 header/keep-alive idle timeout.
 - Add `mode` (`"probed"` | `"trusted"`) to `/healthz` (`HealthSnapshot`), reporting honest unpolled state under `--trust-upstream` without fabricated peer counts or gauges.
@@ -18,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: Remove implicit upstream URL defaults across `--el-http-url` (`ETHONYX_EL_HTTP_URL`, now required), `--el-ws-url` (`ETHONYX_EL_WS_URL`, now optional — omitting it disables WebSocket forwarding and returns `404 Not Found` on WS upgrades), and `--cl-beacon-url` (`ETHONYX_CL_BEACON_URL`, now optional — omitting it runs `ethonyx` in **EL-only mode**, returning `404 Not Found` on CL routes and omitting CL fields/metrics) while retaining the `0.0.0.0:8547` default on `--listen`; reject CL-only flags without `--cl-beacon-url`, reference-only flags without `--el-reference-url`, and `--readyz-strict` / `--el-reference-url` alongside `--trust-upstream` at startup, and include the latest block height in `/readyz` `el_syncing` detail (`"synced (block N)"`).
+- Gate `/readyz` and mocked `/eth/v1/node/health` on Consensus Layer `is_optimistic` and `el_offline` Engine API flags (preserving `206 Partial Content` while actively syncing, including before `latest` is populated under `--readyz-strict`), require a readable `latest` EL block when `eth_syncing` reports `false`, and omit unsupported `net_peerCount` (`-32601`) without probe errors.
 - **BREAKING**: Rename the project, crate, binary, and observability surface from `ethryx` to **`ethonyx`**:
   - Binary & library crate: `ethryx` → `ethonyx` (repository: `https://github.com/DELIGHT-LABS/ethonyx`)
   - Environment variable prefix: `ETHRYX_*` → `ETHONYX_*` (including `ETHONYX_STRESS_SECONDS` and build-time `ETHONYX_GIT_DESCRIBE`)
