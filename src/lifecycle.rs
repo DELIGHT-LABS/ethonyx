@@ -1,16 +1,16 @@
 //! One shutdown deadline and completion barrier for connections and their tasks.
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use tokio::time::{Instant, Sleep, sleep_until, timeout_at};
 
 /// Lazily allocated stall/idle timer shared by streaming HTTP bodies and
 /// WebSocket endpoints so immediate operations never allocate a [`Sleep`].
-#[derive(Default)]
 pub(crate) struct LazyDeadline {
     sleep: Option<Pin<Box<Sleep>>>,
     armed: bool,
@@ -28,7 +28,7 @@ impl LazyDeadline {
         self.armed
     }
 
-    pub(crate) fn disarm(&mut self) {
+    pub(crate) const fn disarm(&mut self) {
         self.armed = false;
     }
 
@@ -74,6 +74,54 @@ impl LazyDeadline {
 struct ShutdownInner {
     deadline: OnceLock<Instant>,
     notify: Notify,
+    active: AtomicUsize,
+    drained: Notify,
+}
+
+impl ShutdownInner {
+    /// Wait until shutdown is triggered and return the drain deadline.
+    ///
+    /// Registers the task's [`Waker`] in [`Notify`] at most once per waker so
+    /// steady-state polls from `biased` `select!` loops (`Shutdown::bound`,
+    /// `drive_graceful`, `bridge_ws`) cost a single atomic load and pointer check
+    /// instead of locking `notify.waiters` on every socket wake.
+    async fn deadline(&self) -> Instant {
+        if let Some(&at) = self.deadline.get() {
+            return at;
+        }
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        let mut registered_waker: Option<Waker> = None;
+        std::future::poll_fn(|cx| {
+            if let Some(&at) = self.deadline.get() {
+                return Poll::Ready(at);
+            }
+            if registered_waker
+                .as_ref()
+                .is_some_and(|w| w.will_wake(cx.waker()))
+            {
+                return Poll::Pending;
+            }
+            // `ShutdownTx` stores `deadline` before `notify_waiters()`, so any wake
+            // landing between the check above and registration is observed right below.
+            let _ = notified.as_mut().poll(cx);
+            if let Some(&at) = self.deadline.get() {
+                return Poll::Ready(at);
+            }
+            registered_waker = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
+
+    async fn bound<F: Future>(&self, task: F) -> Option<F::Output> {
+        tokio::pin!(task);
+        tokio::select! {
+            biased;
+            end = self.deadline() => timeout_at(end, task).await.ok(),
+            value = &mut task => Some(value),
+        }
+    }
 }
 
 pub(crate) struct ShutdownTx(Arc<ShutdownInner>);
@@ -98,78 +146,80 @@ impl Drop for ShutdownTx {
 pub(crate) struct Shutdown(Arc<ShutdownInner>);
 
 impl Shutdown {
-    /// Wait until shutdown is triggered and return the drain deadline.
-    ///
-    /// Registers the task's [`Waker`] in [`Notify`] at most once per waker so
-    /// steady-state polls from `biased` `select!` loops (`Shutdown::bound`,
-    /// `drive_graceful`, `bridge_ws`) cost a single atomic load and pointer check
-    /// instead of locking `notify.waiters` on every socket wake.
-    pub(crate) async fn deadline(&self) -> Instant {
-        let inner = &*self.0;
-        if let Some(&at) = inner.deadline.get() {
-            return at;
-        }
-        let notified = inner.notify.notified();
-        tokio::pin!(notified);
-        let mut registered_waker: Option<Waker> = None;
-        std::future::poll_fn(|cx| {
-            if let Some(&at) = inner.deadline.get() {
-                return Poll::Ready(at);
-            }
-            if registered_waker
-                .as_ref()
-                .is_some_and(|w| w.will_wake(cx.waker()))
-            {
-                return Poll::Pending;
-            }
-            // `ShutdownTx` stores `deadline` before `notify_waiters()`, so any wake
-            // landing between the check above and registration is observed right below.
-            let _ = notified.as_mut().poll(cx);
-            if let Some(&at) = inner.deadline.get() {
-                return Poll::Ready(at);
-            }
-            registered_waker = Some(cx.waker().clone());
-            Poll::Pending
-        })
-        .await
+    pub(crate) fn deadline(&self) -> impl Future<Output = Instant> {
+        self.0.deadline()
     }
 
     /// Run `task` until it completes or the drain deadline passes, whichever is
     /// first. `None` means the deadline cancelled it.
-    pub(crate) async fn bound<F: Future>(&self, task: F) -> Option<F::Output> {
-        tokio::pin!(task);
-        tokio::select! {
-            biased;
-            end = self.deadline() => timeout_at(end, task).await.ok(),
-            value = &mut task => Some(value),
+    pub(crate) fn bound<F: Future>(&self, task: F) -> impl Future<Output = Option<F::Output>> {
+        self.0.bound(task)
+    }
+}
+
+/// Single-consumer completion barrier resolved once every [`Lifecycle`] token has dropped.
+pub(crate) struct Drain(Arc<ShutdownInner>);
+
+impl Drain {
+    /// Wait until every accepted connection (via `ServerBuilders`), HTTP/2 request
+    /// task, and upgraded WebSocket relay holding a [`Lifecycle`] token has dropped.
+    pub(crate) async fn wait(self) {
+        loop {
+            if self.0.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            self.0.drained.notified().await;
         }
     }
 }
 
-pub(crate) fn channel() -> (ShutdownTx, Shutdown) {
+pub(crate) fn channel() -> (ShutdownTx, Lifecycle, Drain) {
     let inner = Arc::new(ShutdownInner {
         deadline: OnceLock::new(),
         notify: Notify::new(),
+        active: AtomicUsize::new(1),
+        drained: Notify::new(),
     });
-    (ShutdownTx(Arc::clone(&inner)), Shutdown(inner))
+    (
+        ShutdownTx(Arc::clone(&inner)),
+        Lifecycle(Arc::clone(&inner)),
+        Drain(inner),
+    )
 }
 
-#[derive(Clone)]
-pub(crate) struct Lifecycle {
-    shutdown: Shutdown,
-    completed: mpsc::Sender<()>,
+/// Drain-tracked handle sharing the server's [`ShutdownInner`] allocation (`8` bytes).
+///
+/// Only cloning an existing [`Lifecycle`] increments `active`, so the `1 -> 0` transition
+/// happens at most once across a server's lifetime. [`Drain::wait`] reads `active` before
+/// registering a waiter, so it relies on `notify_one` storing a permit when nobody is
+/// waiting yet; `notify_waiters` would lose a wakeup landing between the load and wait.
+pub(crate) struct Lifecycle(Arc<ShutdownInner>);
+
+impl Clone for Lifecycle {
+    fn clone(&self) -> Self {
+        self.0.active.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl Drop for Lifecycle {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Must remain `notify_one` (stored permit), not `notify_waiters`, so a
+            // `1 -> 0` drop before `Drain::wait` registers `notified()` cannot be lost.
+            self.0.drained.notify_one();
+        }
+    }
 }
 
 impl Lifecycle {
-    pub(crate) const fn new(shutdown: Shutdown, completed: mpsc::Sender<()>) -> Self {
-        Self {
-            shutdown,
-            completed,
-        }
+    pub(crate) fn deadline(&self) -> impl Future<Output = Instant> {
+        self.0.deadline()
     }
 
-    pub(crate) async fn deadline(&self) -> Instant {
-        self.shutdown.deadline().await
+    /// Return a non-drain-tracked [`Shutdown`] handle sharing this server's deadline.
+    pub(crate) fn shutdown(&self) -> Shutdown {
+        Shutdown(Arc::clone(&self.0))
     }
 
     /// Run a closure with direct access to [`Shutdown`] while guaranteeing its
@@ -180,18 +230,15 @@ impl Lifecycle {
         F: FnOnce(Shutdown) -> Fut,
         Fut: Future<Output = T>,
     {
-        let Self {
-            shutdown,
-            completed,
-        } = self;
-        let res = f(shutdown).await;
-        drop(completed);
+        let res = f(self.shutdown()).await;
+        drop(self);
         res
     }
 
-    pub(crate) async fn run<F: Future>(self, task: F) -> Option<F::Output> {
-        self.run_with(|shutdown| async move { shutdown.bound(task).await })
-            .await
+    async fn run<F: Future>(self, task: F) -> Option<F::Output> {
+        let res = self.0.bound(task).await;
+        drop(self);
+        res
     }
 }
 
@@ -222,32 +269,35 @@ mod tests {
             }
         }
         for closing in [Some(Instant::now()), None] {
-            let (shutdown, receiver) = channel();
+            let (shutdown, lifecycle, drain) = channel();
             if let Some(at) = closing {
                 shutdown.send(at);
             } else {
                 drop(shutdown);
             }
-            let (completed, mut drained) = mpsc::channel(1);
             let dropped = Arc::new(AtomicBool::new(false));
             let guard = Dropped(dropped.clone());
-            let task = Lifecycle::new(receiver, completed).run(async move {
+            let task = lifecycle.run(async move {
                 let _guard = guard;
                 std::future::pending::<()>().await;
             });
             let handle = tokio::spawn(task);
-            assert!(
-                tokio::time::timeout(Duration::from_secs(1), drained.recv())
-                    .await
-                    .expect("late or closed shutdown must cancel the task")
-                    .is_none()
-            );
+            tokio::time::timeout(Duration::from_secs(1), drain.wait())
+                .await
+                .expect("late or closed shutdown must cancel the task");
             assert!(
                 dropped.load(Ordering::Acquire),
                 "completion must follow resource cleanup"
             );
             assert!(handle.await.unwrap().is_none());
         }
+
+        // Dropping the last `Lifecycle` before `drain.wait()` is polled must still resolve immediately.
+        let (_shutdown, lifecycle, drain) = channel();
+        drop(lifecycle);
+        tokio::time::timeout(Duration::from_secs(1), drain.wait())
+            .await
+            .expect("already-drained barrier must resolve immediately");
     }
 
     #[tokio::test]
@@ -259,7 +309,8 @@ mod tests {
             }
         }
 
-        let (tx, rx) = channel();
+        let (tx, lifecycle, _drain) = channel();
+        let rx = lifecycle.shutdown();
         let fut = rx.deadline();
         tokio::pin!(fut);
 

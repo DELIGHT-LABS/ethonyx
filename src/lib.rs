@@ -238,11 +238,9 @@ impl Bound {
             telemetry,
         } = self;
 
-        let (shutdown_tx, shutdown_rx) = lifecycle::channel();
-        let poller = poller.map(|p| p.spawn(Arc::clone(&state), shutdown_rx.clone()));
+        let (shutdown_tx, lifecycle, drain) = lifecycle::channel();
+        let poller = poller.map(|p| p.spawn(Arc::clone(&state), lifecycle.shutdown()));
 
-        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let lifecycle = lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
         let prometheus = state.metrics.prometheus_handle();
         let accept_handle = tokio::spawn(server::accept_loop(listeners, state, lifecycle));
 
@@ -275,7 +273,7 @@ impl Bound {
         // Each connection, HTTP/2 request and relay uses the same deadline. Wait for
         // their futures to be dropped even with zero grace; timing out this barrier
         // would let serve() return before sockets and request tasks are released.
-        let _ = conn_rx.recv().await;
+        drain.wait().await;
 
         telemetry.shutdown().await;
         accept_res?;

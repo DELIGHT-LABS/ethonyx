@@ -24,72 +24,106 @@ use crate::websocket::WsMode;
 
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
-/// Permit bounding concurrent WebSocket relays across both HTTP/1.1 `Upgrade`
-/// and HTTP/2 Extended `CONNECT` streams under `--max-connections`.
-enum WsPermit {
-    Upgraded { _permit: Arc<OwnedSemaphorePermit> },
-    IncludedH2(Arc<Connection>),
-    DedicatedH2 { _permit: OwnedSemaphorePermit },
-}
-
-impl Drop for WsPermit {
-    fn drop(&mut self) {
-        if let Self::IncludedH2(conn) = self {
-            conn.h2_ws_slot_in_use.store(false, Ordering::Release);
-        }
-    }
-}
-
-/// Connection-owned state. Requests clone one Arc; detached WebSocket relays
-/// and HTTP/2 request tasks also retain the shared lifecycle and connection permit.
-pub(crate) struct Connection {
-    state: Arc<AppState>,
-    lifecycle: crate::lifecycle::Lifecycle,
-    peer: SocketAddr,
-    permit: Arc<OwnedSemaphorePermit>,
+/// Shared TCP permit + H2 WebSocket reuse slot, allocated only for WS-enabled
+/// servers after protocol preface succeeds so detached WS relays never retain
+/// `Arc<Connection>` / `Arc<AppState>`.
+struct SharedPermit {
+    _permit: OwnedSemaphorePermit,
     h2_ws_slot_in_use: AtomicBool,
 }
 
-impl Connection {
-    pub(crate) const fn new(
-        state: Arc<AppState>,
-        lifecycle: crate::lifecycle::Lifecycle,
-        peer: SocketAddr,
-        permit: Arc<OwnedSemaphorePermit>,
-    ) -> Self {
-        Self {
-            state,
-            lifecycle,
-            peer,
-            permit,
-            h2_ws_slot_in_use: AtomicBool::new(false),
-        }
-    }
+/// Connection-scoped WebSocket state for WS-enabled servers.
+/// `permit` is declared before `lifecycle` so the semaphore permit drops before
+/// releasing the drain token if `Connection` drops standalone.
+struct WsConn {
+    permit: Arc<SharedPermit>,
+    lifecycle: crate::lifecycle::Lifecycle,
+}
 
+impl WsConn {
     /// Claim a WebSocket concurrency slot:
     /// - HTTP/1.1 `Upgrade` shares the TCP connection's existing permit.
     /// - HTTP/2 Extended `CONNECT` reuses the H2 connection's own permit for its
     ///   first active WS stream, and acquires dedicated permits from `--max-connections`
     ///   for additional concurrent WS streams so multiplex amplification is bounded.
-    fn acquire_ws_permit(self: &Arc<Self>, mode: WsMode) -> Option<WsPermit> {
+    fn acquire_permit(&self, mode: WsMode, state: &AppState) -> Option<WsPermit> {
         match mode {
-            WsMode::Upgrade => Some(WsPermit::Upgraded {
+            WsMode::Upgrade => Some(WsPermit::SharedUpgrade {
                 _permit: Arc::clone(&self.permit),
             }),
             WsMode::ExtendedConnect => {
                 if self
+                    .permit
                     .h2_ws_slot_in_use
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    Some(WsPermit::IncludedH2(Arc::clone(self)))
-                } else if let Ok(_permit) = Arc::clone(&self.state.conn_limit).try_acquire_owned() {
-                    Some(WsPermit::DedicatedH2 { _permit })
+                    Some(WsPermit::SharedH2Slot(Arc::clone(&self.permit)))
                 } else {
-                    self.state.metrics.inc_saturated();
-                    None
+                    state
+                        .try_acquire_permit()
+                        .ok()
+                        .map(|permit| WsPermit::Dedicated { _permit: permit })
                 }
             }
+        }
+    }
+}
+
+enum ConnPermit {
+    /// HTTP-only server (`--el-ws-url` omitted): zero heap allocation and zero
+    /// `Lifecycle` refcount churn per connection.
+    Owned { _permit: OwnedSemaphorePermit },
+    /// WS-enabled server: shared by H1 `Upgrade` and the first H2 Extended `CONNECT` stream.
+    Shared(WsConn),
+}
+
+/// Permit bounding concurrent WebSocket relays across both HTTP/1.1 `Upgrade`
+/// and HTTP/2 Extended `CONNECT` streams under `--max-connections`.
+enum WsPermit {
+    SharedUpgrade { _permit: Arc<SharedPermit> },
+    SharedH2Slot(Arc<SharedPermit>),
+    Dedicated { _permit: OwnedSemaphorePermit },
+}
+
+impl Drop for WsPermit {
+    fn drop(&mut self) {
+        if let Self::SharedH2Slot(permit) = self {
+            permit.h2_ws_slot_in_use.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Connection-owned state. Requests clone one Arc; detached WebSocket relays
+/// retain only the shared lifecycle token and permit (never `Arc<AppState>`).
+pub(crate) struct Connection {
+    state: Arc<AppState>,
+    peer: SocketAddr,
+    permit: ConnPermit,
+}
+
+impl Connection {
+    pub(crate) fn new(
+        state: Arc<AppState>,
+        lifecycle: &crate::lifecycle::Lifecycle,
+        peer: SocketAddr,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let permit = if state.el_ws.is_some() {
+            ConnPermit::Shared(WsConn {
+                permit: Arc::new(SharedPermit {
+                    _permit: permit,
+                    h2_ws_slot_in_use: AtomicBool::new(false),
+                }),
+                lifecycle: lifecycle.clone(),
+            })
+        } else {
+            ConnPermit::Owned { _permit: permit }
+        };
+        Self {
+            state,
+            peer,
+            permit,
         }
     }
 
@@ -109,7 +143,7 @@ impl Connection {
                 ));
             }
             Route::Proxy(target) => {
-                let Some(forward) = Forward::resolve(target, &self.state) else {
+                let Some(forward) = Forward::resolve(target, &self) else {
                     return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
                 };
                 forward
@@ -141,7 +175,7 @@ impl Connection {
             tracing::Span::none()
         };
         let start = std::time::Instant::now();
-        let response = route(req, &self, forward).instrument(span).await;
+        let response = route(req, &self.state, forward).instrument(span).await;
         let elapsed = start.elapsed();
         let status = response.status().as_u16();
         if let Some((version, method, pq)) = access_ctx {
@@ -263,20 +297,23 @@ impl UpstreamProto {
     }
 }
 
-/// A [`Target`] bound to the configured upstream it requires.
+/// A [`Target`] bound to the configured upstream and connection resources it requires.
 #[derive(Clone, Copy)]
 enum Forward<'a> {
     Cl(&'a ClState),
     El,
-    WebSocket(WsMode, &'a WsTarget),
+    WebSocket(WsMode, &'a WsTarget, &'a WsConn),
 }
 
 impl<'a> Forward<'a> {
-    fn resolve(target: Target, state: &'a AppState) -> Option<Self> {
+    fn resolve(target: Target, conn: &'a Connection) -> Option<Self> {
         Some(match target {
-            Target::Cl => Self::Cl(state.cl.as_ref()?),
+            Target::Cl => Self::Cl(conn.state.cl.as_ref()?),
             Target::El => Self::El,
-            Target::WebSocket(mode) => Self::WebSocket(mode, state.el_ws.as_ref()?),
+            Target::WebSocket(mode) => match (&conn.state.el_ws, &conn.permit) {
+                (Some(ws), ConnPermit::Shared(ws_conn)) => Self::WebSocket(mode, ws, ws_conn),
+                _ => return None,
+            },
         })
     }
 
@@ -291,21 +328,20 @@ impl<'a> Forward<'a> {
 
 async fn route(
     req: Request<Incoming>,
-    connection: &Arc<Connection>,
+    state: &AppState,
     forward: Forward<'_>,
 ) -> Response<ResBody> {
-    let state = &connection.state;
     trace!(method = %req.method(), path = req.uri().path(), "routing request");
     match forward {
         Forward::Cl(cl) => proxy_cl(req, state, cl).await,
-        Forward::WebSocket(mode, ws) => {
+        Forward::WebSocket(mode, ws, ws_conn) => {
             Box::pin(crate::websocket::upgrade(
                 req,
                 mode,
                 ws,
                 state,
-                &connection.lifecycle,
-                || connection.acquire_ws_permit(mode),
+                &ws_conn.lifecycle,
+                || ws_conn.acquire_permit(mode, state),
             ))
             .await
         }
@@ -496,10 +532,10 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
 fn response_idle_timeout(
     headers: &HeaderMap,
     proxy_timeout: Duration,
-    sse_idle_timeout: Duration,
+    sse_idle_timeout: Option<Duration>,
 ) -> Option<Duration> {
     if is_event_stream(headers) {
-        (!sse_idle_timeout.is_zero()).then_some(sse_idle_timeout)
+        sse_idle_timeout
     } else {
         Some(proxy_timeout)
     }
@@ -701,9 +737,9 @@ mod tests {
     }
 
     #[test]
-    fn response_idle_timeout_distinguishes_event_streams_and_zero_disable() {
+    fn response_idle_timeout_distinguishes_event_streams_and_disabled() {
         let proxy_timeout = Duration::from_secs(60);
-        let sse_timeout = Duration::from_secs(900);
+        let sse_timeout = Some(Duration::from_secs(900));
 
         let mut plain = HeaderMap::new();
         assert_eq!(
@@ -725,11 +761,11 @@ mod tests {
             sse.insert("content-type", ct.parse().unwrap());
             assert_eq!(
                 response_idle_timeout(&sse, proxy_timeout, sse_timeout),
-                Some(sse_timeout),
+                sse_timeout,
                 "ct={ct}"
             );
             assert_eq!(
-                response_idle_timeout(&sse, proxy_timeout, Duration::ZERO),
+                response_idle_timeout(&sse, proxy_timeout, None),
                 None,
                 "ct={ct} disabled"
             );
@@ -743,7 +779,11 @@ mod tests {
         headers.insert("content-type", "text/event-stream".parse().unwrap());
         sanitize_response_headers(StatusCode::OK, &mut headers);
         assert_eq!(
-            response_idle_timeout(&headers, Duration::from_secs(60), Duration::from_secs(900)),
+            response_idle_timeout(
+                &headers,
+                Duration::from_secs(60),
+                Some(Duration::from_secs(900)),
+            ),
             Some(Duration::from_secs(60))
         );
     }
@@ -751,12 +791,13 @@ mod tests {
     #[tokio::test]
     async fn h2_extended_connect_permit_reuses_first_slot_and_caps_concurrent_amplification() {
         use clap::Parser;
-        use tokio::sync::mpsc;
 
         let cfg = crate::Config::parse_from([
             "ethonyx",
             "--el-http-url",
             "http://127.0.0.1:8545",
+            "--el-ws-url",
+            "ws://127.0.0.1:8546",
             "--trust-upstream",
             "--max-connections",
             "2",
@@ -769,36 +810,94 @@ mod tests {
             crate::metrics::ServerMetrics::default(),
         ));
         let sem = Arc::clone(&state.conn_limit);
-        let tcp_permit = Arc::new(sem.clone().try_acquire_owned().unwrap());
-        let (_shutdown_tx, shutdown_rx) = crate::lifecycle::channel();
-        let (conn_tx, _conn_rx) = mpsc::channel(1);
-        let lifecycle = crate::lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
+        let tcp_permit = sem.clone().try_acquire_owned().unwrap();
+        let (_shutdown_tx, lifecycle, _drain) = crate::lifecycle::channel();
         let conn = Arc::new(Connection::new(
-            state,
-            lifecycle,
+            Arc::clone(&state),
+            &lifecycle,
             "127.0.0.1:12345".parse().unwrap(),
             tcp_permit,
         ));
+        let state_refs_before = Arc::strong_count(&state);
 
-        // 1st H2 Extended CONNECT stream reuses the connection's own permit (1 left in sem).
-        let p1 = conn.acquire_ws_permit(WsMode::ExtendedConnect);
+        let Forward::WebSocket(_, _, ws_conn) =
+            Forward::resolve(Target::WebSocket(WsMode::ExtendedConnect), &conn)
+                .expect("WS-enabled Connection must resolve WebSocket target")
+        else {
+            panic!("expected Forward::WebSocket");
+        };
+
+        // 1st H2 Extended CONNECT stream reuses the connection's own permit (1 left in sem)
+        // without retaining `Arc<Connection>` / `Arc<AppState>`.
+        let p1 = ws_conn.acquire_permit(WsMode::ExtendedConnect, &state);
         assert!(p1.is_some());
         assert_eq!(sem.available_permits(), 1);
+        assert_eq!(Arc::strong_count(&state), state_refs_before);
 
         // 2nd concurrent H2 Extended CONNECT stream claims the remaining semaphore permit.
-        let p2 = conn.acquire_ws_permit(WsMode::ExtendedConnect);
+        let p2 = ws_conn.acquire_permit(WsMode::ExtendedConnect, &state);
         assert!(p2.is_some());
         assert_eq!(sem.available_permits(), 0);
 
         // 3rd concurrent stream is rejected instead of amplifying beyond max_connections=2.
-        assert!(conn.acquire_ws_permit(WsMode::ExtendedConnect).is_none());
+        assert!(
+            ws_conn
+                .acquire_permit(WsMode::ExtendedConnect, &state)
+                .is_none()
+        );
 
         // Dropping p1 releases the connection's included H2 WS slot for reuse.
         drop(p1);
-        let p1_reused = conn.acquire_ws_permit(WsMode::ExtendedConnect);
+        let p1_reused = ws_conn.acquire_permit(WsMode::ExtendedConnect, &state);
         assert!(p1_reused.is_some());
         drop((p2, p1_reused));
         assert_eq!(sem.available_permits(), 1);
+
+        // A detached relay holding the connection's H2 slot keeps the permit alive after
+        // `Connection` drops while releasing `Arc<AppState>` immediately.
+        let detached = ws_conn
+            .acquire_permit(WsMode::ExtendedConnect, &state)
+            .unwrap();
+        assert!(matches!(detached, WsPermit::SharedH2Slot(_)));
+        drop(conn);
+        assert_eq!(Arc::strong_count(&state), 1);
+        assert_eq!(sem.available_permits(), 1);
+        drop(detached);
+        assert_eq!(sem.available_permits(), 2);
+
+        // HTTP-only server (`--el-ws-url` omitted) keeps `ConnPermit::Owned` without
+        // cloning `Lifecycle` per connection.
+        let http_only = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+            "--max-connections",
+            "1",
+        ])
+        .parse_validated()
+        .unwrap();
+        let http_state = Arc::new(AppState::new(
+            http_only.opts,
+            http_only.upstreams,
+            health::HealthSource::Trusted,
+            crate::metrics::ServerMetrics::default(),
+        ));
+        let http_permit = Arc::clone(&http_state.conn_limit)
+            .try_acquire_owned()
+            .unwrap();
+        let (_tx2, lc2, drain2) = crate::lifecycle::channel();
+        let http_conn = Connection::new(
+            http_state,
+            &lc2,
+            "127.0.0.1:12346".parse().unwrap(),
+            http_permit,
+        );
+        drop(lc2);
+        tokio::time::timeout(Duration::from_millis(100), drain2.wait())
+            .await
+            .expect("HTTP-only Connection must not retain a Lifecycle token");
+        assert!(Forward::resolve(Target::WebSocket(WsMode::Upgrade), &http_conn).is_none());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::fmt;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
@@ -384,8 +384,8 @@ pub(crate) struct StrictFreshness {
 #[derive(Clone, Copy)]
 pub(crate) struct ProxyOpts {
     pub(crate) proxy_timeout: Duration,
-    pub(crate) sse_idle_timeout: Duration,
-    pub(crate) max_connections: usize,
+    pub(crate) sse_idle_timeout: Option<Duration>,
+    pub(crate) max_connections: Option<NonZeroUsize>,
     pub(crate) mock_eth_syncing: bool,
 }
 
@@ -694,8 +694,8 @@ impl Config {
         let otel_endpoint = crate::otel::parse_config_endpoint(self)?;
         let opts = ProxyOpts {
             proxy_timeout: self.proxy_timeout,
-            sse_idle_timeout: self.sse_idle_timeout,
-            max_connections: self.max_connections,
+            sse_idle_timeout: (!self.sse_idle_timeout.is_zero()).then_some(self.sse_idle_timeout),
+            max_connections: NonZeroUsize::new(self.max_connections),
             mock_eth_syncing: self.mock_eth_syncing,
         };
         Ok(ParsedConfig {
@@ -1061,6 +1061,12 @@ mod tests {
             "0",
         ]);
         assert!(zero_optional.validate().is_ok());
+        // `0` disables both options at parse time so data-plane paths see `Option` directly.
+        let off = zero_optional.parse_validated().unwrap().opts;
+        assert!(off.sse_idle_timeout.is_none() && off.max_connections.is_none());
+        let on = default_cfg.parse_validated().unwrap().opts;
+        assert_eq!(on.sse_idle_timeout, Some(Duration::from_secs(900)));
+        assert_eq!(on.max_connections.map(NonZeroUsize::get), Some(4096));
 
         let trimmed_listen = parse(&[
             "--listen",
