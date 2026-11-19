@@ -16,23 +16,26 @@ const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");
 const OTLP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct TelemetryProviders {
+    // Declared first so fallback drops (if `Telemetry::shutdown` or `Telemetry::drop`
+    // cannot spawn a helper thread) signal `ShutdownTx::drop` (`Instant::now()`)
+    // before `traces`/`metrics` run blocking drops.
+    shutdown_tx: crate::lifecycle::ShutdownTx,
     traces: opentelemetry_sdk::trace::SdkTracerProvider,
     metrics: opentelemetry_sdk::metrics::SdkMeterProvider,
-    shutdown_tx: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
 }
 
 impl TelemetryProviders {
     fn shutdown_blocking(self, deadline: tokio::time::Instant) {
         let Self {
+            shutdown_tx,
             traces,
             metrics,
-            shutdown_tx,
         } = self;
         // Publish a shared shutdown deadline so in-flight OTLP HTTP exports
         // (including `SdkMeterProvider::shutdown_with_timeout`, whose timeout
         // argument is ignored by `opentelemetry_sdk` 0.33.1) abort on time and
         // strip `Retry-After` throttle headers.
-        let _ = shutdown_tx.send(Some(deadline));
+        shutdown_tx.send(deadline);
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         std::thread::scope(|s| {
             let metrics_ref = &metrics;
@@ -210,8 +213,8 @@ fn init_otel(
     endpoints: OtelEndpoints,
     rt: tokio::runtime::Handle,
 ) -> Result<Telemetry, crate::BoxError> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(None);
-    let (trace_client, metric_client) = client::build_signal_clients(rt, shutdown_rx);
+    let (shutdown_tx, shutdown) = crate::lifecycle::shutdown_channel();
+    let (trace_client, metric_client) = client::build_signal_clients(rt, shutdown);
     let trace_timeout = trace_client.timeout();
     let metric_timeout = metric_client.timeout();
     let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -351,7 +354,7 @@ mod tests {
         let _retained_traces_clone = traces.clone();
         let _retained_metrics_clone = metrics.clone();
 
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(None);
+        let (shutdown_tx, _shutdown) = crate::lifecycle::shutdown_channel();
         let telemetry = Telemetry(Some(TelemetryProviders {
             traces,
             metrics,
@@ -417,7 +420,7 @@ mod tests {
             .with_periodic_exporter(exporter)
             .build();
         let traces = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(None);
+        let (shutdown_tx, shutdown) = crate::lifecycle::shutdown_channel();
         let telemetry = Telemetry(Some(TelemetryProviders {
             traces,
             metrics,
@@ -438,13 +441,9 @@ mod tests {
         // Confirm the spawned shutdown thread published the export deadline
         // (waiting briefly so a heavily loaded CI runner scheduling the new OS
         // thread cannot flake before `shutdown_tx.send` runs).
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            shutdown_rx.wait_for(Option::is_some),
-        )
-        .await
-        .expect("shutdown thread must publish the export deadline")
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), shutdown.deadline())
+            .await
+            .expect("shutdown thread must publish the export deadline");
         // Unblock the detached shutdown thread cleanly before the test returns.
         let _ = release_tx.send(());
     }

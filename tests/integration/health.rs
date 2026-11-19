@@ -1195,8 +1195,9 @@ async fn el_only_mode_omits_cl_metrics_returns_404_on_cl_routes_and_tolerates_mi
     assert!(h_json["el"].get("errors").is_none(), "{h_json}");
     assert_eq!(h_json["el"]["block_number"], 42);
 
-    // 3. Unconfigured CL and WS routes (both HTTP/1.1 Upgrade and H2 Extended CONNECT)
-    //    return 404 locally BEFORE recording proxy metrics, while EL HTTP JSON-RPC passes.
+    // 3. Unconfigured CL and HTTP/1.1 WS routes return 404 locally BEFORE recording
+    //    proxy metrics, while HTTP/2 omits RFC 8441 SETTINGS_ENABLE_CONNECT_PROTOCOL
+    //    (rejecting Extended CONNECT at the framing layer) and EL JSON-RPC passes.
     for cl_path in [
         "/eth/v1/node/syncing",
         "/lighthouse/ui/health",
@@ -1219,8 +1220,10 @@ async fn el_only_mode_omits_cl_metrics_returns_404_on_cl_routes_and_tolerates_mi
 
     let mut h2 = proxy.open_h2().await;
     let ws_h2_req = ext_connect(proxy.url("/"));
-    let ws_h2_resp = h2.send_request(ws_h2_req).await.unwrap();
-    assert_eq!(ws_h2_resp.status(), StatusCode::NOT_FOUND);
+    assert!(
+        h2.send_request(ws_h2_req).await.is_err(),
+        "HTTP/2 without --el-ws-url must not advertise RFC 8441 Extended CONNECT"
+    );
     drop(h2);
 
     let (el_st, _) = post_json(

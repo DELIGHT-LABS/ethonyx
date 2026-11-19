@@ -1309,3 +1309,21 @@ async fn http2_extended_connect_large_frame_slow_reader_completes_past_proxy_tim
     drop((ws, sender, h2_conn));
     proxy.shutdown().await;
 }
+
+#[tokio::test]
+async fn eth_syncing_over_websocket_is_forwarded_when_mocking_is_off() {
+    let upstream = ws_echo_upstream().await;
+    let proxy = EthonyxHandle::start_trusted_ws(&upstream.url).await;
+    let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
+        .await
+        .unwrap();
+    let request = r#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}"#;
+    ws.send(Message::Text(request.into())).await.unwrap();
+    // The echo upstream returns the request itself; a local mock would answer `"result":false`.
+    assert_eq!(
+        ws.next().await.unwrap().unwrap(),
+        Message::Text(request.into())
+    );
+    ws.close(None).await.unwrap();
+    proxy.shutdown().await;
+}

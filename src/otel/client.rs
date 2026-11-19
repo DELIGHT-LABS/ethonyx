@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use opentelemetry_http::{HttpClient, HttpError, ResponseBodyTooLarge};
-use tokio::sync::watch;
 use tracing::instrument::WithSubscriber as _;
+
+use crate::lifecycle::Shutdown;
 
 const OTLP_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound (1 hour) so extreme `OTEL_EXPORTER_OTLP_*_TIMEOUT` values cannot
@@ -50,7 +51,7 @@ pub(super) struct OtlpHyperClient {
     client: crate::transport::ProxyClient,
     rt: tokio::runtime::Handle,
     timeout: Duration,
-    shutdown: watch::Receiver<Option<tokio::time::Instant>>,
+    shutdown: Shutdown,
 }
 
 impl OtlpHyperClient {
@@ -68,10 +69,10 @@ impl fmt::Debug for OtlpHyperClient {
 }
 
 /// Build per-signal trace and metric OTLP clients sharing one pooled HTTPS client
-/// and one shutdown deadline broadcast channel.
+/// and one single-shot shutdown deadline handle.
 pub(super) fn build_signal_clients(
     rt: tokio::runtime::Handle,
-    shutdown: watch::Receiver<Option<tokio::time::Instant>>,
+    shutdown: Shutdown,
 ) -> (OtlpHyperClient, OtlpHyperClient) {
     let client = crate::transport::build_otlp_client();
     let trace_client = OtlpHyperClient {
@@ -107,85 +108,59 @@ impl HttpClient for OtlpHyperClient {
         Box::pin(async move {
             let client = self.client.clone();
             let timeout = self.timeout;
-            let mut shutdown = self.shutdown.clone();
+            let shutdown = self.shutdown.clone();
             // Detach the spawned export task from any global `tracing` subscriber (pairing
             // with `NoSubscriberExecutor` on the client) so `hyper`/`h2` export spans
             // cannot recursively feed back into the OpenTelemetry trace exporter.
-            let mut handle = AbortOnDrop(self.rt.spawn(
-                async move {
-                    let now = tokio::time::Instant::now();
-                    let mut deadline = now + timeout;
-                    if let Some(shutdown_deadline) = *shutdown.borrow_and_update() {
-                        deadline = deadline.min(shutdown_deadline);
-                    }
-                    // Refuse new dials once the shutdown deadline has passed so SDK retry
-                    // backoff never opens fresh TCP connections during teardown.
-                    if now >= deadline {
-                        return Err("OTLP HTTP export timed out".into());
-                    }
-
-                    let req = request.map(crate::response::full_body);
-                    let mut send = std::pin::pin!(async move {
-                        let resp = client
-                            .request(req)
+            let mut handle = AbortOnDrop(
+                self.rt.spawn(
+                    async move {
+                        let export_deadline = tokio::time::Instant::now() + timeout;
+                        let send = async move {
+                            let req = request.map(crate::response::full_body);
+                            let resp = client
+                                .request(req)
+                                .await
+                                .map_err(|e| -> HttpError { Box::new(e) })?;
+                            let (parts, body) = resp.into_parts();
+                            let collected = crate::response::collect_body(
+                                body,
+                                OTLP_MAX_RESPONSE_BODY_BYTES,
+                                None,
+                            )
                             .await
-                            .map_err(|e| -> HttpError { Box::new(e) })?;
-                        let (parts, body) = resp.into_parts();
-                        let collected = crate::response::collect_body(
-                            body,
-                            OTLP_MAX_RESPONSE_BODY_BYTES,
-                            None,
-                        )
-                        .await
-                        .map_err(|err| -> HttpError {
-                            match err {
-                                crate::response::BodyReadError::TooLarge => {
-                                    Box::new(ResponseBodyTooLarge::new())
-                                }
-                                crate::response::BodyReadError::TimedOut => {
-                                    "OTLP HTTP export timed out".into()
-                                }
-                                crate::response::BodyReadError::Body(e) => Box::new(e),
-                            }
-                        })?;
-                        Ok(http::Response::from_parts(parts, collected))
-                    });
-
-                    let sleep = tokio::time::sleep_until(deadline);
-                    tokio::pin!(sleep);
-                    let mut shutdown_closed = false;
-                    loop {
-                        tokio::select! {
-                            biased;
-                            res = &mut send => {
-                                return res.map(|mut resp| {
-                                    // Strip `Retry-After` once shutdown has started so
-                                    // `opentelemetry-otlp`'s synchronous retry loop cannot
-                                    // `std::thread::sleep` up to 30s on a 429/503 throttle
-                                    // header during graceful teardown.
-                                    if shutdown.borrow_and_update().is_some() {
-                                        resp.headers_mut().remove(http::header::RETRY_AFTER);
+                            .map_err(|err| -> HttpError {
+                                match err {
+                                    crate::response::BodyReadError::TooLarge => {
+                                        Box::new(ResponseBodyTooLarge::new())
                                     }
-                                    resp
-                                });
-                            }
-                            () = &mut sleep => return Err("OTLP HTTP export timed out".into()),
-                            res = shutdown.changed(), if !shutdown_closed => match res {
-                                Ok(()) => {
-                                    if let Some(shutdown_deadline) = *shutdown.borrow_and_update()
-                                        && shutdown_deadline < deadline
-                                    {
-                                        deadline = shutdown_deadline;
-                                        sleep.as_mut().reset(deadline);
+                                    crate::response::BodyReadError::TimedOut => {
+                                        "OTLP HTTP export timed out".into()
                                     }
+                                    crate::response::BodyReadError::Body(e) => Box::new(e),
                                 }
-                                Err(_) => shutdown_closed = true,
-                            },
-                        }
+                            })?;
+                            Ok(http::Response::from_parts(parts, collected))
+                        };
+                        let res = shutdown
+                            .bound(tokio::time::timeout_at(export_deadline, send))
+                            .await
+                            .and_then(Result::ok)
+                            .unwrap_or_else(|| Err("OTLP HTTP export timed out".into()));
+                        res.map(|mut resp| {
+                            // Strip `Retry-After` once shutdown has started so
+                            // `opentelemetry-otlp`'s synchronous retry loop cannot
+                            // `std::thread::sleep` up to 30s on a 429/503 throttle
+                            // header during graceful teardown.
+                            if shutdown.current_deadline().is_some() {
+                                resp.headers_mut().remove(http::header::RETRY_AFTER);
+                            }
+                            resp
+                        })
                     }
-                }
-                .with_subscriber(tracing::dispatcher::Dispatch::none()),
-            ));
+                    .with_subscriber(tracing::dispatcher::Dispatch::none()),
+                ),
+            );
             (&mut handle.0)
                 .await
                 .map_err(|e| -> HttpError { Box::new(e) })?
@@ -206,10 +181,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
 
-    fn test_client(
-        timeout: Duration,
-        shutdown: watch::Receiver<Option<tokio::time::Instant>>,
-    ) -> OtlpHyperClient {
+    fn test_client(timeout: Duration, shutdown: Shutdown) -> OtlpHyperClient {
         OtlpHyperClient {
             client: crate::transport::build_otlp_client(),
             rt: tokio::runtime::Handle::current(),
@@ -301,7 +273,7 @@ mod tests {
             }
         }));
 
-        let (_tx, rx) = watch::channel(None);
+        let (_tx, rx) = crate::lifecycle::shutdown_channel();
         let client = test_client(OTLP_DEFAULT_TIMEOUT, rx);
         let ok_uri = format!("http://{addr}/v1/traces");
         let huge_uri = format!("http://{addr}/huge");
@@ -365,8 +337,8 @@ mod tests {
             }
         }));
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(None);
-        let client = test_client(Duration::from_secs(60), shutdown_rx);
+        let (shutdown_tx, shutdown) = crate::lifecycle::shutdown_channel();
+        let client = test_client(Duration::from_secs(60), shutdown.clone());
         let uri = format!("http://{addr}/v1/metrics");
         let req = post_req(&uri, b"metrics");
 
@@ -377,7 +349,7 @@ mod tests {
             .unwrap();
 
         let started = tokio::time::Instant::now();
-        let _ = shutdown_tx.send(Some(started + Duration::from_millis(40)));
+        shutdown_tx.send(started + Duration::from_millis(40));
         let err = tokio::time::timeout(Duration::from_secs(2), export)
             .await
             .expect("shutdown deadline must preempt 60s OTLP timeout")
@@ -386,13 +358,28 @@ mod tests {
         assert!(err.to_string().contains("timed out"), "unexpected: {err}");
 
         // A retry attempted after the shutdown deadline must fail immediately without dialing.
-        let retry_client = test_client(Duration::from_secs(60), shutdown_tx.subscribe());
+        let retry_client = test_client(Duration::from_secs(60), shutdown);
         let retry_err = retry_client
             .send_bytes(post_req(&uri, b"retry"))
             .await
             .expect_err("post-deadline retry must be rejected upfront");
         assert!(retry_err.to_string().contains("timed out"));
         assert_eq!(accepts.load(Ordering::SeqCst), 1);
+
+        // Dropping `ShutdownTx` without calling `send` (e.g. thread spawn failure on Drop)
+        // must also immediately cancel an in-flight export via `ShutdownTx::drop`.
+        let (drop_tx, drop_shutdown) = crate::lifecycle::shutdown_channel();
+        let drop_client = test_client(Duration::from_secs(60), drop_shutdown);
+        let drop_req = post_req(&uri, b"drop");
+        let drop_export = tokio::spawn(async move { drop_client.send_bytes(drop_req).await });
+        tokio::task::yield_now().await;
+        drop(drop_tx);
+        let drop_err = tokio::time::timeout(Duration::from_secs(2), drop_export)
+            .await
+            .expect("dropping ShutdownTx must preempt 60s OTLP timeout immediately")
+            .unwrap()
+            .expect_err("aborted export must fail with timeout");
+        assert!(drop_err.to_string().contains("timed out"), "{drop_err}");
     }
 
     #[tokio::test]
@@ -415,7 +402,7 @@ mod tests {
             }
         }));
 
-        let (_tx, rx) = watch::channel(None);
+        let (_tx, rx) = crate::lifecycle::shutdown_channel();
         let client = test_client(Duration::from_secs(60), rx);
         let uri = format!("http://{addr}/v1/traces");
         let mut fut = client.send_bytes(post_req(&uri, b"trace"));
@@ -483,8 +470,8 @@ mod tests {
                     let _control = tracing::trace_span!("control").entered();
                     assert_eq!(spans.load(Ordering::SeqCst), 1);
 
-                    let (_tx, rx) = watch::channel(None);
-                    let client = test_client(OTLP_DEFAULT_TIMEOUT, rx);
+                    let (_tx, shutdown) = crate::lifecycle::shutdown_channel();
+                    let client = test_client(OTLP_DEFAULT_TIMEOUT, shutdown);
                     let resp = client.send_bytes(post_req(&uri, b"trace")).await.unwrap();
 
                     // Exercise `NoSubscriberExecutor` directly with an `h2`-style
@@ -536,8 +523,8 @@ mod tests {
         })
         .await;
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(None);
-        let client = test_client(OTLP_DEFAULT_TIMEOUT, shutdown_rx);
+        let (shutdown_tx, shutdown) = crate::lifecycle::shutdown_channel();
+        let client = test_client(OTLP_DEFAULT_TIMEOUT, shutdown.clone());
         let fast_uri = format!("http://{addr}/v1/metrics");
         let slow_uri = format!("http://{addr}/slow");
 
@@ -557,12 +544,12 @@ mod tests {
         // 2. When shutdown activates while an export is already in flight,
         // `Retry-After` is stripped before returning to `opentelemetry-otlp`.
         let inflight = tokio::spawn({
-            let client = test_client(OTLP_DEFAULT_TIMEOUT, shutdown_tx.subscribe());
+            let client = test_client(OTLP_DEFAULT_TIMEOUT, shutdown);
             let req = post_req(&slow_uri, b"inflight");
             async move { client.send_bytes(req).await }
         });
         arrived.notified().await;
-        let _ = shutdown_tx.send(Some(tokio::time::Instant::now() + Duration::from_secs(5)));
+        shutdown_tx.send(tokio::time::Instant::now() + Duration::from_secs(5));
         release.notify_one();
         let inflight_resp = inflight.await.unwrap().unwrap();
         assert_eq!(inflight_resp.status(), StatusCode::TOO_MANY_REQUESTS);

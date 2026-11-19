@@ -6,16 +6,90 @@ mod relay;
 use crate::lifecycle::Lifecycle;
 use crate::metrics::UpstreamLayer;
 use crate::response::{ResBody, empty_body, text_response, uri_too_long_response};
-use crate::state::AppState;
+use crate::state::{AppState, ConnPermitGuard};
 use crate::transport::{WsTarget, configure_tcp_stream};
 use http::{Method, Request, Response, StatusCode, Version};
 use hyper::body::{Body as _, Incoming};
 use hyper_util::rt::TokioIo;
 use relay::{WriteProgressIo, bridge_ws};
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tracing::{debug, warn};
+
+/// Shared TCP permit + single reusable WebSocket slot, allocated only for
+/// WS-enabled servers with a bounded `--max-connections` after protocol preface
+/// succeeds so detached WS relays never retain `Arc<Connection>` / `Arc<AppState>`.
+struct SharedPermit {
+    _permit: OwnedSemaphorePermit,
+    ws_slot_in_use: AtomicBool,
+}
+
+/// Connection-scoped WebSocket state for WS-enabled servers.
+/// `permit` is declared before `lifecycle` so the semaphore permit drops before
+/// releasing the drain token if `Connection` drops standalone.
+pub(crate) struct WsConn {
+    permit: Option<Arc<SharedPermit>>,
+    lifecycle: Lifecycle,
+}
+
+/// Permit bounding concurrent WebSocket relays across both HTTP/1.1 `Upgrade`
+/// and HTTP/2 Extended `CONNECT` streams under `--max-connections`.
+#[must_use = "WebSocket permit is released immediately if dropped"]
+enum WsPermit {
+    Shared(Arc<SharedPermit>),
+    Direct { _guard: ConnPermitGuard },
+}
+
+impl Drop for WsPermit {
+    fn drop(&mut self) {
+        if let Self::Shared(permit) = self {
+            permit.ws_slot_in_use.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl WsConn {
+    pub(crate) fn new(permit: ConnPermitGuard, lifecycle: Lifecycle) -> Self {
+        Self {
+            permit: permit.into_inner().map(|permit| {
+                Arc::new(SharedPermit {
+                    _permit: permit,
+                    ws_slot_in_use: AtomicBool::new(false),
+                })
+            }),
+            lifecycle,
+        }
+    }
+
+    /// Claim a WebSocket concurrency slot:
+    /// - Unlimited `--max-connections 0`: zero heap allocation and zero atomic CAS.
+    /// - HTTP/1.1 `Upgrade` and the first active HTTP/2 Extended `CONNECT` stream
+    ///   share the TCP connection's existing permit via `ws_slot_in_use`.
+    /// - Additional concurrent HTTP/2 Extended `CONNECT` streams acquire dedicated
+    ///   permits from `--max-connections` so multiplex amplification is bounded.
+    fn acquire_permit(&self, state: &AppState) -> Option<WsPermit> {
+        let Some(shared) = &self.permit else {
+            return Some(WsPermit::Direct {
+                _guard: ConnPermitGuard::unlimited(),
+            });
+        };
+        if shared
+            .ws_slot_in_use
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Some(WsPermit::Shared(Arc::clone(shared)))
+        } else {
+            state
+                .try_acquire_permit()
+                .map(|_guard| WsPermit::Direct { _guard })
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HandshakeError {
@@ -178,18 +252,17 @@ fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .read_buffer_size(8 * 1024)
         .write_buffer_size(16 * 1024)
-        .max_write_buffer_size(64 * 1024 * 1024 + 64 * 1024)
+        .max_write_buffer_size(2 * 1024 * 1024)
         .max_message_size(Some(64 * 1024 * 1024))
         .max_frame_size(Some(16 * 1024 * 1024))
 }
 
-pub(crate) async fn upgrade<P: Send + 'static>(
+pub(crate) async fn upgrade(
     req: Request<Incoming>,
     mode: WsMode,
     ws: &WsTarget,
     state: &AppState,
-    lifecycle: &Lifecycle,
-    acquire_permit: impl FnOnce() -> Option<P>,
+    ws_conn: &WsConn,
 ) -> Response<ResBody> {
     if matches!(mode, WsMode::Upgrade) && !req.body().is_end_stream() {
         return text_response(StatusCode::BAD_REQUEST, "invalid websocket upgrade");
@@ -215,7 +288,7 @@ pub(crate) async fn upgrade<P: Send + 'static>(
     let Ok(upstream_uri) = ws.upstream.rewrite_uri(inbound_uri) else {
         return uri_too_long_response();
     };
-    let Some(permit) = acquire_permit() else {
+    let Some(permit) = ws_conn.acquire_permit(state) else {
         return text_response(StatusCode::SERVICE_UNAVAILABLE, "connection limit reached");
     };
     let on_upgrade = hyper::upgrade::on(&mut req);
@@ -283,7 +356,7 @@ pub(crate) async fn upgrade<P: Send + 'static>(
             .headers_mut()
             .insert(http::header::SEC_WEBSOCKET_PROTOCOL, protocol);
     }
-    let lifecycle = lifecycle.clone();
+    let lifecycle = ws_conn.lifecycle.clone();
     let mock_enabled = state.opts.mock_eth_syncing;
     let ws_slot = state.metrics.ws_slot();
     tokio::spawn(lifecycle.run_with(move |shutdown| async move {
@@ -544,5 +617,97 @@ mod tests {
                 "/ws/sub?api_key=secret&tag=1"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ws_conn_reuses_first_slot_caps_amplification_and_skips_alloc_when_unlimited() {
+        use clap::Parser;
+
+        let parsed = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--el-ws-url",
+            "ws://127.0.0.1:8546",
+            "--trust-upstream",
+            "--max-connections",
+            "2",
+        ])
+        .parse_validated()
+        .unwrap();
+        let (state, _) = AppState::start(
+            parsed.opts,
+            parsed.max_connections,
+            parsed.upstreams,
+            parsed.health,
+            crate::metrics::ServerMetrics::default(),
+        )
+        .await;
+        let tcp_permit = state.try_acquire_permit().unwrap();
+        let (_shutdown_tx, lifecycle, _drain) = crate::lifecycle::channel();
+        let ws_conn = WsConn::new(tcp_permit, lifecycle.clone());
+        let state_refs_before = Arc::strong_count(&state);
+
+        // 1st WebSocket stream reuses the connection's own permit (1 left in sem)
+        // without retaining `Arc<AppState>`.
+        let p1 = ws_conn.acquire_permit(&state);
+        assert!(matches!(p1, Some(WsPermit::Shared(_))));
+        assert_eq!(state.conn_limit.available_permits(), Some(1));
+        assert_eq!(Arc::strong_count(&state), state_refs_before);
+
+        // 2nd concurrent H2 Extended CONNECT stream claims the remaining semaphore permit.
+        let p2 = ws_conn.acquire_permit(&state);
+        assert!(matches!(p2, Some(WsPermit::Direct { _guard: ref guard }) if guard.is_bounded()));
+        assert_eq!(state.conn_limit.available_permits(), Some(0));
+
+        // 3rd concurrent stream is rejected instead of amplifying beyond max_connections=2.
+        assert!(ws_conn.acquire_permit(&state).is_none());
+
+        // Dropping p1 releases the connection's included WS slot for reuse.
+        drop(p1);
+        let p1_reused = ws_conn.acquire_permit(&state);
+        assert!(matches!(p1_reused, Some(WsPermit::Shared(_))));
+        drop((p2, p1_reused));
+        assert_eq!(state.conn_limit.available_permits(), Some(1));
+
+        // A detached relay holding the shared slot keeps the TCP permit alive after
+        // `WsConn` drops, then returns it on relay drop.
+        let detached = ws_conn.acquire_permit(&state).unwrap();
+        assert!(matches!(detached, WsPermit::Shared(_)));
+        drop(ws_conn);
+        assert_eq!(state.conn_limit.available_permits(), Some(1));
+        drop(detached);
+        assert_eq!(state.conn_limit.available_permits(), Some(2));
+
+        // Unlimited `--max-connections 0` skips `Arc<SharedPermit>` allocation and CAS.
+        let unlimited = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--el-ws-url",
+            "ws://127.0.0.1:8546",
+            "--trust-upstream",
+            "--max-connections",
+            "0",
+        ])
+        .parse_validated()
+        .unwrap();
+        let (unlimited_state, _) = AppState::start(
+            unlimited.opts,
+            unlimited.max_connections,
+            unlimited.upstreams,
+            unlimited.health,
+            crate::metrics::ServerMetrics::default(),
+        )
+        .await;
+        let unlimited_conn = WsConn::new(
+            unlimited_state.try_acquire_permit().unwrap(),
+            lifecycle.clone(),
+        );
+        assert!(unlimited_conn.permit.is_none());
+        assert!(matches!(
+            unlimited_conn.acquire_permit(&unlimited_state),
+            Some(WsPermit::Direct { _guard: ref guard }) if !guard.is_bounded()
+        ));
     }
 }
