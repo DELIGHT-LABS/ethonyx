@@ -677,46 +677,6 @@ mod tests {
 
     #[test]
     fn rewrite_uri_preserves_paths_queries_and_overrides_for_http_and_ws() {
-        let root_http = HttpUpstream::parse("--cl-beacon-url", "http://127.0.0.1:5052").unwrap();
-        assert_eq!(
-            root_http.rewrite_uri(Uri::from_static("/")).unwrap(),
-            "http://127.0.0.1:5052/"
-        );
-        assert_eq!(
-            root_http
-                .rewrite_uri(Uri::from_static("/eth/v1/node/syncing?foo=1"))
-                .unwrap(),
-            "http://127.0.0.1:5052/eth/v1/node/syncing?foo=1"
-        );
-        let mev_replaced = replace_uri_path(
-            Uri::from_static("/eth/v1/validator/register_validator"),
-            "/eth/v1/builder/validators",
-        )
-        .unwrap();
-        assert_eq!(
-            root_http.rewrite_uri(mev_replaced).unwrap(),
-            "http://127.0.0.1:5052/eth/v1/builder/validators"
-        );
-
-        let prefixed_http =
-            HttpUpstream::parse("--el-http-url", "https://rpc.example.com/rpc?key=a%2Fb").unwrap();
-        assert_eq!(
-            prefixed_http.rewrite_uri(Uri::from_static("/")).unwrap(),
-            "https://rpc.example.com/rpc?key=a%2Fb"
-        );
-        assert_eq!(
-            prefixed_http
-                .rewrite_uri(Uri::from_static("/?tag=a%2Fb"))
-                .unwrap(),
-            "https://rpc.example.com/rpc?key=a%2Fb&tag=a%2Fb"
-        );
-        assert_eq!(
-            prefixed_http
-                .rewrite_uri(Uri::from_static("/rpc/extra?tag=a%2Fb"))
-                .unwrap(),
-            "https://rpc.example.com/rpc/rpc/extra?key=a%2Fb&tag=a%2Fb"
-        );
-
         let root_ws = WsUpstream::parse("--el-ws-url", "ws://127.0.0.1:8546").unwrap();
         assert_eq!(
             root_ws.rewrite_uri(Uri::from_static("/")).unwrap(),
@@ -772,6 +732,24 @@ mod tests {
             ("http://127.0.0.1:8545/rpc/", "/", None, "/rpc/"),
             ("http://127.0.0.1:8545/rpc/", "/?tag=1", None, "/rpc/?tag=1"),
             (
+                "https://rpc.example.com/rpc?key=a%2Fb",
+                "/",
+                None,
+                "/rpc?key=a%2Fb",
+            ),
+            (
+                "https://rpc.example.com/rpc?key=a%2Fb",
+                "/?tag=a%2Fb",
+                None,
+                "/rpc?key=a%2Fb&tag=a%2Fb",
+            ),
+            (
+                "https://rpc.example.com/rpc?key=a%2Fb",
+                "/rpc/extra?tag=a%2Fb",
+                None,
+                "/rpc/rpc/extra?key=a%2Fb&tag=a%2Fb",
+            ),
+            (
                 "http://127.0.0.1:8545/rpc?api_key=secret",
                 "/",
                 None,
@@ -819,6 +797,12 @@ mod tests {
                 Some("/eth/v1/builder/validators"),
                 "/prefix/eth/v1/builder/validators?api_key=secret&tag=1",
             ),
+            (
+                "https://relay.example",
+                "/eth/v1/validator/register_validator",
+                Some("/eth/v1/builder/validators"),
+                "/eth/v1/builder/validators",
+            ),
         ] {
             let upstream = HttpUpstream::parse("--el-http-url", base).unwrap();
             let inbound_uri: Uri = inbound.parse().unwrap();
@@ -832,6 +816,9 @@ mod tests {
                 expected,
                 "base={base}, inbound={inbound}, override={override_path:?}"
             );
+            let base_uri: Uri = base.parse().unwrap();
+            assert_eq!(uri.scheme(), base_uri.scheme(), "base={base}");
+            assert_eq!(uri.authority(), base_uri.authority(), "base={base}");
         }
     }
 }

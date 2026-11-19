@@ -304,6 +304,7 @@ mod tests {
     fn subprotocol_offers_preserve_all_lines_and_reject_invalid_tokens() {
         for (values, expected) in [
             (vec![], Some("")),
+            (vec![" first\t"], Some("first")),
             (vec!["first", "second, Third"], Some("first, second, Third")),
             (
                 vec![" first\t,second ", "THIRD"],

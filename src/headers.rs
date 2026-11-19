@@ -162,54 +162,33 @@ mod tests {
     }
 
     #[test]
-    fn removes_known_hop_by_hop() {
-        let mut m = h(&[
+    fn strip_hop_by_hop_removes_standard_and_nominated_headers_preserving_others() {
+        let mut empty = HeaderMap::new();
+        strip_hop_by_hop(&mut empty);
+        assert!(empty.is_empty());
+
+        let mut known = h(&[
             ("host", "example.com"),
             ("connection", "keep-alive, TE"),
             ("te", "trailers"),
+            ("trailer", "expires"),
+            ("trailers", "legacy"),
             ("content-length", "42"),
             ("transfer-encoding", "chunked"),
             ("upgrade", "websocket"),
             ("content-type", "application/json"),
-        ]);
-        strip_hop_by_hop(&mut m);
-        assert!(!m.contains_key("host"));
-        assert!(!m.contains_key("connection"));
-        assert!(!m.contains_key("te"));
-        assert!(!m.contains_key("content-length"));
-        assert!(!m.contains_key("transfer-encoding"));
-        assert!(!m.contains_key("upgrade"));
-        assert!(m.contains_key("content-type"));
-    }
-
-    #[test]
-    fn is_case_insensitive_via_canonical_lookup() {
-        let mut m = h(&[("Host", "x"), ("CONNECTION", "close"), ("Close", "1")]);
-        strip_hop_by_hop(&mut m);
-        assert!(m.is_empty());
-    }
-
-    #[test]
-    fn empty_map_is_noop() {
-        let mut m: HeaderMap<HeaderValue> = HeaderMap::new();
-        strip_hop_by_hop(&mut m);
-        assert!(m.is_empty());
-    }
-
-    #[test]
-    fn preserves_unrelated_headers() {
-        let mut m = h(&[
             ("authorization", "Bearer x"),
-            ("x-custom", "1"),
-            ("user-agent", "ethonyx"),
         ]);
-        strip_hop_by_hop(&mut m);
-        assert_eq!(m.len(), 3);
-    }
+        strip_hop_by_hop(&mut known);
+        assert_eq!(known.len(), 2);
+        assert_eq!(known["content-type"], "application/json");
+        assert_eq!(known["authorization"], "Bearer x");
 
-    #[test]
-    fn removes_options_from_every_connection_field() {
-        let mut m = h(&[
+        let mut upper = h(&[("Host", "x"), ("CONNECTION", "close"), ("Close", "1")]);
+        strip_hop_by_hop(&mut upper);
+        assert!(upper.is_empty());
+
+        let mut multi = h(&[
             ("connection", "keep-alive, X-One, , connection"),
             ("connection", "\tX-TWO\t, X-One"),
             ("x-one", "first"),
@@ -218,26 +197,23 @@ mod tests {
             ("proxy-connection", "keep-alive"),
             ("authorization", "Bearer token"),
         ]);
-        strip_hop_by_hop(&mut m);
-        assert_eq!(m.len(), 1);
-        assert_eq!(m["authorization"], "Bearer token");
-    }
+        strip_hop_by_hop(&mut multi);
+        assert_eq!(multi.len(), 1);
+        assert_eq!(multi["authorization"], "Bearer token");
 
-    #[test]
-    fn invalid_options_do_not_hide_valid_options() {
-        let mut m = h(&[
+        let mut malformed = h(&[
             ("connection", "bad option, x-remove, :invalid, ,"),
             ("x-remove", "removed"),
             ("x-keep", "kept"),
         ]);
-        m.append(
+        malformed.append(
             CONNECTION,
             HeaderValue::from_bytes(b"\xff, x-last").unwrap(),
         );
-        m.insert("x-last", HeaderValue::from_static("removed"));
-        strip_hop_by_hop(&mut m);
-        assert_eq!(m.len(), 1);
-        assert_eq!(m["x-keep"], "kept");
+        malformed.insert("x-last", HeaderValue::from_static("removed"));
+        strip_hop_by_hop(&mut malformed);
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed["x-keep"], "kept");
     }
 
     #[test]

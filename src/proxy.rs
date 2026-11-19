@@ -630,46 +630,6 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_request() {
-        // 1. CL Path HTTP request
-        let req = Request::builder()
-            .uri("/eth/v1/node/syncing")
-            .body(())
-            .unwrap();
-        assert_eq!(classify_request(&req), Route::Proxy(Target::Cl));
-
-        // 2. EL Path HTTP request
-        let req = Request::builder().uri("/").body(()).unwrap();
-        assert_eq!(classify_request(&req), Route::Proxy(Target::El));
-
-        // 3. WS HTTP/1.1 Upgrade request
-        let req = Request::builder()
-            .uri("/")
-            .header("connection", "upgrade")
-            .header("upgrade", "websocket")
-            .body(())
-            .unwrap();
-        assert_eq!(
-            classify_request(&req),
-            Route::Proxy(Target::WebSocket(WsMode::Upgrade))
-        );
-
-        // 4. WS HTTP/2 Extended CONNECT request
-        let mut req = Request::builder()
-            .version(Version::HTTP_2)
-            .method(Method::CONNECT)
-            .uri("/")
-            .body(())
-            .unwrap();
-        req.extensions_mut()
-            .insert(hyper::ext::Protocol::from_static("websocket"));
-        assert_eq!(
-            classify_request(&req),
-            Route::Proxy(Target::WebSocket(WsMode::ExtendedConnect))
-        );
-    }
-
-    #[test]
     fn routing_preserves_probe_and_cl_precedence() {
         for (path, probe) in [
             ("/healthz", Probe::Health),
@@ -749,6 +709,25 @@ mod tests {
             .insert(hyper::ext::Protocol::from_static("other"));
         assert_eq!(classify_request(&req), Route::Reject);
 
+        let root_get = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(())
+            .unwrap();
+        assert_eq!(classify_request(&root_get), Route::Proxy(Target::El));
+
+        let root_ws = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header("connection", "keep-alive, Upgrade")
+            .header("upgrade", "WebSocket")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            classify_request(&root_ws),
+            Route::Proxy(Target::WebSocket(WsMode::Upgrade))
+        );
+
         let asterisk = Request::builder()
             .method(Method::OPTIONS)
             .uri("*")
@@ -772,6 +751,12 @@ mod tests {
         // Non-eth_syncing request should return None
         let req = r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":101}"#;
         assert!(try_mock_eth_syncing(req.as_bytes()).is_none());
+
+        // Notification eth_syncing returns 204 No Content with an empty body
+        let notif = r#"{"jsonrpc":"2.0","method":"eth_syncing"}"#;
+        let res = try_mock_eth_syncing(notif.as_bytes()).unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(res.body().is_end_stream());
 
         // Batch eth_syncing request
         let batch = r#"[{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}]"#;

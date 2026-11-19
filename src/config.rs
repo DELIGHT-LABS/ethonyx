@@ -126,7 +126,7 @@ pub struct Config {
     pub el_max_reference_lag: Option<u64>,
 
     /// Interval between background `--el-reference-url` polls (seconds; defaults to 3
-    /// when `--el-reference-url` is set; must be at least 1).
+    /// when `--el-reference-url` is set; must be at least 1 on the CLI).
     #[arg(long, env = "ETHONYX_EL_REFERENCE_POLL_INTERVAL", value_parser = parse_secs)]
     pub el_reference_poll_interval: Option<Duration>,
 
@@ -168,7 +168,7 @@ pub struct Config {
 
     /// Interval between background health polls (seconds). `/healthz` and
     /// `/readyz` serve the latest poll, so upstream load stays constant
-    /// regardless of probe rate. Must be at least 1 second.
+    /// regardless of probe rate. Must be at least 1 second on the CLI.
     #[arg(long, env = "ETHONYX_HEALTH_POLL_INTERVAL", default_value = "1", value_parser = parse_secs)]
     pub health_poll_interval: Duration,
 
@@ -241,7 +241,7 @@ pub struct Config {
     )]
     pub mock_cl_node_health: bool,
 
-    /// Upstream timeout for proxied requests (seconds; must be at least 1).
+    /// Upstream timeout for proxied requests (seconds; must be at least 1 on the CLI).
     #[arg(long, env = "ETHONYX_PROXY_TIMEOUT", default_value = "60", value_parser = parse_secs)]
     pub proxy_timeout: Duration,
 
@@ -549,6 +549,8 @@ impl Config {
             ("shutdown-grace", Some(self.shutdown_grace), true),
         ] {
             if let Some(dur) = dur {
+                // CLI flags parse whole seconds (`parse_secs`), so `!is_zero()` enforces `>= 1s`
+                // on the CLI while deliberately allowing sub-second `Duration`s via library `Config`.
                 if !allow_zero && dur.is_zero() {
                     return Err(format!("{name} must be greater than zero").into());
                 }
@@ -769,32 +771,6 @@ fn parse_secs(s: &str) -> Result<Duration, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn presets_match_known_genesis_times() {
-        assert_eq!(Network::Mainnet.preset_genesis_time(), Some(1_606_824_023));
-        assert_eq!(Network::Hoodi.preset_genesis_time(), Some(1_742_213_400));
-        assert_eq!(Network::Sepolia.preset_genesis_time(), Some(1_655_733_600));
-        assert_eq!(Network::Holesky.preset_genesis_time(), Some(1_695_902_400));
-    }
-
-    #[test]
-    fn presets_use_ethereum_slot_duration() {
-        for n in [
-            Network::Mainnet,
-            Network::Hoodi,
-            Network::Sepolia,
-            Network::Holesky,
-        ] {
-            assert_eq!(n.preset_seconds_per_slot(), Some(12));
-        }
-    }
-
-    #[test]
-    fn custom_has_no_presets() {
-        assert_eq!(Network::Custom.preset_genesis_time(), None);
-        assert_eq!(Network::Custom.preset_seconds_per_slot(), None);
-    }
-
     fn parse(extra: &[&str]) -> Config {
         let mut argv = vec!["ethonyx"];
         if !extra.contains(&"--el-http-url") {
@@ -805,8 +781,20 @@ mod tests {
     }
 
     #[test]
-    fn explicit_genesis_overrides_network_preset() {
-        let parsed = parse(&[
+    fn network_presets_and_slot_clock_resolution() {
+        for (net, genesis) in [
+            (Network::Mainnet, 1_606_824_023),
+            (Network::Hoodi, 1_742_213_400),
+            (Network::Sepolia, 1_655_733_600),
+            (Network::Holesky, 1_695_902_400),
+        ] {
+            assert_eq!(net.preset_genesis_time(), Some(genesis));
+            assert_eq!(net.preset_seconds_per_slot(), Some(12));
+        }
+        assert_eq!(Network::Custom.preset_genesis_time(), None);
+        assert_eq!(Network::Custom.preset_seconds_per_slot(), None);
+
+        let override_gen = parse(&[
             "--cl-beacon-url",
             "http://127.0.0.1:5052",
             "--network",
@@ -817,14 +805,11 @@ mod tests {
         .parse_validated()
         .unwrap();
         assert_eq!(
-            parsed.health.policy().unwrap().slot_clock,
+            override_gen.health.policy().unwrap().slot_clock,
             SlotClock::new(999, 12)
         );
-    }
 
-    #[test]
-    fn network_preset_used_when_genesis_not_provided() {
-        let parsed = parse(&[
+        let sepolia = parse(&[
             "--cl-beacon-url",
             "http://127.0.0.1:5052",
             "--network",
@@ -833,40 +818,39 @@ mod tests {
         .parse_validated()
         .unwrap();
         assert_eq!(
-            parsed.health.policy().unwrap().slot_clock,
+            sepolia.health.policy().unwrap().slot_clock,
             SlotClock::new(1_655_733_600, 12)
         );
-    }
 
-    #[test]
-    fn custom_without_genesis_fails() {
-        assert!(
-            parse(&[
+        for missing in [
+            &[
                 "--cl-beacon-url",
                 "http://127.0.0.1:5052",
                 "--network",
                 "custom",
-            ])
-            .validate()
-            .is_err()
-        );
-        assert!(
-            parse(&[
+            ][..],
+            &[
                 "--cl-beacon-url",
                 "http://127.0.0.1:5052",
                 "--network",
                 "custom",
                 "--cl-genesis-time",
                 "1700000000",
-            ])
-            .validate()
-            .is_err()
-        );
-    }
+            ],
+            // Slot length given, genesis missing: only the missing-genesis check rejects this.
+            &[
+                "--cl-beacon-url",
+                "http://127.0.0.1:5052",
+                "--network",
+                "custom",
+                "--cl-seconds-per-slot",
+                "12",
+            ],
+        ] {
+            assert!(parse(missing).validate().is_err(), "{missing:?}");
+        }
 
-    #[test]
-    fn custom_with_explicit_values_resolves() {
-        let parsed = parse(&[
+        let custom = parse(&[
             "--cl-beacon-url",
             "http://127.0.0.1:5052",
             "--network",
@@ -879,14 +863,11 @@ mod tests {
         .parse_validated()
         .unwrap();
         assert_eq!(
-            parsed.health.policy().unwrap().slot_clock,
+            custom.health.policy().unwrap().slot_clock,
             SlotClock::new(1_700_000_000, 6)
         );
-    }
 
-    #[test]
-    fn cl_genesis_zero_disables_check_but_still_resolves() {
-        let parsed = parse(&[
+        let disabled = parse(&[
             "--cl-beacon-url",
             "http://127.0.0.1:5052",
             "--cl-genesis-time",
@@ -894,71 +875,34 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        assert!(parsed.upstreams.cl.is_some());
-        assert_eq!(parsed.health.policy().unwrap().slot_clock, None);
+        assert!(disabled.upstreams.cl.is_some());
+        assert_eq!(disabled.health.policy().unwrap().slot_clock, None);
     }
 
     #[test]
-    fn listen_accepts_repeated_flag() {
-        let cfg = parse(&["--listen", "127.0.0.1:1", "--listen", "127.0.0.1:2"]);
-        assert_eq!(cfg.listen, vec!["127.0.0.1:1", "127.0.0.1:2"]);
-    }
+    fn cli_defaults_and_flag_forms() {
+        let def = parse(&[]);
+        assert!(!def.readyz_strict);
+        assert!(!def.access_log);
+        assert!(!def.trust_upstream);
+        assert_eq!(def.health_poll_interval, Duration::from_secs(1));
+        assert_eq!(def.log_level, "info");
 
-    #[test]
-    fn listen_accepts_comma_separated() {
-        let cfg = parse(&["--listen", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3"]);
-        assert_eq!(cfg.listen.len(), 3);
-        assert_eq!(cfg.listen[2], "127.0.0.1:3");
-    }
-
-    #[test]
-    fn readyz_strict_defaults_off() {
-        assert!(!parse(&[]).readyz_strict);
-    }
-
-    #[test]
-    fn readyz_strict_bare_flag_enables() {
         assert!(parse(&["--readyz-strict"]).readyz_strict);
-    }
-
-    #[test]
-    fn readyz_strict_accepts_explicit_bool() {
         assert!(parse(&["--readyz-strict", "true"]).readyz_strict);
         assert!(!parse(&["--readyz-strict", "false"]).readyz_strict);
-    }
-
-    #[test]
-    fn health_poll_interval_defaults_to_1s() {
-        assert_eq!(parse(&[]).health_poll_interval, Duration::from_secs(1));
-    }
-
-    #[test]
-    fn log_level_defaults_to_info() {
-        assert_eq!(parse(&[]).log_level, "info");
-    }
-
-    #[test]
-    fn access_log_defaults_off() {
-        assert!(!parse(&[]).access_log);
-    }
-
-    #[test]
-    fn access_log_bare_flag_enables() {
         assert!(parse(&["--access-log"]).access_log);
-    }
-
-    #[test]
-    fn trust_upstream_defaults_off() {
-        assert!(!parse(&[]).trust_upstream);
-    }
-
-    #[test]
-    fn trust_upstream_bare_flag_enables() {
         assert!(parse(&["--trust-upstream"]).trust_upstream);
-    }
 
-    #[test]
-    fn log_level_rejects_unknown_value() {
+        assert_eq!(
+            parse(&["--listen", "127.0.0.1:1", "--listen", "127.0.0.1:2"]).listen,
+            vec!["127.0.0.1:1", "127.0.0.1:2"]
+        );
+        assert_eq!(
+            parse(&["--listen", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3"]).listen,
+            vec!["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"]
+        );
+
         let argv = [
             "ethonyx",
             "--el-http-url",
@@ -967,19 +911,12 @@ mod tests {
         ];
         assert!(Config::try_parse_from(argv.into_iter().chain(["info"])).is_ok());
         assert!(Config::try_parse_from(argv.into_iter().chain(["bogus"])).is_err());
-    }
 
-    #[test]
-    fn parse_secs_accepts_integer() {
-        assert_eq!(parse_secs("30").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_secs("0").unwrap(), Duration::from_secs(0));
-    }
-
-    #[test]
-    fn parse_secs_rejects_non_integer() {
-        assert!(parse_secs("abc").is_err());
-        assert!(parse_secs("3.14").is_err());
-        assert!(parse_secs("-1").is_err());
+        assert_eq!(parse_secs("30"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_secs("0"), Ok(Duration::from_secs(0)));
+        for bad in ["abc", "3.14", "-1"] {
+            assert!(parse_secs(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1222,15 +1159,9 @@ mod tests {
             ("--health-poll-interval", "0", "health-poll-interval"),
             ("--health-timeout", "0", "health-timeout"),
             ("--proxy-timeout", "0", "proxy-timeout"),
-            ("--cl-seconds-per-slot", "0", "cl-seconds-per-slot"),
             ("--el-http-url", "ws://127.0.0.1:8545", "--el-http-url"),
             ("--el-ws-url", "http://127.0.0.1:8546", "--el-ws-url"),
             ("--cl-beacon-url", "ws://127.0.0.1:5052", "--cl-beacon-url"),
-            (
-                "--cl-mev-relay-url",
-                "wss://127.0.0.1:18550",
-                "--cl-mev-relay-url",
-            ),
             ("--otel-endpoint", "http://:4318", "--otel-endpoint"),
         ] {
             let err = parse(&[flag, val])
@@ -1274,11 +1205,27 @@ mod tests {
             .validate()
             .is_ok()
         );
+
+        // Dependent zero-duration checks that require their prerequisite URL flag.
+        let ref_zero = parse(&[
+            "--el-reference-url",
+            "http://127.0.0.1:8546",
+            "--el-reference-poll-interval",
+            "0",
+        ])
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            ref_zero.contains("el-reference-poll-interval")
+                && ref_zero.contains("greater than zero"),
+            "{ref_zero}"
+        );
         assert!(
             parse(&[
+                "--trust-upstream",
                 "--cl-beacon-url",
                 "http://127.0.0.1:5052",
-                "--trust-upstream",
                 "--cl-seconds-per-slot",
                 "0",
             ])
@@ -1308,7 +1255,6 @@ mod tests {
                 .to_string();
             assert!(err.contains("otel"), "unexpected error: {err}");
         }
-
         // Upper-bound checks prevent `Instant::now() + duration` panics via both CLI and library Config.
         assert_eq!(parse_secs(&MAX_TIMEOUT_SECS.to_string()), Ok(MAX_TIMEOUT));
         assert!(parse_secs(&(MAX_TIMEOUT_SECS + 1).to_string()).is_err());
@@ -1321,6 +1267,15 @@ mod tests {
                 .to_string()
                 .contains("shutdown-grace")
         );
+
+        // Library `Config` deliberately accepts non-zero sub-second `Duration`s even though
+        // CLI flags parse integer seconds.
+        let mut sub_sec = parse(&["--el-reference-url", "http://127.0.0.1:8546"]);
+        sub_sec.health_poll_interval = Duration::from_millis(50);
+        sub_sec.health_timeout = Duration::from_millis(150);
+        sub_sec.proxy_timeout = Duration::from_millis(250);
+        sub_sec.el_reference_poll_interval = Some(Duration::from_millis(60));
+        assert!(sub_sec.validate().is_ok());
     }
 
     #[tokio::test]
