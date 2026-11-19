@@ -245,8 +245,8 @@ mod tests {
                 } else {
                     request.clone()
                 };
-                for padding in [0, 512] {
-                    let input = format!("{input}{}", " ".repeat(padding));
+                for (lead, padding) in [("", 0), ("", 512), (" \t\r\n", 0)] {
+                    let input = format!("{lead}{input}{}", " ".repeat(padding));
                     let expected = if local {
                         let reply = r#"{"jsonrpc":"2.0","id":7,"result":false}"#;
                         MockResult::Reply(if batch {
@@ -268,6 +268,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","params":["0xdeadbeef","latest"],"method":"eth_syncing","id":7}"#,
             r#"{"jsonrpc":"2.0","params":{},"method":"eth_syncing","id":7}"#,
             r#"{"jsonrpc":"2.0","params":[INVALID"#,
+            "\x0c{\"jsonrpc\":\"2.0\",\"method\":\"eth_syncing\",\"id\":7}",
         ] {
             assert_eq!(mock_syncing(input.as_bytes()), MockResult::Forward);
         }
