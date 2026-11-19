@@ -196,7 +196,7 @@ pub(crate) async fn upgrade<P: Send + 'static>(
 ) -> Result<Response<ResBody>, BoxError> {
     let (parts, _body) = req.into_parts();
     let mut req = Request::from_parts(parts, ());
-    let mut response = match mode.response(&mut req, state.otel_enabled) {
+    let mut response = match mode.response(&mut req, state.opts.otel_enabled) {
         Ok(response) => response,
         Err(_) => {
             return Ok(text_response(

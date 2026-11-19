@@ -1,341 +1,362 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ::metrics::{Counter, Gauge, Histogram, KeyName, SharedString, Unit};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
+use ::metrics::{Counter, Gauge, Histogram};
+use metrics_exporter_prometheus::{
+    Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
+};
+
+use crate::otel::{OtelActiveGuard, OtelMetrics};
 
 pub(crate) const ACTIVE_CONNECTIONS: &str = "ethonyx_active_connections";
+pub(crate) const CONNECTION_LIMIT_SATURATED: &str = "ethonyx_connection_limit_saturated_total";
+pub(crate) const PROXY_REQUEST_DURATION: &str = "ethonyx_proxy_request_duration_seconds";
+pub(crate) const PROXY_REQUESTS_TOTAL: &str = "ethonyx_proxy_requests_total";
 
-/// A recorder that can live in `Arc<AppState>` and be shared across tasks.
-pub(crate) type DynRecorder = Box<dyn ::metrics::Recorder + Send + Sync>;
+/// Explicit histogram buckets (seconds) shared by Prometheus and OpenTelemetry for
+/// RPC/Beacon proxy latencies so `histogram_quantile()` aggregates accurately across replicas.
+pub(crate) const LATENCY_BUCKETS: [f64; 11] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
-/// This server's recorder. Handles are registered through it and never through
-/// the process-global `metrics` recorder.
-struct LocalRecorder(DynRecorder);
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnProtocol {
+    Tcp = 0,
+    // Must remain last; `Self::COUNT` is derived from this variant.
+    Ws = 1,
+}
 
-impl LocalRecorder {
-    fn with<T>(&self, f: impl FnOnce() -> T) -> T {
-        ::metrics::with_local_recorder(&*self.0, f)
+impl ConnProtocol {
+    const COUNT: usize = Self::Ws as usize + 1;
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Ws => "ws",
+        }
     }
 }
 
-struct PairRecorder {
-    primary: PrometheusRecorder,
-    secondary: DynRecorder,
+/// Unarmed Prometheus + OpenTelemetry active-connection handle.
+///
+/// Captured before `tokio::spawn` for WebSocket relays so sessions activate the `ws`
+/// gauge only after `on_upgrade` succeeds without retaining `Arc<AppState>`.
+#[must_use]
+pub(crate) struct ActiveGauge {
+    prom: Gauge,
+    otel: OtelActiveGuard,
 }
 
-struct PairCounter(Counter, Counter);
-
-impl ::metrics::CounterFn for PairCounter {
-    fn increment(&self, value: u64) {
-        self.0.increment(value);
-        self.1.increment(value);
-    }
-
-    fn absolute(&self, value: u64) {
-        self.0.absolute(value);
-        self.1.absolute(value);
-    }
-}
-
-struct PairGauge(Gauge, Gauge);
-
-impl ::metrics::GaugeFn for PairGauge {
-    fn increment(&self, value: f64) {
-        self.0.increment(value);
-        self.1.increment(value);
-    }
-
-    fn decrement(&self, value: f64) {
-        self.0.decrement(value);
-        self.1.decrement(value);
-    }
-
-    fn set(&self, value: f64) {
-        self.0.set(value);
-        self.1.set(value);
+impl ActiveGauge {
+    pub(crate) fn activate(self) -> ActiveConnectionGuard {
+        self.prom.increment(1.0);
+        self.otel.add(1);
+        ActiveConnectionGuard(self)
     }
 }
 
-struct PairHistogram(Histogram, Histogram);
-
-impl ::metrics::HistogramFn for PairHistogram {
-    fn record(&self, value: f64) {
-        self.0.record(value);
-        self.1.record(value);
-    }
-}
-
-impl ::metrics::Recorder for PairRecorder {
-    // OTel ignores descriptions; forward by move to Prometheus without cloning.
-    fn describe_counter(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        self.primary.describe_counter(key, unit, description);
-    }
-
-    fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        self.primary.describe_gauge(key, unit, description);
-    }
-
-    fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        self.primary.describe_histogram(key, unit, description);
-    }
-
-    fn register_counter(
-        &self,
-        key: &::metrics::Key,
-        metadata: &::metrics::Metadata<'_>,
-    ) -> Counter {
-        Counter::from_arc(std::sync::Arc::new(PairCounter(
-            self.primary.register_counter(key, metadata),
-            self.secondary.register_counter(key, metadata),
-        )))
-    }
-
-    fn register_gauge(&self, key: &::metrics::Key, metadata: &::metrics::Metadata<'_>) -> Gauge {
-        Gauge::from_arc(std::sync::Arc::new(PairGauge(
-            self.primary.register_gauge(key, metadata),
-            self.secondary.register_gauge(key, metadata),
-        )))
-    }
-
-    fn register_histogram(
-        &self,
-        key: &::metrics::Key,
-        metadata: &::metrics::Metadata<'_>,
-    ) -> Histogram {
-        Histogram::from_arc(std::sync::Arc::new(PairHistogram(
-            self.primary.register_histogram(key, metadata),
-            self.secondary.register_histogram(key, metadata),
-        )))
-    }
-}
-
-pub(crate) struct ActiveConnectionGuard(Gauge);
-
-impl ActiveConnectionGuard {
-    fn new(gauge: Gauge) -> Self {
-        gauge.increment(1.0);
-        Self(gauge)
-    }
-}
+/// Armed active-connection guard that decrements both gauges on drop.
+#[must_use]
+pub(crate) struct ActiveConnectionGuard(ActiveGauge);
 
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
-        self.0.decrement(1.0);
+        self.0.prom.decrement(1.0);
+        self.0.otel.add(-1);
     }
 }
 
-/// Deferred WebSocket gauge handle captured before `tokio::spawn` so upgraded
-/// sessions activate the `ws` gauge only after `on_upgrade` succeeds without
-/// retaining `Arc<AppState>` across the relay's lifetime.
-pub(crate) struct WsConnectionSlot(Gauge);
-
-impl WsConnectionSlot {
-    pub(crate) fn activate(self) -> ActiveConnectionGuard {
-        ActiveConnectionGuard::new(self.0)
-    }
-}
-
-#[repr(usize)]
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UpstreamLayer {
     El = 0,
+    // Must remain last; `Self::COUNT` is derived from this variant.
     Cl = 1,
 }
 
 impl UpstreamLayer {
+    const COUNT: usize = Self::Cl as usize + 1;
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::El => "EL",
             Self::Cl => "CL",
         }
     }
+
+    pub(crate) const fn as_lower_str(self) -> &'static str {
+        match self {
+            Self::El => "el",
+            Self::Cl => "cl",
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MethodBucket {
+    Post = 0,
+    Get,
+    Connect,
+    Head,
+    Put,
+    Delete,
+    Options,
+    Patch,
+    Trace,
+    // Must remain last; `Self::COUNT` is derived from this variant.
+    Other,
+}
+
+impl MethodBucket {
+    const COUNT: usize = Self::Other as usize + 1;
+
+    pub(crate) fn classify(m: &http::Method) -> Self {
+        match *m {
+            http::Method::POST => Self::Post,
+            http::Method::GET => Self::Get,
+            http::Method::CONNECT => Self::Connect,
+            http::Method::HEAD => Self::Head,
+            http::Method::PUT => Self::Put,
+            http::Method::DELETE => Self::Delete,
+            http::Method::OPTIONS => Self::Options,
+            http::Method::PATCH => Self::Patch,
+            http::Method::TRACE => Self::Trace,
+            _ => Self::Other,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Post => "POST",
+            Self::Get => "GET",
+            Self::Connect => "CONNECT",
+            Self::Head => "HEAD",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+            Self::Options => "OPTIONS",
+            Self::Patch => "PATCH",
+            Self::Trace => "TRACE",
+            Self::Other => "OTHER",
+        }
+    }
+}
+
+macro_rules! define_tracked_statuses {
+    ($($code:literal),+ $(,)?) => {
+        /// Status codes that get their own `ethonyx_proxy_requests_total` series (`58` bytes,
+        /// strictly sorted for `binary_search`). Every other code shares the trailing
+        /// `status="OTHER"` slot, which bounds the label set.
+        const TRACKED_STATUS: &[u16] = &[$($code),+];
+        const STATUS_SLOTS: usize = TRACKED_STATUS.len() + 1;
+        const STATUS_LABELS: [&str; STATUS_SLOTS] = [$(stringify!($code)),+, "OTHER"];
+    };
+}
+
+define_tracked_statuses![
+    101, 200, 201, 202, 204, 206, 301, 302, 304, 307, 308, 400, 401, 403, 404, 405, 408, 409, 413,
+    414, 415, 417, 422, 429, 500, 501, 502, 503, 504,
+];
+
+const _: () = {
+    let mut i = 1;
+    while i < TRACKED_STATUS.len() {
+        assert!(TRACKED_STATUS[i - 1] < TRACKED_STATUS[i]);
+        i += 1;
+    }
+};
+
+fn status_slot(status: u16) -> usize {
+    TRACKED_STATUS
+        .binary_search(&status)
+        .unwrap_or(TRACKED_STATUS.len())
+}
+
+const REQUEST_SLOTS: usize = UpstreamLayer::COUNT * MethodBucket::COUNT * STATUS_SLOTS;
+
+const fn request_slot(layer: UpstreamLayer, method: MethodBucket, status_slot: usize) -> usize {
+    (layer as usize * MethodBucket::COUNT + method as usize) * STATUS_SLOTS + status_slot
 }
 
 /// Per-server metric registry and lazily cached hot-path handles.
 ///
-/// Each [`crate::Bound`] server owns its own [`PrometheusRecorder`] (plus an
-/// optional OTel fanout layer), isolating `/metrics` output, upkeep, and OTel
-/// metric export per instance while keeping steady-state HTTP and WebSocket
-/// traffic on single-atomic-load [`OnceLock`] handles without global state.
+/// Each [`crate::Bound`] server owns its own concrete [`PrometheusRecorder`] plus a
+/// typed [`OtelMetrics`] fanout (zero-sized when `otel` is disabled), isolating `/metrics`
+/// output, upkeep, and OTel export per instance with zero `Recorder` virtual dispatch or
+/// per-series wrapper allocations. Every finite Prometheus series sits behind a dedicated [`OnceLock`]
+/// so steady-state traffic costs a single atomic load.
 pub(crate) struct ServerMetrics {
-    recorder: LocalRecorder,
-    prometheus: PrometheusHandle,
-    active_tcp: OnceLock<Gauge>,
-    active_ws: OnceLock<Gauge>,
+    prometheus: PrometheusRecorder,
+    prometheus_handle: PrometheusHandle,
+    otel: OtelMetrics,
+    active: [OnceLock<Gauge>; ConnProtocol::COUNT],
     saturated: OnceLock<Counter>,
-    duration: [OnceLock<Histogram>; 2],
-    /// `[upstream: EL=0 | CL=1][method: POST=0 | GET=1 | CONNECT=2 | HEAD=3][status: 8 hot codes]`
-    requests: [[[OnceLock<Counter>; 8]; 4]; 2],
+    duration: [OnceLock<Histogram>; UpstreamLayer::COUNT],
+    /// Flat `(UpstreamLayer, MethodBucket, status slot)` table (`2 × 10 × 30 = 600` slots,
+    /// ~14 KiB) initialized directly on the heap; uncalled slots remain uninitialized and
+    /// are never registered or exported.
+    requests: Box<[OnceLock<Counter>]>,
     health: [OnceLock<Gauge>; HealthGauge::COUNT],
 }
 
+impl Default for ServerMetrics {
+    fn default() -> Self {
+        Self::new(OtelMetrics::disabled())
+    }
+}
+
 impl ServerMetrics {
-    /// `secondary`, when present, mirrors every registered series into OTel.
-    pub(crate) fn new(secondary: Option<DynRecorder>) -> Self {
-        let primary = PrometheusBuilder::new().build_recorder();
-        let prometheus = primary.handle();
-        let recorder: DynRecorder = match secondary {
-            Some(secondary) => Box::new(PairRecorder { primary, secondary }),
-            None => Box::new(primary),
-        };
+    pub(crate) fn new(otel: OtelMetrics) -> Self {
+        let prometheus = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Full(PROXY_REQUEST_DURATION.to_owned()),
+                &LATENCY_BUCKETS,
+            )
+            .expect("LATENCY_BUCKETS is non-empty")
+            .build_recorder();
+        let prometheus_handle = prometheus.handle();
         Self {
-            recorder: LocalRecorder(recorder),
             prometheus,
-            active_tcp: OnceLock::new(),
-            active_ws: OnceLock::new(),
+            prometheus_handle,
+            otel,
+            active: [const { OnceLock::new() }; ConnProtocol::COUNT],
             saturated: OnceLock::new(),
-            duration: Default::default(),
-            requests: Default::default(),
-            health: Default::default(),
+            duration: [const { OnceLock::new() }; UpstreamLayer::COUNT],
+            requests: std::iter::repeat_with(OnceLock::new)
+                .take(REQUEST_SLOTS)
+                .collect(),
+            health: [const { OnceLock::new() }; HealthGauge::COUNT],
         }
     }
 
     pub(crate) fn prometheus_handle(&self) -> PrometheusHandle {
-        self.prometheus.clone()
+        self.prometheus_handle.clone()
     }
 
     pub(crate) fn render_prometheus(&self) -> String {
-        self.prometheus.render()
+        self.prometheus_handle.render()
+    }
+
+    /// The one place a Prometheus series is registered: through this server's concrete
+    /// recorder (never the process-global one), on first use, once.
+    fn handle<'a, H>(&'a self, slot: &'a OnceLock<H>, register: impl FnOnce() -> H) -> &'a H {
+        slot.get_or_init(|| ::metrics::with_local_recorder(&self.prometheus, register))
+    }
+
+    fn active(&self, protocol: ConnProtocol) -> ActiveGauge {
+        let label = protocol.as_str();
+        let prom = self
+            .handle(
+                &self.active[protocol as usize],
+                || ::metrics::gauge!(ACTIVE_CONNECTIONS, "protocol" => label),
+            )
+            .clone();
+        ActiveGauge {
+            prom,
+            otel: self.otel.active_guard(protocol),
+        }
     }
 
     pub(crate) fn active_tcp(&self) -> ActiveConnectionGuard {
-        let gauge = self
-            .active_tcp
-            .get_or_init(|| {
-                self.recorder
-                    .with(|| ::metrics::gauge!(ACTIVE_CONNECTIONS, "protocol" => "tcp"))
-            })
-            .clone();
-        ActiveConnectionGuard::new(gauge)
+        self.active(ConnProtocol::Tcp).activate()
     }
 
-    pub(crate) fn ws_slot(&self) -> WsConnectionSlot {
-        let gauge = self
-            .active_ws
-            .get_or_init(|| {
-                self.recorder
-                    .with(|| ::metrics::gauge!(ACTIVE_CONNECTIONS, "protocol" => "ws"))
-            })
-            .clone();
-        WsConnectionSlot(gauge)
+    pub(crate) fn ws_slot(&self) -> ActiveGauge {
+        self.active(ConnProtocol::Ws)
     }
 
     pub(crate) fn inc_saturated(&self) {
-        self.saturated
-            .get_or_init(|| {
-                self.recorder
-                    .with(|| ::metrics::counter!("ethonyx_connection_limit_saturated_total"))
-            })
-            .increment(1);
+        self.handle(&self.saturated, || {
+            ::metrics::counter!(CONNECTION_LIMIT_SATURATED)
+        })
+        .increment(1);
+        self.otel.inc_saturated();
     }
 
     pub(crate) fn record_request(
         &self,
         layer: UpstreamLayer,
-        method_idx: Option<usize>,
-        method_label: &'static str,
+        method: MethodBucket,
         status: u16,
         elapsed: Duration,
     ) {
-        let l_idx = layer as usize;
-        let upstream_label = layer.as_str();
-        self.duration[l_idx]
-            .get_or_init(|| {
-                self.recorder.with(|| {
-                    ::metrics::histogram!(
-                        "ethonyx_proxy_request_duration_seconds",
-                        "upstream" => upstream_label,
-                    )
-                })
-            })
-            .record(elapsed.as_secs_f64());
+        let secs = elapsed.as_secs_f64();
+        let upstream = layer.as_str();
+        self.handle(
+            &self.duration[layer as usize],
+            || ::metrics::histogram!(PROXY_REQUEST_DURATION, "upstream" => upstream),
+        )
+        .record(secs);
 
-        let (status_idx, status_label) = classify_status(status);
-        if let (Some(m_idx), Some(s_idx)) = (method_idx, status_idx) {
-            self.requests[l_idx][m_idx][s_idx]
-                .get_or_init(|| {
-                    self.recorder.with(|| {
-                        ::metrics::counter!(
-                            "ethonyx_proxy_requests_total",
-                            "upstream" => upstream_label,
-                            "method" => method_label,
-                            "status" => status_label,
-                        )
-                    })
-                })
-                .increment(1);
-        } else {
-            self.recorder.with(|| {
-                ::metrics::counter!(
-                    "ethonyx_proxy_requests_total",
-                    "upstream" => upstream_label,
-                    "method" => method_label,
-                    "status" => status_label,
-                )
-                .increment(1);
-            });
-        }
+        let s_idx = status_slot(status);
+        let method_str = method.as_str();
+        let status_str = STATUS_LABELS[s_idx];
+        self.handle(&self.requests[request_slot(layer, method, s_idx)], || {
+            ::metrics::counter!(
+                PROXY_REQUESTS_TOTAL,
+                "upstream" => upstream,
+                "method" => method_str,
+                "status" => status_str,
+            )
+        })
+        .increment(1);
+
+        self.otel
+            .record_request(upstream, method_str, status_str, secs);
     }
 
     /// Set one health gauge. Its handle is registered on first use, so a gauge that is
     /// never set (a disabled layer, or everything under `--trust-upstream`) never appears.
     pub(crate) fn set_health(&self, gauge: HealthGauge, value: f64) {
-        self.health[gauge as usize]
-            .get_or_init(|| self.recorder.with(|| gauge.register()))
-            .set(value);
+        let (instrument, layer) = gauge.spec();
+        let name = instrument.name();
+        self.handle(&self.health[gauge as usize], || match layer {
+            Some(layer) => ::metrics::gauge!(name, "layer" => layer.as_lower_str()),
+            None => ::metrics::gauge!(name),
+        })
+        .set(value);
+        self.otel.set_health(instrument, layer, value);
     }
 }
 
-pub(crate) fn classify_method(m: &http::Method) -> (Option<usize>, &'static str) {
-    match *m {
-        http::Method::POST => (Some(0), "POST"),
-        http::Method::GET => (Some(1), "GET"),
-        http::Method::CONNECT => (Some(2), "CONNECT"),
-        http::Method::HEAD => (Some(3), "HEAD"),
-        http::Method::PUT => (None, "PUT"),
-        http::Method::DELETE => (None, "DELETE"),
-        http::Method::OPTIONS => (None, "OPTIONS"),
-        http::Method::PATCH => (None, "PATCH"),
-        http::Method::TRACE => (None, "TRACE"),
-        _ => (None, "OTHER"),
+/// Distinct OTel health gauge instruments shared between Prometheus and OpenTelemetry;
+/// the only place their series names appear.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HealthInstrument {
+    UpstreamHealth = 0,
+    UpstreamPeers,
+    UpstreamSyncDistance,
+    UpstreamBlockNumber,
+    UpstreamSlotNumber,
+    ReferenceHealth,
+    ReferenceBlockNumber,
+    // Must remain last; `Self::COUNT` is derived from this variant.
+    ReferenceBlockLag,
+}
+
+impl HealthInstrument {
+    #[cfg(feature = "otel")]
+    pub(crate) const COUNT: usize = Self::ReferenceBlockLag as usize + 1;
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::UpstreamHealth => "ethonyx_upstream_health_status",
+            Self::UpstreamPeers => "ethonyx_upstream_peers",
+            Self::UpstreamSyncDistance => "ethonyx_upstream_sync_distance",
+            Self::UpstreamBlockNumber => "ethonyx_upstream_block_number",
+            Self::UpstreamSlotNumber => "ethonyx_upstream_slot_number",
+            Self::ReferenceHealth => "ethonyx_reference_health_status",
+            Self::ReferenceBlockNumber => "ethonyx_reference_block_number",
+            Self::ReferenceBlockLag => "ethonyx_reference_block_lag",
+        }
     }
 }
 
-const fn classify_status(status: u16) -> (Option<usize>, &'static str) {
-    match status {
-        100 => (None, "100"),
-        101 => (Some(0), "101"),
-        200 => (Some(1), "200"),
-        201 => (None, "201"),
-        202 => (None, "202"),
-        204 => (Some(2), "204"),
-        206 => (None, "206"),
-        301 => (None, "301"),
-        302 => (None, "302"),
-        304 => (None, "304"),
-        400 => (Some(3), "400"),
-        401 => (None, "401"),
-        403 => (None, "403"),
-        404 => (Some(4), "404"),
-        405 => (None, "405"),
-        408 => (None, "408"),
-        409 => (None, "409"),
-        413 => (Some(5), "413"),
-        414 => (None, "414"),
-        415 => (None, "415"),
-        429 => (None, "429"),
-        500 => (None, "500"),
-        502 => (Some(6), "502"),
-        503 => (Some(7), "503"),
-        504 => (None, "504"),
-        _ => (None, "OTHER"),
-    }
-}
-
-/// Every gauge the health poller sets; the only place their series names appear.
-#[repr(usize)]
-#[derive(Clone, Copy)]
+/// Every gauge series the health poller sets (EL/CL share 3 layered instruments).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HealthGauge {
     ElHealth = 0,
     ElPeers,
@@ -354,20 +375,25 @@ pub(crate) enum HealthGauge {
 impl HealthGauge {
     const COUNT: usize = Self::ReferenceBlockLag as usize + 1;
 
-    fn register(self) -> Gauge {
-        use ::metrics::gauge;
+    const fn spec(self) -> (HealthInstrument, Option<UpstreamLayer>) {
         match self {
-            Self::ElHealth => gauge!("ethonyx_upstream_health_status", "layer" => "el"),
-            Self::ElPeers => gauge!("ethonyx_upstream_peers", "layer" => "el"),
-            Self::ElSyncDistance => gauge!("ethonyx_upstream_sync_distance", "layer" => "el"),
-            Self::ElBlockNumber => gauge!("ethonyx_upstream_block_number"),
-            Self::ClHealth => gauge!("ethonyx_upstream_health_status", "layer" => "cl"),
-            Self::ClPeers => gauge!("ethonyx_upstream_peers", "layer" => "cl"),
-            Self::ClSyncDistance => gauge!("ethonyx_upstream_sync_distance", "layer" => "cl"),
-            Self::ClSlotNumber => gauge!("ethonyx_upstream_slot_number"),
-            Self::ReferenceHealth => gauge!("ethonyx_reference_health_status"),
-            Self::ReferenceBlockNumber => gauge!("ethonyx_reference_block_number"),
-            Self::ReferenceBlockLag => gauge!("ethonyx_reference_block_lag"),
+            Self::ElHealth => (HealthInstrument::UpstreamHealth, Some(UpstreamLayer::El)),
+            Self::ElPeers => (HealthInstrument::UpstreamPeers, Some(UpstreamLayer::El)),
+            Self::ElSyncDistance => (
+                HealthInstrument::UpstreamSyncDistance,
+                Some(UpstreamLayer::El),
+            ),
+            Self::ElBlockNumber => (HealthInstrument::UpstreamBlockNumber, None),
+            Self::ClHealth => (HealthInstrument::UpstreamHealth, Some(UpstreamLayer::Cl)),
+            Self::ClPeers => (HealthInstrument::UpstreamPeers, Some(UpstreamLayer::Cl)),
+            Self::ClSyncDistance => (
+                HealthInstrument::UpstreamSyncDistance,
+                Some(UpstreamLayer::Cl),
+            ),
+            Self::ClSlotNumber => (HealthInstrument::UpstreamSlotNumber, None),
+            Self::ReferenceHealth => (HealthInstrument::ReferenceHealth, None),
+            Self::ReferenceBlockNumber => (HealthInstrument::ReferenceBlockNumber, None),
+            Self::ReferenceBlockLag => (HealthInstrument::ReferenceBlockLag, None),
         }
     }
 }
@@ -378,58 +404,147 @@ mod tests {
     use http::Method;
 
     #[test]
-    fn test_classify_method() {
-        assert_eq!(classify_method(&Method::POST), (Some(0), "POST"));
-        assert_eq!(classify_method(&Method::GET), (Some(1), "GET"));
-        assert_eq!(classify_method(&Method::CONNECT), (Some(2), "CONNECT"));
-        assert_eq!(classify_method(&Method::HEAD), (Some(3), "HEAD"));
-        assert_eq!(
-            classify_method(&Method::from_bytes(b"OPTIONS").unwrap()),
-            (None, "OPTIONS")
+    fn method_buckets_cover_every_label() {
+        let methods = [
+            (Method::POST, MethodBucket::Post, "POST"),
+            (Method::GET, MethodBucket::Get, "GET"),
+            (Method::CONNECT, MethodBucket::Connect, "CONNECT"),
+            (Method::HEAD, MethodBucket::Head, "HEAD"),
+            (Method::PUT, MethodBucket::Put, "PUT"),
+            (Method::DELETE, MethodBucket::Delete, "DELETE"),
+            (Method::OPTIONS, MethodBucket::Options, "OPTIONS"),
+            (Method::PATCH, MethodBucket::Patch, "PATCH"),
+            (Method::TRACE, MethodBucket::Trace, "TRACE"),
+            (
+                Method::from_bytes(b"PURGE").unwrap(),
+                MethodBucket::Other,
+                "OTHER",
+            ),
+        ];
+        assert_eq!(methods.len(), MethodBucket::COUNT);
+        for (method, expected, label) in &methods {
+            let bucket = MethodBucket::classify(method);
+            assert_eq!(bucket, *expected);
+            assert_eq!(bucket.as_str(), *label);
+        }
+    }
+
+    #[test]
+    fn tracked_statuses_get_their_own_series_and_the_rest_share_other() {
+        let tracked = [
+            101, 200, 201, 202, 204, 206, 301, 302, 304, 307, 308, 400, 401, 403, 404, 405, 408,
+            409, 413, 414, 415, 417, 422, 429, 500, 501, 502, 503, 504,
+        ];
+        assert_eq!(tracked.len(), TRACKED_STATUS.len());
+        let m = ServerMetrics::default();
+        for status in tracked.into_iter().chain([303, 418, 599]) {
+            m.record_request(
+                UpstreamLayer::Cl,
+                MethodBucket::Other,
+                status,
+                Duration::ZERO,
+            );
+        }
+
+        let rendered = m.render_prometheus();
+        assert!(
+            rendered.contains("# TYPE ethonyx_proxy_request_duration_seconds histogram"),
+            "duration must export as explicit Prometheus histogram, got:\n{rendered}"
         );
+        let bucket_prefix = r#"ethonyx_proxy_request_duration_seconds_bucket{upstream="CL",le=""#;
+        let buckets: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix(bucket_prefix))
+            .collect();
+        let total = tracked.len() + 3;
+        let expected_le = [
+            "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf",
+        ];
+        assert_eq!(expected_le.len(), LATENCY_BUCKETS.len() + 1);
+        let expected_buckets: Vec<String> = expected_le
+            .iter()
+            .map(|le| format!("{le}\"}} {total}"))
+            .collect();
         assert_eq!(
-            classify_method(&Method::from_bytes(b"PURGE").unwrap()),
-            (None, "OTHER")
+            buckets, expected_buckets,
+            "expected all 11 LATENCY_BUCKETS plus +Inf, got:\n{rendered}"
+        );
+        let prefix = r#"ethonyx_proxy_requests_total{upstream="CL",method="OTHER",status=""#;
+        let mut series: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .collect();
+        series.sort_unstable();
+        let mut expected: Vec<String> = tracked
+            .iter()
+            .map(|status| format!("{status}\"}} 1"))
+            .collect();
+        expected.push("OTHER\"} 3".to_owned());
+        assert_eq!(series, expected);
+    }
+
+    #[test]
+    fn request_series_that_share_two_coordinates_stay_separate() {
+        let m = ServerMetrics::default();
+        for (layer, method, status) in [
+            (UpstreamLayer::El, MethodBucket::Post, 200),
+            (UpstreamLayer::Cl, MethodBucket::Post, 200),
+            (UpstreamLayer::El, MethodBucket::Get, 200),
+            (UpstreamLayer::El, MethodBucket::Post, 404),
+            (UpstreamLayer::El, MethodBucket::Post, 418),
+        ] {
+            m.record_request(layer, method, status, Duration::ZERO);
+        }
+
+        let rendered = m.render_prometheus();
+        let mut series: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix("ethonyx_proxy_requests_total"))
+            .collect();
+        series.sort_unstable();
+        assert_eq!(
+            series,
+            [
+                r#"{upstream="CL",method="POST",status="200"} 1"#,
+                r#"{upstream="EL",method="GET",status="200"} 1"#,
+                r#"{upstream="EL",method="POST",status="200"} 1"#,
+                r#"{upstream="EL",method="POST",status="404"} 1"#,
+                r#"{upstream="EL",method="POST",status="OTHER"} 1"#,
+            ]
         );
     }
 
     #[test]
-    fn test_classify_status() {
-        assert_eq!(classify_status(101), (Some(0), "101"));
-        assert_eq!(classify_status(200), (Some(1), "200"));
-        assert_eq!(classify_status(204), (Some(2), "204"));
-        assert_eq!(classify_status(400), (Some(3), "400"));
-        assert_eq!(classify_status(404), (Some(4), "404"));
-        assert_eq!(classify_status(408), (None, "408"));
-        assert_eq!(classify_status(413), (Some(5), "413"));
-        assert_eq!(classify_status(414), (None, "414"));
-        assert_eq!(classify_status(502), (Some(6), "502"));
-        assert_eq!(classify_status(503), (Some(7), "503"));
-        assert_eq!(classify_status(418), (None, "OTHER"));
-        assert_eq!(classify_status(307), (None, "OTHER"));
-    }
-
-    #[test]
-    fn server_metrics_instances_are_isolated_across_hot_and_cold_series() {
-        let m1 = ServerMetrics::new(None);
-        let m2 = ServerMetrics::new(None);
+    fn server_metrics_instances_are_isolated_across_all_request_buckets() {
+        let m1 = ServerMetrics::default();
+        let m2 = ServerMetrics::default();
 
         let _tcp = m1.active_tcp();
         drop(m1.ws_slot().activate());
         m1.inc_saturated();
         m1.record_request(
             UpstreamLayer::El,
-            Some(0),
-            "POST",
+            MethodBucket::Post,
             200,
             Duration::from_millis(5),
         );
         m1.record_request(
             UpstreamLayer::Cl,
-            None,
-            "OPTIONS",
+            MethodBucket::Options,
             414,
             Duration::from_millis(1),
+        );
+        m1.record_request(
+            UpstreamLayer::Cl,
+            MethodBucket::Get,
+            206,
+            Duration::from_millis(2),
+        );
+        m1.record_request(
+            UpstreamLayer::El,
+            MethodBucket::Delete,
+            429,
+            Duration::from_millis(3),
         );
         for (gauge, value) in [
             (HealthGauge::ElBlockNumber, 1234.0),
@@ -444,6 +559,9 @@ mod tests {
         assert!(r1.contains("ethonyx_connection_limit_saturated_total 1"));
         assert!(r1.contains("status=\"200\""));
         assert!(r1.contains("status=\"414\""));
+        assert!(r1.contains("status=\"206\""));
+        assert!(r1.contains("status=\"429\""));
+        assert!(!r1.contains("status=\"500\""));
         assert!(r1.contains("ethonyx_upstream_block_number 1234"));
         assert!(r1.contains("ethonyx_reference_health_status 1"));
         assert!(r1.contains("ethonyx_reference_block_number 1235"));
@@ -463,5 +581,32 @@ mod tests {
         assert!(!r2_el_only.contains("ethonyx_upstream_slot_number"));
         assert!(!r2_el_only.contains("ethonyx_upstream_peers"));
         assert!(!r2_el_only.contains("ethonyx_reference_"));
+    }
+
+    #[test]
+    fn active_connection_gauges_follow_their_guards() {
+        let metrics = ServerMetrics::default();
+        let active = |protocol: &str| {
+            let prefix = format!("{ACTIVE_CONNECTIONS}{{protocol=\"{protocol}\"}} ");
+            metrics
+                .render_prometheus()
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix.as_str()).map(str::to_owned))
+        };
+        let tcp = metrics.active_tcp();
+        // Dropping an unarmed WS slot registers the series without counting or underflowing.
+        let unarmed_ws = metrics.ws_slot();
+        assert_eq!(active("tcp").as_deref(), Some("1"));
+        assert_eq!(active("ws").as_deref(), Some("0"));
+        drop(unarmed_ws);
+        assert_eq!(active("ws").as_deref(), Some("0"));
+
+        let ws = metrics.ws_slot().activate();
+        let second_tcp = metrics.active_tcp();
+        assert_eq!(active("tcp").as_deref(), Some("2"));
+        assert_eq!(active("ws").as_deref(), Some("1"));
+        drop((tcp, ws, second_tcp));
+        assert_eq!(active("tcp").as_deref(), Some("0"));
+        assert_eq!(active("ws").as_deref(), Some("0"));
     }
 }

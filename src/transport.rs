@@ -43,8 +43,28 @@ fn build_http_connector() -> HttpConnector {
     http
 }
 
-fn configure_client_builder() -> hyper_util::client::legacy::Builder {
-    let mut builder = Client::builder(TokioExecutor::new());
+/// Executor for OTLP export clients that detaches every spawned HTTP/1.1 or HTTP/2
+/// connection driver from the active `tracing` subscriber so `h2`/`hyper` spans
+/// cannot recursively re-enter the OpenTelemetry trace pipeline.
+#[cfg(feature = "otel")]
+#[derive(Clone, Copy)]
+pub(crate) struct NoSubscriberExecutor;
+
+#[cfg(feature = "otel")]
+impl<Fut> hyper::rt::Executor<Fut> for NoSubscriberExecutor
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    fn execute(&self, fut: Fut) {
+        use tracing::instrument::WithSubscriber as _;
+        tokio::spawn(fut.with_subscriber(tracing::dispatcher::Dispatch::none()));
+    }
+}
+
+fn configure_client_builder(
+    mut builder: hyper_util::client::legacy::Builder,
+) -> hyper_util::client::legacy::Builder {
     builder
         .pool_timer(TokioTimer::new())
         .pool_idle_timeout(Duration::from_secs(60))
@@ -95,18 +115,26 @@ pub(crate) fn build_connectors(ws_is_tls: bool) -> (Https, tokio_tungstenite::Co
 }
 
 pub(crate) fn build_client(https: Https) -> ProxyClient {
-    configure_client_builder().build(https)
+    configure_client_builder(Client::builder(TokioExecutor::new())).build(https)
 }
 
 #[cfg(test)]
 pub(crate) fn build_https_client() -> ProxyClient {
-    build_client(build_https_connector())
+    build_client(wrap_https_connector(build_tls_config()))
+}
+
+/// Build a WebPKI HTTPS client for OTLP export whose connection-driver tasks run
+/// with [`tracing::dispatcher::Dispatch::none`].
+#[cfg(feature = "otel")]
+pub(crate) fn build_otlp_client() -> ProxyClient {
+    configure_client_builder(Client::builder(NoSubscriberExecutor))
+        .build(wrap_https_connector(build_tls_config()))
 }
 
 /// Cleartext-only HTTP/2 prior-knowledge (`h2c`) client for probed `http://` EL upstreams,
 /// sharing the same `Https` connector type so both clients unify as [`ProxyClient`].
-pub(crate) fn build_h2c_client(https: Https) -> ProxyClient {
-    let mut builder = configure_client_builder();
+fn build_h2c_client(https: Https) -> ProxyClient {
+    let mut builder = configure_client_builder(Client::builder(TokioExecutor::new()));
     builder.http2_only(true);
     builder.build(https)
 }

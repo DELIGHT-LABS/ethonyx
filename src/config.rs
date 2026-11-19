@@ -398,6 +398,7 @@ pub(crate) struct ProxyOpts {
     pub(crate) sse_idle_timeout: Duration,
     pub(crate) max_connections: usize,
     pub(crate) mock_eth_syncing: bool,
+    pub(crate) otel_enabled: bool,
 }
 
 /// Health readiness and freshness evaluation thresholds owned by polled health state
@@ -715,7 +716,9 @@ impl Config {
         })))
     }
 
-    pub(crate) fn parse_with_otel(&self) -> Result<(ParsedConfig, Option<HttpUpstream>), BoxError> {
+    pub(crate) fn parse_with_otel(
+        &self,
+    ) -> Result<(ParsedConfig, Option<crate::otel::OtelEndpoints>), BoxError> {
         self.validate_scalars_and_durations()?;
         self.validate_flag_combinations()?;
         let listen = self.parse_listen_addrs()?;
@@ -727,12 +730,13 @@ impl Config {
             .transpose()?;
         let cl = self.parse_cl()?;
         let health = self.parse_health_mode(&el_http, cl.is_some())?;
-        let otel_endpoint = crate::otel::parse_config_endpoint(self)?;
+        let otel_endpoint = crate::otel::parse_config_endpoint(self.otel_endpoint.as_deref())?;
         let opts = ProxyOpts {
             proxy_timeout: self.proxy_timeout,
             sse_idle_timeout: self.sse_idle_timeout,
             max_connections: self.max_connections,
             mock_eth_syncing: self.mock_eth_syncing,
+            otel_enabled: otel_endpoint.is_some(),
         };
         Ok((
             ParsedConfig {
