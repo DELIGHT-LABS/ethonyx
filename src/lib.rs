@@ -55,7 +55,7 @@ impl Prepared {
     /// Validate `cfg` and start the OTLP providers when an endpoint is configured.
     pub async fn new(cfg: Config) -> Result<Self, BoxError> {
         let (parsed, otel_endpoint) = cfg.parse_with_otel()?;
-        let telemetry = otel::start(otel_endpoint).await?;
+        let telemetry = otel::start(otel_endpoint)?;
         Ok(Self {
             cfg,
             parsed,
@@ -109,8 +109,7 @@ impl Prepared {
             opts,
             upstreams,
             health,
-            telemetry.is_enabled(),
-            metrics::ServerMetrics::new(telemetry.metric_sink()),
+            metrics::ServerMetrics::new(telemetry.metrics()),
         )
         .await;
 

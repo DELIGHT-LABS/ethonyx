@@ -32,11 +32,12 @@ rustls = { version = "0.23.46" }
 socket2 = "0.6"
 opentelemetry = { version = "0.33.1", optional = true, default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.33.1", optional = true, default-features = false, features = ["trace", "metrics"] }
-opentelemetry-otlp = { version = "0.33.1", optional = true, default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+opentelemetry-http = { version = "0.33.1", optional = true, default-features = false }
+opentelemetry-otlp = { version = "0.33.1", optional = true, default-features = false, features = ["http-proto", "internal-logs"] }
 tracing-opentelemetry = { version = "0.34", optional = true, default-features = false }
 
 [features]
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-http", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [dev-dependencies]
 hyper-util = { version = "0.1.21", features = ["server-auto"] }

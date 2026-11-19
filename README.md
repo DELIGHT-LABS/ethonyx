@@ -269,8 +269,8 @@ match (`git` is `v0.1.2`); an ad-hoc build off a later commit shows
 changes — so a binary's exact provenance is always visible in its logs. (`git`
 is `unknown` when built without a git checkout, e.g. from a source tarball.)
 
-Set the level with `--log-level <trace|debug|info|warn|error>` (default `info`).
-`RUST_LOG` overrides it and allows per-target directives:
+Set the level with `--log-level <trace|debug|info|warn|error>` (default `info`); under `--log-level debug|trace`, `opentelemetry-otlp` is capped at `info` so raw OTLP export URLs are not logged.
+`RUST_LOG` overrides `--log-level` and allows per-target directives (when `--otel-endpoint` is set, scope debug logging — e.g. `RUST_LOG=ethonyx=debug` or `RUST_LOG=debug,opentelemetry-otlp=info` — so `opentelemetry-otlp` export-error debug logs do not print raw OTLP URLs):
 
 ```sh
 ethonyx --log-level debug ...
@@ -304,8 +304,8 @@ ethonyx exports core application and proxy metrics on `GET /metrics`.
 The following metrics are exposed:
 - `ethonyx_active_connections`: Number of currently active client connections (labeled by `protocol`: `tcp` tracks open inbound HTTP/1.1 and HTTP/2 TCP sessions until upgrade handoff or socket close, while `ws` tracks active upgraded HTTP/1.1 and HTTP/2 Extended `CONNECT` WebSocket relays).
 - `ethonyx_connection_limit_saturated_total`: Total number of inbound TCP accepts queued or HTTP/2 Extended `CONNECT` WebSocket streams rejected due to `--max-connections` saturation.
-- `ethonyx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`).
-- `ethonyx_proxy_request_duration_seconds`: Latency histogram of upstream proxied requests (labeled by `upstream`).
+- `ethonyx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`; common HTTP status codes have individual series while unlisted codes are grouped under `status="OTHER"`).
+- `ethonyx_proxy_request_duration_seconds`: Explicit-bucket latency histogram of upstream proxied requests (`0.005`–`10`s + `+Inf`, labeled by `upstream`) exported consistently to Prometheus (`_bucket`/`_sum`/`_count` for `histogram_quantile()`) and OpenTelemetry.
 - `ethonyx_upstream_peers`: Number of peers reported by upstream nodes (labeled by `layer`: `layer="el"` is omitted when `net_peerCount` is unsupported, and `layer="cl"` is omitted when CL is disabled).
 - `ethonyx_upstream_sync_distance`: Remaining sync distance in blocks or slots (labeled by `layer` as `el` or `cl`).
 - `ethonyx_upstream_block_number`: Latest execution layer block number.
@@ -321,8 +321,10 @@ If built with the `otel` feature, ethonyx supports exporting traces and metrics 
 
 Pass an HTTP(S) **base URL**, optionally with a path prefix and without a query or fragment.
 Ethonyx appends `/v1/traces` and `/v1/metrics` for the respective signals. The
-exporters use Rustls and run their blocking work outside Tokio workers. Both
-providers flush on orderly shutdown (Ctrl-C, or SIGTERM on Unix).
+exporters use `hyper-util` + Rustls with bundled `webpki-roots` (working out of the box
+in `FROM scratch` containers; OS/private CA stores and `HTTP_PROXY`/`HTTPS_PROXY`
+environment variables are not loaded) and run their blocking work outside Tokio
+workers. Both providers flush on orderly shutdown (Ctrl-C, or SIGTERM on Unix).
 
 ```sh
 # Build with OpenTelemetry support
@@ -333,8 +335,9 @@ ethonyx --otel-endpoint http://localhost:4318 ...
 ```
 
 When enabled:
-- **Distributed Tracing**: Context propagation is hooked into HTTP and WebSocket upstream requests (W3C standard `traceparent` headers are injected after hop-by-hop header sanitization).
-- **Span Attributes**: Upstream requests are instrumented with tracing spans containing method, path, and upstream layer details.
+- **Distributed Tracing**: Context propagation is hooked into HTTP and WebSocket upstream requests (W3C standard `traceparent` and `tracestate` headers are injected after hop-by-hop header sanitization).
+- **Span Attributes**: Upstream requests are instrumented with tracing spans containing method, path, upstream layer, `http.response.status_code`, and `Error` span status on `5xx` responses. Request spans remain active for OTLP export regardless of `--log-level` (e.g., `--log-level warn`).
+- **Exporter Timeouts**: OTLP HTTP exports honor `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` and `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` (falling back to `OTEL_EXPORTER_OTLP_TIMEOUT`, default `10000` ms, clamped to 1 hour) and are bounded by a 5-second flush deadline on shutdown.
 - **Resource Identity**: `service.name` defaults to `ethonyx` and honors standard `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` overrides.
 
 ## systemd

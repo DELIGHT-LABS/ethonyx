@@ -21,7 +21,18 @@ async fn main() -> Result<(), BoxError> {
             .map_err(|e| format!("invalid RUST_LOG: {e}"))?,
         None => {
             let access = if cfg.access_log { "info" } else { "off" };
-            tracing_subscriber::EnvFilter::new(format!("{},access_log={access}", cfg.log_level))
+            // `opentelemetry-otlp` logs raw export URIs at `debug`/`trace`; cap it at
+            // `info` under `--log-level debug|trace` without raising quieter log levels.
+            let otlp_cap =
+                if cfg!(feature = "otel") && matches!(cfg.log_level.as_str(), "debug" | "trace") {
+                    ",opentelemetry-otlp=info"
+                } else {
+                    ""
+                };
+            tracing_subscriber::EnvFilter::new(format!(
+                "{},access_log={access}{otlp_cap}",
+                cfg.log_level
+            ))
         }
     };
     let fmt_layer = tracing_subscriber::fmt::layer()

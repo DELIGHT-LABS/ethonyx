@@ -4,17 +4,47 @@ use super::*;
 use serde_json::json;
 use tokio_tungstenite::connect_async;
 
-struct KillOnDrop(std::process::Child);
+struct KillOnDrop {
+    child: std::process::Child,
+    stderr_buf: Arc<Mutex<String>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KillOnDrop {
+    fn spawn(mut cmd: std::process::Command) -> Self {
+        let mut child = cmd.spawn().unwrap();
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let reader = child.stderr.take().map(|mut pipe| {
+            let buf = Arc::clone(&stderr_buf);
+            std::thread::spawn(move || {
+                let mut captured = String::new();
+                let _ = std::io::Read::read_to_string(&mut pipe, &mut captured);
+                *buf.lock().unwrap() = captured;
+            })
+        });
+        Self {
+            child,
+            stderr_buf,
+            stderr_reader: reader,
+        }
+    }
+
+    fn stderr_snapshot(&self) -> String {
+        self.stderr_buf.lock().unwrap().clone()
+    }
+}
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(handle) = self.stderr_reader.take() {
+            let _ = handle.join();
+        }
     }
 }
 
 async fn spawn_binary_on_ephemeral_port(
-    upstream: &MockServer,
     mut configure: impl FnMut(&mut std::process::Command),
 ) -> (KillOnDrop, u16) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,42 +59,41 @@ async fn spawn_binary_on_ephemeral_port(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
         configure(&mut cmd);
-        let mut child = KillOnDrop(cmd.spawn().unwrap());
-        let probe_path = format!("/__ethonyx_ready_{attempt}");
-        let probe_req =
-            format!("GET {probe_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let mut child = KillOnDrop::spawn(cmd);
 
         for _ in 0..250 {
-            if let Some(status) = child.0.try_wait().unwrap() {
-                let mut stderr = String::new();
-                if let Some(mut err_pipe) = child.0.stderr.take() {
-                    let _ = std::io::Read::read_to_string(&mut err_pipe, &mut stderr);
+            if let Some(status) = child.child.try_wait().unwrap() {
+                // Allow the stderr reader thread to finish draining EOF.
+                if let Some(handle) = child.stderr_reader.take() {
+                    let _ = handle.join();
                 }
+                let stderr = child.stderr_snapshot();
                 if attempt < 4 && stderr.contains("failed to bind --listen address") {
                     break;
                 }
                 panic!("ethonyx binary exited prematurely with {status} on port {port}: {stderr}");
             }
-            // Open a fresh `Connection: close` socket each tick (never reusing a pooled
-            // keep-alive socket to a previous port holder), bound the probe with a short
-            // timeout in case a blackhole listener stole `port`, and verify that the
-            // request reached THIS test's dedicated `upstream` MockServer.
+            // Probe `/livez` directly over a fresh `Connection: close` socket so startup
+            // readiness never pollutes upstream mock logs or emits proxy spans/metrics.
             let probed = tokio::time::timeout(Duration::from_millis(250), async {
                 let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
                     .await
                     .ok()?;
-                sock.write_all(probe_req.as_bytes()).await.ok()?;
-                let mut discard = [0u8; 512];
-                let _ = sock.read(&mut discard).await;
-                Some(())
+                sock.write_all(
+                    b"GET /livez HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .ok()?;
+                let mut buf = Vec::new();
+                let _ = sock.read_to_end(&mut buf).await;
+                Some(buf)
             })
             .await;
-            if matches!(probed, Ok(Some(()))) {
-                let mut recorded = upstream.recorded.lock().unwrap();
-                if recorded.iter().any(|r| r.path == probe_path) {
-                    recorded.retain(|r| !r.path.starts_with("/__ethonyx_ready_"));
-                    return (child, port);
-                }
+            if let Ok(Some(resp)) = probed
+                && resp.starts_with(b"HTTP/1.1 200 OK")
+                && resp.ends_with(b"\r\n\r\nok")
+            {
+                return (child, port);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -72,31 +101,61 @@ async fn spawn_binary_on_ephemeral_port(
     panic!("ethonyx subprocess failed to become ready after retries");
 }
 
-/// Without an active `tracing-opentelemetry` subscriber layer (`EthonyxHandle`
-/// runs in-process without installing a global subscriber), non-`Connection`-nominated
-/// `traceparent` headers pass through `strip_hop_by_hop` intact to the upstream.
+/// With a real `tracing-opentelemetry` subscriber installed, ethonyx extracts incoming
+/// `traceparent` + multi-line `tracestate`, generates a child `span-id`, forwards the
+/// updated W3C headers to upstream, and flushes the exported trace batch to the collector
+/// on shutdown.
 #[tokio::test]
 async fn trace_context_is_propagated_to_upstream() {
+    use tracing_subscriber::prelude::*;
+
     let collector = MockServer::start(ok_handler()).await;
     let el = MockServer::start(ok_handler()).await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethonyx = EthonyxHandle::start(&[
+
+    let cfg = Config::parse_from([
+        "ethonyx",
+        "--listen",
+        "127.0.0.1:0",
+        "--trust-upstream",
         "--el-http-url",
         &el.url,
         "--cl-beacon-url",
         &cl.url,
         "--otel-endpoint",
         &collector.url,
-    ])
-    .await;
+        "--shutdown-grace",
+        "0",
+    ]);
+    let prepared = Prepared::new(cfg).await.unwrap();
+    let tracer = prepared.tracer().expect("otel tracer must be initialized");
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(tracing_subscriber::EnvFilter::new(
+                "ethonyx=info,access_log=off",
+            )),
+    );
+    // `#[tokio::test]` runs on a `current_thread` runtime, so `set_default` binds all
+    // tasks spawned by `bound.serve(...)` to this test's isolated OTel subscriber.
+    let _sub_guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+
+    let bound = prepared.bind().await.unwrap();
+    let addr = bound.local_addrs()[0];
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(bound.serve(async move {
+        let _ = stop_rx.await;
+    }));
 
     let c = client();
-
     let traceparent_val = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     let req = Request::builder()
         .method(Method::POST)
-        .uri(ethonyx.url("/"))
+        .uri(format!("http://{addr}/"))
         .header("traceparent", traceparent_val)
+        .header("tracestate", "vendor=ethonyx")
+        .header("tracestate", "tier=edge")
         .body(Full::new(Bytes::from(
             json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1})
                 .to_string(),
@@ -105,24 +164,154 @@ async fn trace_context_is_propagated_to_upstream() {
 
     let resp = c.request(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let _ = resp.into_body().collect().await.unwrap();
+    drop(c);
 
-    let received_traceparent_str = {
+    {
         let recorded_reqs = el.recorded.lock().unwrap();
-        let received_traceparent = recorded_reqs
+        let forwarded = recorded_reqs
             .iter()
-            .filter_map(|r| r.headers.get("traceparent"))
-            .next()
-            .expect("traceparent header in any upstream request");
-        received_traceparent.to_str().unwrap().to_owned()
-    };
+            .find(|r| r.method == Method::POST && r.path == "/")
+            .expect("POST request forwarded to EL");
+        let received_tp = forwarded
+            .headers
+            .get("traceparent")
+            .expect("traceparent header in upstream request")
+            .to_str()
+            .unwrap();
+        assert!(
+            received_tp.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"),
+            "must preserve parent trace-id, got: {received_tp}"
+        );
+        assert!(
+            !received_tp.contains("-00f067aa0ba902b7-"),
+            "must rewrite span-id to the child span, got: {received_tp}"
+        );
+        assert_eq!(
+            forwarded
+                .headers
+                .get("tracestate")
+                .and_then(|v| v.to_str().ok()),
+            Some("vendor=ethonyx,tier=edge")
+        );
+    }
 
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+
+    let exported = collector.recorded.lock().unwrap();
     assert!(
-        received_traceparent_str.contains("4bf92f3577b34da6a3ce929d0e0e4736"),
-        "Expected propagated traceparent to contain trace ID, got: {}",
-        received_traceparent_str
+        exported
+            .iter()
+            .any(|r| r.path == "/v1/traces" && !r.body.is_empty()),
+        "shutdown must flush trace batch to collector, got paths: {:?}",
+        exported.iter().map(|r| &r.path).collect::<Vec<_>>()
     );
+}
 
-    ethonyx.shutdown().await;
+#[tokio::test]
+async fn pooled_client_exports_first_request_span_while_keepalive_socket_stays_open() {
+    use opentelemetry::Value;
+    use opentelemetry::trace::{Status, TracerProvider as _};
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturingSpanExporter(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+
+    impl opentelemetry_sdk::trace::SpanExporter for CapturingSpanExporter {
+        async fn export(&self, batch: Vec<opentelemetry_sdk::trace::SpanData>) -> OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    let h1_el = MockServer::start(ok_handler()).await;
+    let h2_el = MockServer::start_h2c(ok_handler()).await;
+    let err_el = MockServer::start(Arc::new(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Bytes::from_static(b"boom"),
+        )
+    }))
+    .await;
+
+    let span_exporter = CapturingSpanExporter::default();
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(span_exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer_provider.tracer("ethonyx"))
+            .with_filter(tracing_subscriber::EnvFilter::new(
+                "ethonyx=debug,access_log=off",
+            )),
+    );
+    let _sub_guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+
+    // 1. Pooled HTTP/1.1 keep-alive (`--trust-upstream`) and 2. Pooled h2c keep-alive
+    // (probed), plus a 500 response checking `http.response.status_code` & Error status.
+    let h1_proxy = EthonyxHandle::start(&["--trust-upstream", "--el-http-url", &h1_el.url]).await;
+    let h2_proxy = EthonyxHandle::start(&["--el-http-url", &h2_el.url]).await;
+    let err_proxy = EthonyxHandle::start(&["--trust-upstream", "--el-http-url", &err_el.url]).await;
+    let c = client();
+
+    for proxy in [&h1_proxy, &h2_proxy] {
+        let (status, _) = post_json(
+            &c,
+            &proxy.url("/"),
+            json!({"jsonrpc":"2.0","method":"eth_blockNumber","id":1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (err_status, _) = post_json(
+        &c,
+        &err_proxy.url("/"),
+        json!({"jsonrpc":"2.0","method":"eth_blockNumber","id":1}),
+    )
+    .await;
+    assert_eq!(err_status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // All three pooled upstream keep-alive connections remain open inside the proxies:
+    // without `rt-tracing-exec-force`, background pool driver tasks must NOT retain a
+    // clone of Request #1's span, so all three spans are exported immediately!
+    wait_for(|| {
+        let count = span_exporter.0.lock().unwrap().len();
+        async move {
+            (count >= 3)
+                .then_some(())
+                .ok_or_else(|| format!("exported spans={count}, expected 3"))
+        }
+    })
+    .await;
+
+    {
+        let spans = span_exporter.0.lock().unwrap();
+        assert_eq!(spans.len(), 3);
+        let statuses: Vec<i64> = spans
+            .iter()
+            .filter_map(|s| {
+                s.attributes.iter().find_map(|kv| {
+                    (kv.key.as_str() == "http.response.status_code")
+                        .then_some(&kv.value)
+                        .and_then(|v| match v {
+                            Value::I64(n) => Some(*n),
+                            _ => None,
+                        })
+                })
+            })
+            .collect();
+        assert_eq!(statuses, [200, 200, 500]);
+        assert!(matches!(spans[2].status, Status::Error { .. }));
+    }
+
+    drop(c);
+    h1_proxy.shutdown().await;
+    h2_proxy.shutdown().await;
+    err_proxy.shutdown().await;
+    let _ = tracer_provider.shutdown();
 }
 
 #[cfg(unix)]
@@ -134,7 +323,7 @@ async fn binary_exports_traces_and_metrics_and_flushes_on_sigterm() {
     // Set periodic export intervals to 60s so neither BatchSpanProcessor nor
     // PeriodicReader exports on a timer during the test — only SIGTERM's
     // `telemetry.shutdown().await` can deliver both signals to `collector`.
-    let (mut child, port) = spawn_binary_on_ephemeral_port(&upstream, |cmd| {
+    let (mut child, port) = spawn_binary_on_ephemeral_port(|cmd| {
         cmd.args([
             "--trust-upstream",
             "--el-http-url",
@@ -166,14 +355,14 @@ async fn binary_exports_traces_and_metrics_and_flushes_on_sigterm() {
 
     assert!(
         Command::new("kill")
-            .args(["-TERM", &child.0.id().to_string()])
+            .args(["-TERM", &child.child.id().to_string()])
             .status()
             .unwrap()
             .success()
     );
     let status = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(status) = child.0.try_wait().unwrap() {
+            if let Some(status) = child.child.try_wait().unwrap() {
                 break status;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -277,7 +466,7 @@ async fn traceparent_survives_connection_nomination_and_propagates_to_websocket(
         drop(ws);
     });
 
-    let (_child, port) = spawn_binary_on_ephemeral_port(&el, |cmd| {
+    let (_child, port) = spawn_binary_on_ephemeral_port(|cmd| {
         cmd.args([
             "--trust-upstream",
             "--el-http-url",

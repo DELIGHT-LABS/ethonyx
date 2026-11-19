@@ -321,7 +321,7 @@ mod tests {
             }),
             reference: None,
         };
-        let metrics = ServerMetrics::new(None);
+        let metrics = ServerMetrics::default();
         let mut observer = PollObserver::new(DEFAULT_POLICY);
         let mut record =
             |p: &Probe| observer.record_metrics(&metrics, p, evaluate_readiness(DEFAULT_POLICY, p));
@@ -413,7 +413,7 @@ mod tests {
             }),
             reference: None,
         };
-        let metrics = ServerMetrics::new(None);
+        let metrics = ServerMetrics::default();
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::callsite::rebuild_interest_cache();
