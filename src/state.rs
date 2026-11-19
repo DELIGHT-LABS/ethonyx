@@ -1,12 +1,93 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{ClProbeUris, HealthMode, ProxyOpts, ValidatedUpstreams};
 use crate::health::{self, HealthPoller, HealthSource};
 use crate::metrics::ServerMetrics;
 use crate::transport::{HttpTarget, ProxyClient, WsTarget, build_client, build_connectors};
 use crate::upstream::WsUpstream;
+
+struct BoundedLimit {
+    sem: Arc<Semaphore>,
+    max: NonZeroUsize,
+}
+
+/// Optional connection concurrency cap (`None` when `--max-connections 0`).
+/// Avoids semaphore atomic traffic completely when unlimited and eliminates
+/// impossible `TryAcquireError::Closed` handling across callers.
+pub(crate) struct ConnLimit(Option<BoundedLimit>);
+
+/// RAII permit for one active connection or dedicated HTTP/2 WebSocket stream.
+/// Carries zero runtime overhead when `--max-connections 0`.
+#[must_use = "connection permit is released immediately if dropped"]
+pub(crate) struct ConnPermitGuard {
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ConnPermitGuard {
+    pub(crate) const fn unlimited() -> Self {
+        Self { permit: None }
+    }
+
+    pub(crate) fn into_inner(self) -> Option<OwnedSemaphorePermit> {
+        self.permit
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_bounded(&self) -> bool {
+        self.permit.is_some()
+    }
+}
+
+impl ConnLimit {
+    fn new(max: Option<NonZeroUsize>) -> Self {
+        Self(max.map(|max| BoundedLimit {
+            sem: Arc::new(Semaphore::new(max.get())),
+            max,
+        }))
+    }
+
+    pub(crate) const fn max(&self) -> Option<NonZeroUsize> {
+        match &self.0 {
+            Some(bounded) => Some(bounded.max),
+            None => None,
+        }
+    }
+
+    /// Try to claim a permit without blocking.
+    fn try_acquire(&self) -> Option<ConnPermitGuard> {
+        let Some(bounded) = &self.0 else {
+            return Some(ConnPermitGuard::unlimited());
+        };
+        Arc::clone(&bounded.sem)
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| ConnPermitGuard {
+                permit: Some(permit),
+            })
+    }
+
+    /// Wait until a permit becomes available (resolves immediately when unlimited).
+    pub(crate) async fn acquire(&self) -> ConnPermitGuard {
+        let Some(bounded) = &self.0 else {
+            return ConnPermitGuard::unlimited();
+        };
+        let permit = Arc::clone(&bounded.sem)
+            .acquire_owned()
+            .await
+            .expect("connection limit semaphore is never closed");
+        ConnPermitGuard {
+            permit: Some(permit),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_permits(&self) -> Option<usize> {
+        self.0.as_ref().map(|b| b.sem.available_permits())
+    }
+}
 
 pub(crate) struct ClState {
     pub(crate) beacon: HttpTarget,
@@ -24,7 +105,7 @@ pub(crate) struct AppState {
     pub(crate) el: HttpTarget,
     pub(crate) el_ws: Option<WsTarget>,
     pub(crate) cl: Option<ClState>,
-    pub(crate) conn_limit: Arc<Semaphore>,
+    pub(crate) conn_limit: ConnLimit,
     pub(crate) health: HealthSource,
     pub(crate) metrics: ServerMetrics,
 }
@@ -34,6 +115,7 @@ impl AppState {
     /// is set).
     pub(crate) async fn start(
         opts: ProxyOpts,
+        max_connections: Option<NonZeroUsize>,
         upstreams: ValidatedUpstreams,
         health: HealthMode,
         metrics: ServerMetrics,
@@ -56,12 +138,7 @@ impl AppState {
             mock_node_health: cl.mock_node_health,
         });
         let (health, poller) = health::warm(health, &client, &el, cl.as_ref(), &metrics).await;
-        let permits = if opts.max_connections == 0 {
-            Semaphore::MAX_PERMITS
-        } else {
-            opts.max_connections
-        };
-        let conn_limit = Arc::new(Semaphore::new(permits));
+        let conn_limit = ConnLimit::new(max_connections);
 
         (
             Arc::new(Self {
@@ -76,5 +153,15 @@ impl AppState {
             }),
             poller,
         )
+    }
+
+    /// Try to claim a `--max-connections` permit without blocking, incrementing
+    /// `ethonyx_connection_limit_saturated_total` on contention.
+    pub(crate) fn try_acquire_permit(&self) -> Option<ConnPermitGuard> {
+        let permit = self.conn_limit.try_acquire();
+        if permit.is_none() {
+            self.metrics.inc_saturated();
+        }
+        permit
     }
 }

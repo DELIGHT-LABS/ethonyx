@@ -21,7 +21,7 @@ nodes and optional **Consensus Layer** (CL) Beacon node pairs (supports both `EL
 | `POST /eth/v1/validator/register_validator` | `--cl-mev-relay-url` (rewritten to `/eth/v1/builder/validators`) if set, else `--cl-beacon-url` (`404` in EL-only mode) |
 | `POST /eth/v1/validator/{prepare_beacon_proposer, beacon_committee_subscriptions, sync_committee_subscriptions}` | `200 OK` if `--mock-cl-subscriptions` set, else `--cl-beacon-url` (`404` in EL-only mode) |
 | `/eth/...`, `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...` | `--cl-beacon-url` (`404` when `--cl-beacon-url` is omitted) |
-| `Upgrade: websocket` / H2 Extended `CONNECT` | `--el-ws-url` (`404` when `--el-ws-url` is omitted) |
+| `Upgrade: websocket` / H2 Extended `CONNECT` | `--el-ws-url` (`404` on HTTP/1.1 Upgrade; RFC 8441 Extended `CONNECT` not advertised when omitted) |
 | everything else (JSON-RPC `POST /`)  | `--el-http-url` *(required)* |
 
 ## Probes
@@ -139,22 +139,25 @@ HTTP/1.1 WebSocket upgrade are unchanged.
 WebSocket works over both transports when `--el-ws-url` is configured: the HTTP/1.1
 `Upgrade` handshake and HTTP/2 Extended CONNECT (RFC 8441, `:protocol=websocket`).
 Either is bridged to the upstream's HTTP/1.1 WebSocket (`--el-ws-url`); when
-`--el-ws-url` is omitted, WebSocket upgrade requests return `404 Not Found`.
+`--el-ws-url` is omitted, HTTP/1.1 WebSocket upgrades return `404 Not Found` and
+HTTP/2 does not advertise RFC 8441 `SETTINGS_ENABLE_CONNECT_PROTOCOL` (unnegotiated
+HTTP/2 Extended `CONNECT` requests are rejected with `RST_STREAM(PROTOCOL_ERROR)`).
 
 Subprotocol offers from all request header lines are combined, and the selected
 protocol is relayed from the upstream. Unsupported extensions, including
 compression, are not negotiated; unsolicited extension responses are rejected.
 Frames remain limited to 16 MiB and complete messages to 64 MiB, including
 fragmented messages. The single-task non-blocking full-duplex `poll_fn` relay reads
-in 8 KiB chunks with frame storage that grows for larger frames and uses 16 KiB
-write buffers (capped at `64 MiB + 64 KiB` total write buffer and `64 KiB` per
-transport write) with independent directional backpressure and no split-sink lock;
+in 8 KiB chunks with frame storage that grows for larger frames, uses 16 KiB
+write buffers (capped at `2 MiB` total write buffer and `64 KiB` per transport
+write) with zero-copy `1 MiB` outbound fragmentation aligned to UTF-8 boundaries,
+and maintains independent directional backpressure with no split-sink lock;
 client `Ping` frames flush their local `Pong` immediately without forwarding
 upstream, upstream `Ping` frames flush their local `Pong` and are additionally
 forwarded to completely idle clients (whose `Pong` is absorbed locally without
 duplication) so front-side L7 load balancers observe keepalive traffic, and
 outbound relay sinks enforce progress-based stall deadlines (`--proxy-timeout`
-for data frames, `5s` when only a control frame flush is pending) that reset once
+for data frames, `min(--proxy-timeout, 5s)` when only a control frame flush is pending) that reset once
 at least `4 KiB` of new transport bytes drain after backpressure begins (bounded
 by kernel TCP / HTTP/2 flow-control send windows) while refusing extensions from
 queued trickle frames. Tungstenite continues to validate masking, UTF-8, control

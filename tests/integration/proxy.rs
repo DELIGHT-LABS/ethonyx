@@ -1347,7 +1347,7 @@ async fn post_accept_permits_allow_two_h2_ws_streams_and_reject_invalid_or_overs
 
     // 3. Under --max-connections 2, post-accept permit acquisition leaves the 2nd
     // permit free so 1 H2 connection can open TWO concurrent Extended CONNECT WS
-    // streams (`IncludedH2` + `DedicatedH2`) with zero spurious saturation increments,
+    // streams (`WsPermit::Shared` + `WsPermit::Dedicated`) with zero spurious saturation increments,
     // and rejects the 3rd concurrent stream with 503 (+1 saturation).
     let make_ext_ws = || ext_connect(format!("http://127.0.0.1:{port}/"));
 

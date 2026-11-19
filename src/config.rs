@@ -1,5 +1,5 @@
 use std::fmt;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
@@ -250,7 +250,7 @@ pub struct Config {
     #[arg(long, env = "ETHONYX_SSE_IDLE_TIMEOUT", default_value = "900", value_parser = parse_secs)]
     pub sse_idle_timeout: Duration,
 
-    /// Maximum concurrent inbound TCP connections across all listeners (0 = unlimited).
+    /// Maximum concurrent inbound connections (including HTTP/2 WebSocket streams) across all listeners (0 = unlimited).
     #[arg(long, env = "ETHONYX_MAX_CONNECTIONS", default_value_t = 4096)]
     pub max_connections: usize,
 
@@ -395,8 +395,7 @@ pub(crate) struct StrictFreshness {
 #[derive(Clone, Copy)]
 pub(crate) struct ProxyOpts {
     pub(crate) proxy_timeout: Duration,
-    pub(crate) sse_idle_timeout: Duration,
-    pub(crate) max_connections: usize,
+    pub(crate) sse_idle_timeout: Option<Duration>,
     pub(crate) mock_eth_syncing: bool,
     pub(crate) otel_enabled: bool,
 }
@@ -475,6 +474,7 @@ pub(crate) struct ValidatedUpstreams {
 pub(crate) struct ParsedConfig {
     pub(crate) listen: Vec<ListenAddr>,
     pub(crate) opts: ProxyOpts,
+    pub(crate) max_connections: Option<NonZeroUsize>,
     pub(crate) upstreams: ValidatedUpstreams,
     pub(crate) health: HealthMode,
     pub(crate) shutdown_grace: Duration,
@@ -733,8 +733,7 @@ impl Config {
         let otel_endpoint = crate::otel::parse_config_endpoint(self.otel_endpoint.as_deref())?;
         let opts = ProxyOpts {
             proxy_timeout: self.proxy_timeout,
-            sse_idle_timeout: self.sse_idle_timeout,
-            max_connections: self.max_connections,
+            sse_idle_timeout: (!self.sse_idle_timeout.is_zero()).then_some(self.sse_idle_timeout),
             mock_eth_syncing: self.mock_eth_syncing,
             otel_enabled: otel_endpoint.is_some(),
         };
@@ -742,6 +741,7 @@ impl Config {
             ParsedConfig {
                 listen,
                 opts,
+                max_connections: NonZeroUsize::new(self.max_connections),
                 upstreams: ValidatedUpstreams { el_http, el_ws, cl },
                 health,
                 shutdown_grace: self.shutdown_grace,
@@ -1107,6 +1107,12 @@ mod tests {
             "0",
         ]);
         assert!(zero_optional.validate().is_ok());
+        // `0` disables both options at parse time so data-plane paths see `Option` directly.
+        let off = zero_optional.parse_validated().unwrap();
+        assert!(off.opts.sse_idle_timeout.is_none() && off.max_connections.is_none());
+        let on = default_cfg.parse_validated().unwrap();
+        assert_eq!(on.opts.sse_idle_timeout, Some(Duration::from_secs(900)));
+        assert_eq!(on.max_connections.map(NonZeroUsize::get), Some(4096));
 
         let trimmed_listen = parse(&[
             "--listen",
