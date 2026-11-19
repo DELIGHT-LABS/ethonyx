@@ -1387,3 +1387,147 @@ async fn upstream_that_never_answers_is_a_502_after_proxy_timeout() {
     );
     proxy.shutdown().await;
 }
+
+#[tokio::test]
+async fn upstream_http10_normalizes_to_http11_keep_alive_and_unsolicited_101_is_502() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let _server = AbortOnDrop(tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                }
+                let reply: &[u8] = if head.starts_with(b"GET /101 ") {
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n"
+                } else {
+                    b"HTTP/1.0 200 OK\r\n\r\nok-from-h10"
+                };
+                let _ = sock.write_all(reply).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    }));
+
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-http-url", &upstream]).await;
+
+    // 1. Close-delimited HTTP/1.0 upstream responses must be normalized to HTTP/1.1 so
+    // a downstream HTTP/1.1 client keeps its connection alive across sequential requests.
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let _conn = AbortOnDrop(tokio::spawn(async move {
+        let _ = conn.await;
+    }));
+    for _ in 0..2 {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(proxy.url("/http10"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.version(), Version::HTTP_11);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.into_body().collect().await.unwrap().to_bytes(),
+            &b"ok-from-h10"[..]
+        );
+    }
+
+    // 2. Unsolicited 101 Switching Protocols on a plain HTTP request must return 502 on
+    // both HTTP/1.1 and HTTP/2 clients instead of closing H1 or resetting the H2 stream.
+    for (label, c) in [("h1", client()), ("h2c", h2c_client())] {
+        let (status, body) = get(&c, &proxy.url("/101")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{label} unsolicited 101");
+        assert_eq!(body.as_ref(), b"bad gateway", "{label} unsolicited 101");
+    }
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_content_length_and_body_carrying_ws_upgrade_fail_fast_without_reading() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_url = format!("ws://{}", ws_listener.local_addr().unwrap());
+    let ws_dials = Arc::new(AtomicUsize::new(0));
+    let ws_dials_srv = Arc::clone(&ws_dials);
+    let _ws_server = AbortOnDrop(tokio::spawn(async move {
+        while let Ok((_sock, _)) = ws_listener.accept().await {
+            ws_dials_srv.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+
+    let proxy = EthonyxHandle::start_trusted(&[
+        "--mock-eth-syncing",
+        "--cl-beacon-url",
+        "http://127.0.0.1:5052",
+        "--mock-cl-subscriptions",
+        "--el-ws-url",
+        &ws_url,
+    ])
+    .await;
+
+    // 1. Oversized Content-Length (> 64 MiB) + Expect: 100-continue on both mocked EL and
+    // mocked CL endpoints must return 413 immediately without sending `100 Continue`.
+    for path in ["/", "/eth/v1/validator/prepare_beacon_proposer"] {
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+            .await
+            .unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100000000\r\nExpect: 100-continue\r\n\r\n"
+        );
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), sock.read_to_end(&mut resp))
+            .await
+            .expect("oversized Content-Length must reject immediately with 413")
+            .unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 413 Payload Too Large"),
+            "path={path}: expected immediate 413 without 100 Continue, got: {text}"
+        );
+        assert!(!text.contains("100 Continue"), "path={path}: {text}");
+    }
+
+    // 2. HTTP/1.1 WebSocket Upgrade carrying a non-empty request body must be rejected
+    // with 400 Bad Request before dialing the upstream WebSocket server.
+    for framing in ["Content-Length: 5", "Transfer-Encoding: chunked"] {
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+            .await
+            .unwrap();
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{framing}\r\n\r\n"
+        );
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), sock.read_to_end(&mut resp))
+            .await
+            .expect("body-carrying WS upgrade must fail fast")
+            .unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 400 Bad Request"),
+            "framing={framing}: expected 400, got: {text}"
+        );
+    }
+    assert_eq!(ws_dials.load(Ordering::SeqCst), 0);
+
+    proxy.shutdown().await;
+}

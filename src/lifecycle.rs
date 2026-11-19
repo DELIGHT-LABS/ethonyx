@@ -35,21 +35,30 @@ impl LazyDeadline {
     /// Arm (if currently disarmed) for `now + duration` and poll whether the
     /// deadline has elapsed. Automatically disarms on expiration.
     pub(crate) fn poll_expired(&mut self, cx: &mut Context<'_>, duration: Duration) -> bool {
-        if !self.armed {
-            let at = Instant::now() + duration;
-            match self.sleep.as_mut() {
-                Some(sleep) => sleep.as_mut().reset(at),
-                None => self.sleep = Some(Box::pin(sleep_until(at))),
+        self.poll_expired_with(cx, || Instant::now() + duration)
+    }
+
+    /// Arm (if currently disarmed) for the instant returned by `deadline` and poll
+    /// whether it has elapsed. Automatically disarms on expiration.
+    pub(crate) fn poll_expired_with(
+        &mut self,
+        cx: &mut Context<'_>,
+        deadline: impl FnOnce() -> Instant,
+    ) -> bool {
+        let sleep = match self.sleep {
+            Some(ref mut sleep) => {
+                if !self.armed {
+                    sleep.as_mut().reset(deadline());
+                    self.armed = true;
+                }
+                sleep
             }
-            self.armed = true;
-        }
-        let expired = self
-            .sleep
-            .as_mut()
-            .expect("sleep initialized when armed")
-            .as_mut()
-            .poll(cx)
-            .is_ready();
+            None => {
+                self.armed = true;
+                self.sleep.insert(Box::pin(sleep_until(deadline())))
+            }
+        };
+        let expired = sleep.as_mut().poll(cx).is_ready();
         if expired {
             self.armed = false;
         }

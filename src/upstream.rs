@@ -249,13 +249,18 @@ impl Endpoint {
         })
     }
 
-    /// Compose the upstream URI by moving `inbound`'s [`PathAndQuery`] directly
-    /// into [`Uri::from_parts`] on root-based upstreams (zero heap allocation),
-    /// and assembling a single pre-sized [`BytesMut`] buffer when joining scoped
-    /// prefixes or queries.
-    fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {
+    /// Compose the upstream URI in a single pass. Moves `inbound`'s [`PathAndQuery`]
+    /// directly into [`Uri::from_parts`] on root-based upstreams (zero heap allocation
+    /// when `path_override` is absent or query-less), and assembles one pre-sized
+    /// [`BytesMut`] buffer when joining scoped prefixes, queries, or path overrides.
+    fn rewrite_uri_with_path(
+        &self,
+        inbound: Uri,
+        path_override: Option<&'static str>,
+    ) -> Result<Uri, http::Error> {
         let inbound_pq = inbound.into_parts().path_and_query;
-        let inbound_path = inbound_pq.as_ref().map_or("", PathAndQuery::path);
+        let inbound_path =
+            path_override.unwrap_or_else(|| inbound_pq.as_ref().map_or("", PathAndQuery::path));
         let inbound_query = inbound_pq.as_ref().and_then(PathAndQuery::query);
 
         if matches!(inbound_path, "" | "/") && inbound_query.is_none() {
@@ -263,9 +268,15 @@ impl Endpoint {
         }
 
         let pq = match self.target {
-            BaseTarget::Root => match inbound_pq {
-                Some(pq) if pq.as_str().starts_with('/') => pq,
-                _ => compose_pq("/", "", None, inbound_query)?,
+            BaseTarget::Root => match path_override {
+                Some(static_path) if inbound_query.is_none() => {
+                    PathAndQuery::from_static(static_path)
+                }
+                Some(static_path) => compose_pq(static_path, "", None, inbound_query)?,
+                None => match inbound_pq {
+                    Some(pq) if pq.as_str().starts_with('/') => pq,
+                    _ => compose_pq("/", "", None, inbound_query)?,
+                },
             },
             BaseTarget::Scoped { join_prefix_len } => {
                 let base_path = self.uri.path();
@@ -283,18 +294,6 @@ impl Endpoint {
         parts.path_and_query = Some(pq);
         Uri::from_parts(parts).map_err(http::Error::from)
     }
-}
-
-/// Replace `uri`'s path with `static_path` while preserving any query string
-/// (zero allocation when `uri` has no query).
-pub(crate) fn replace_uri_path(uri: Uri, static_path: &'static str) -> Result<Uri, http::Error> {
-    let Some(query) = uri.query() else {
-        return Ok(Uri::from_static(static_path));
-    };
-    let pq = compose_pq("", static_path, None, Some(query))?;
-    let mut parts = Parts::default();
-    parts.path_and_query = Some(pq);
-    Uri::from_parts(parts).map_err(http::Error::from)
 }
 
 fn compose_pq(
@@ -367,7 +366,15 @@ impl HttpUpstream {
     }
 
     pub(crate) fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {
-        self.0.rewrite_uri(inbound)
+        self.0.rewrite_uri_with_path(inbound, None)
+    }
+
+    pub(crate) fn rewrite_uri_with_path(
+        &self,
+        inbound: Uri,
+        path_override: Option<&'static str>,
+    ) -> Result<Uri, http::Error> {
+        self.0.rewrite_uri_with_path(inbound, path_override)
     }
 }
 
@@ -417,7 +424,7 @@ impl WsUpstream {
     }
 
     pub(crate) fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {
-        self.endpoint.rewrite_uri(inbound)
+        self.endpoint.rewrite_uri_with_path(inbound, None)
     }
 }
 
@@ -695,11 +702,9 @@ mod tests {
         ] {
             let upstream = HttpUpstream::parse("--el-http-url", base).unwrap();
             let inbound_uri: Uri = inbound.parse().unwrap();
-            let target_uri = match override_path {
-                Some(static_path) => replace_uri_path(inbound_uri, static_path).unwrap(),
-                None => inbound_uri,
-            };
-            let uri = upstream.rewrite_uri(target_uri).unwrap();
+            let uri = upstream
+                .rewrite_uri_with_path(inbound_uri, override_path)
+                .unwrap();
             assert_eq!(
                 uri.path_and_query().unwrap().as_str(),
                 expected,
