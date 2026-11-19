@@ -200,14 +200,8 @@ async fn bind_failure_is_not_swallowed_by_shutdown_with_unresponsive_otel_collec
     let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let occupied_addr = occupied.local_addr().unwrap();
 
-    let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let collector_url = format!("http://{}", blackhole.local_addr().unwrap());
-    let collector_task = tokio::spawn(async move {
-        let mut held = Vec::new();
-        while let Ok((sock, _)) = blackhole.accept().await {
-            held.push(sock);
-        }
-    });
+    let blackhole = StubPort::silent().await;
+    let collector_url = blackhole.http_url();
 
     let cfg = Config::parse_from([
         "ethonyx",
@@ -252,8 +246,6 @@ async fn bind_failure_is_not_swallowed_by_shutdown_with_unresponsive_otel_collec
         err.to_string().contains("failed to bind --listen address"),
         "unexpected error: {err}"
     );
-
-    collector_task.abort();
 }
 
 #[tokio::test]
