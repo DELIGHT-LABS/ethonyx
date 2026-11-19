@@ -2,7 +2,71 @@
 
 use super::*;
 use serde_json::json;
+use std::borrow::Cow;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+/// Read an HTTP/1.x request head (up to `\r\n\r\n`) from a raw TCP socket.
+async fn read_http1_head(sock: &mut tokio::net::TcpStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = vec![0u8; 8192];
+    let mut filled = 0usize;
+    loop {
+        let n = sock.read(&mut buf[filled..]).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        filled += n;
+        if let Some(pos) = buf[..filled].windows(4).position(|w| w == b"\r\n\r\n") {
+            return Some(String::from_utf8_lossy(&buf[..pos]).into_owned());
+        }
+        if filled == buf.len() {
+            return None;
+        }
+    }
+}
+
+/// Spawn a raw HTTP/1.x mock upstream replying to each connection's request head and closing.
+async fn spawn_raw_http1_upstream<F>(handler: F) -> (String, AbortOnDrop)
+where
+    F: Fn(&str) -> Cow<'static, [u8]> + Send + Sync + 'static,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handler = Arc::new(handler);
+    let server = AbortOnDrop(tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let handler = Arc::clone(&handler);
+            tokio::spawn(async move {
+                let Some(head) = read_http1_head(&mut sock).await else {
+                    return;
+                };
+                let reply = handler(&head);
+                let _ = sock.write_all(&reply).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    }));
+    (url, server)
+}
+
+/// Send a raw HTTP/1.1 request over loopback TCP and read the full response until EOF.
+async fn raw_http1_exchange(port: u16, req: &[u8]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    sock.write_all(req).await.unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), sock.read_to_end(&mut resp))
+        .await
+        .expect("raw HTTP/1.1 exchange must complete before timeout")
+        .unwrap();
+    String::from_utf8_lossy(&resp).into_owned()
+}
 
 #[tokio::test]
 async fn jsonrpc_post_is_forwarded_to_el_http_upstream() {
@@ -978,8 +1042,6 @@ async fn max_connections_caps_concurrent_http_and_upgraded_websocket_clients() {
 
 #[tokio::test]
 async fn multi_listener_max_connections_fairness_and_h2_extended_connect_cap() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let ws_upstream = ws_echo_upstream().await;
 
     let proxy = EthonyxHandle::start_trusted(&[
@@ -996,15 +1058,12 @@ async fn multi_listener_max_connections_fairness_and_h2_extended_connect_cap() {
     // 1. Even with --max-connections 1 and an idle second listener, repeated
     // connections on either port succeed without permit starvation.
     for port in [proxy.port, proxy.port, second_port, proxy.port] {
-        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        sock.write_all(b"GET /livez HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        let mut buf = Vec::new();
-        sock.read_to_end(&mut buf).await.unwrap();
-        assert!(buf.starts_with(b"HTTP/1.1 200 OK"));
+        let resp = raw_http1_exchange(
+            port,
+            b"GET /livez HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
     }
 
     // 2. Over a single HTTP/2 connection under --max-connections 1:
@@ -1169,8 +1228,6 @@ async fn query_only_upstream_url_reaches_h2c_and_h1_as_root_path() {
 
 #[tokio::test]
 async fn post_accept_permits_allow_two_h2_ws_streams_and_reject_invalid_or_oversized_targets() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let ws_upstream = ws_echo_upstream().await;
     let http_upstream = ws_upstream.url.replacen("ws://", "http://", 1);
     let long_prefix = "k".repeat(62_000);
@@ -1221,17 +1278,15 @@ async fn post_accept_permits_allow_two_h2_ws_streams_and_reject_invalid_or_overs
 
     // 1. Rejected targets (`OPTIONS *` and CL `CONNECT`) return 400
     // BEFORE `ethonyx_proxy_requests_total` is recorded!
-    let mut raw_sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    raw_sock
-        .write_all(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let mut raw_resp = Vec::new();
-    raw_sock.read_to_end(&mut raw_resp).await.unwrap();
-    assert!(raw_resp.starts_with(b"HTTP/1.1 400 Bad Request"));
-    drop(raw_sock);
+    let raw_resp = raw_http1_exchange(
+        port,
+        b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        raw_resp.starts_with("HTTP/1.1 400 Bad Request"),
+        "got: {raw_resp}"
+    );
     // Ensure `serve_connection` finishes dropping the 2nd TCP permit before section 3
     // (`_guard` decrements `active_connections{protocol="tcp"}` strictly after `permit` drops).
     wait_for(|| {
@@ -1357,5 +1412,615 @@ async fn upstream_that_never_answers_is_a_502_after_proxy_timeout() {
         "the 502 must come from --proxy-timeout (took {:?})",
         started.elapsed()
     );
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn upstream_http10_normalizes_to_http11_keep_alive_and_unsolicited_101_is_502() {
+    let (upstream, _server) = spawn_raw_http1_upstream(|head| {
+        if head.starts_with("GET /101 ") {
+            Cow::Borrowed(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n",
+            )
+        } else {
+            Cow::Borrowed(b"HTTP/1.0 200 OK\r\n\r\nok-from-h10")
+        }
+    })
+    .await;
+
+    let proxy = EthonyxHandle::start(&["--trust-upstream", "--el-http-url", &upstream]).await;
+
+    // 1. Close-delimited HTTP/1.0 upstream responses must be normalized to HTTP/1.1 so
+    // a downstream HTTP/1.1 client keeps its connection alive across sequential requests.
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    let _conn = AbortOnDrop(tokio::spawn(async move {
+        let _ = conn.await;
+    }));
+    for _ in 0..2 {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(proxy.url("/http10"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.version(), Version::HTTP_11);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.into_body().collect().await.unwrap().to_bytes(),
+            &b"ok-from-h10"[..]
+        );
+    }
+
+    // 2. Unsolicited 101 Switching Protocols on a plain HTTP request must return 502 on
+    // both HTTP/1.1 and HTTP/2 clients instead of closing H1 or resetting the H2 stream.
+    for (label, c) in [("h1", client()), ("h2c", h2c_client())] {
+        let (status, body) = get(&c, &proxy.url("/101")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{label} unsolicited 101");
+        assert_eq!(body.as_ref(), b"bad gateway", "{label} unsolicited 101");
+    }
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_content_length_and_body_carrying_ws_upgrade_fail_fast_without_reading() {
+    let ws_upstream = ws_echo_upstream().await;
+
+    let proxy = EthonyxHandle::start_trusted(&[
+        "--mock-eth-syncing",
+        "--cl-beacon-url",
+        "http://127.0.0.1:5052",
+        "--mock-cl-subscriptions",
+        "--el-ws-url",
+        &ws_upstream.url,
+    ])
+    .await;
+
+    // 1. Oversized Content-Length (> 64 MiB) + Expect: 100-continue on the local-only
+    // mocked CL subscription endpoint must return 413 immediately without sending `100 Continue`.
+    let text = raw_http1_exchange(
+        proxy.port,
+        b"POST /eth/v1/validator/prepare_beacon_proposer HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100000000\r\nExpect: 100-continue\r\n\r\n",
+    )
+    .await;
+    assert!(
+        text.starts_with("HTTP/1.1 413 Payload Too Large"),
+        "expected immediate 413 without 100 Continue, got: {text}"
+    );
+    assert!(!text.contains("100 Continue"), "{text}");
+
+    // 2. Unsupported Transfer-Encoding on inbound requests must return 501 Not Implemented.
+    let text = raw_http1_exchange(
+        proxy.port,
+        b"POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+    )
+    .await;
+    assert!(
+        text.starts_with("HTTP/1.1 501 Not Implemented"),
+        "expected 501 for unsupported Transfer-Encoding, got: {text}"
+    );
+
+    // 3. HTTP/1.1 WebSocket Upgrade carrying a non-empty request body must be rejected
+    // with 400 Bad Request before dialing the upstream WebSocket server.
+    for framing in ["Content-Length: 5", "Transfer-Encoding: chunked"] {
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{framing}\r\n\r\n"
+        );
+        let text = raw_http1_exchange(proxy.port, req.as_bytes()).await;
+        assert!(
+            text.starts_with("HTTP/1.1 400 Bad Request"),
+            "framing={framing}: expected 400, got: {text}"
+        );
+    }
+    assert_eq!(ws_upstream.dials(), 0);
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn mock_eth_syncing_streams_large_bodies_over_64k_without_buffering_or_413() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let el = MockServer::start(Arc::new(|req| (StatusCode::OK, req.body.clone()))).await;
+    let proxy = EthonyxHandle::start(&[
+        "--trust-upstream",
+        "--mock-eth-syncing",
+        "--el-http-url",
+        &el.url,
+    ])
+    .await;
+
+    let c = client();
+
+    // 0. Exact 64 KiB boundary: a 64 KiB `eth_syncing` body is inspected and mocked locally
+    // (0 upstream requests), while 64 KiB + 1 byte bypasses inspection and streams upstream.
+    let syncing_req = r#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}"#;
+    let exact_64k = format!("{}{syncing_req}", " ".repeat(64 * 1024 - syncing_req.len()));
+    assert_eq!(exact_64k.len(), 64 * 1024);
+    let resp_64k = c
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(proxy.url("/"))
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from(exact_64k)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_64k.status(), StatusCode::OK);
+    let body_64k = resp_64k.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        body_64k.as_ref(),
+        br#"{"jsonrpc":"2.0","id":1,"result":false}"#
+    );
+    assert!(
+        el.recorded.lock().unwrap().is_empty(),
+        "64 KiB exact must mock locally"
+    );
+
+    let over_64k = Bytes::from(format!(
+        "{}{syncing_req}",
+        " ".repeat(64 * 1024 + 1 - syncing_req.len())
+    ));
+    assert_eq!(over_64k.len(), 64 * 1024 + 1);
+    let resp_over = c
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(proxy.url("/"))
+                .header("content-type", "application/json")
+                .body(Full::new(over_64k.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_over.status(), StatusCode::OK);
+    let body_over = resp_over.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        body_over, over_64k,
+        "64 KiB + 1 must stream straight to upstream"
+    );
+
+    // 1. Known Content-Length > 64 KiB skips inspection completely and streams straight through.
+    let large_payload = Bytes::from(format!(
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"eth_call\",\"params\":[\"{}\"],\"id\":1}}",
+        "a".repeat(96 * 1024)
+    ));
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(proxy.url("/"))
+        .header("content-type", "application/json")
+        .body(Full::new(large_payload.clone()))
+        .unwrap();
+    let resp = c.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let echoed = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(echoed, large_payload);
+
+    // 2. Chunked request (no Content-Length) crossing the 64 KiB inspection boundary replays
+    // its buffered prefix + remaining live chunks intact via `ResBody::prefixed`.
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    sock.write_all(
+        b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    for chunk in large_payload.chunks(24 * 1024) {
+        sock.write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .await
+            .unwrap();
+        sock.write_all(chunk).await.unwrap();
+        sock.write_all(b"\r\n").await.unwrap();
+    }
+    sock.write_all(b"0\r\n\r\n").await.unwrap();
+    let mut raw_resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), sock.read_to_end(&mut raw_resp))
+        .await
+        .unwrap()
+        .unwrap();
+    let split = raw_resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("HTTP response separator");
+    let head = std::str::from_utf8(&raw_resp[..split]).unwrap();
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "got: {head}");
+    assert_eq!(&raw_resp[split + 4..], large_payload.as_ref());
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn http2_head_and_bodyless_upstream_responses_never_emit_forbidden_data_or_cl() {
+    struct OpenBody {
+        chunk: Option<Bytes>,
+        exact: Option<u64>,
+    }
+
+    impl hyper::body::Body for OpenBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+            std::task::Poll::Ready(self.chunk.take().map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.chunk.is_none()
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            self.exact.map_or_else(
+                hyper::body::SizeHint::default,
+                hyper::body::SizeHint::with_exact,
+            )
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+    let _server = AbortOnDrop(tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let svc = service_fn(|req: Request<Incoming>| async move {
+                    let path = req.uri().path().to_owned();
+                    let _ = req.into_body().collect().await;
+                    let resp = match path.as_str() {
+                        "/204-open" => Response::builder()
+                            .status(StatusCode::NO_CONTENT)
+                            .header("content-length", "5")
+                            .body(OpenBody {
+                                chunk: Some(Bytes::from_static(b"hello")),
+                                exact: Some(5),
+                            })
+                            .unwrap(),
+                        "/304-open" => Response::builder()
+                            .status(StatusCode::NOT_MODIFIED)
+                            .header("content-length", "5")
+                            .body(OpenBody {
+                                chunk: Some(Bytes::from_static(b"hello")),
+                                exact: Some(5),
+                            })
+                            .unwrap(),
+                        "/205-nonzero" => Response::builder()
+                            .status(StatusCode::RESET_CONTENT)
+                            .header("content-length", "5")
+                            .body(OpenBody {
+                                chunk: None,
+                                exact: None,
+                            })
+                            .unwrap(),
+                        "/head-open" => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-length", "42")
+                            .body(OpenBody {
+                                chunk: Some(Bytes::new()),
+                                exact: None,
+                            })
+                            .unwrap(),
+                        _ => {
+                            let batch = Bytes::from_static(
+                                br#"[{"jsonrpc":"2.0","id":1,"result":false},{"jsonrpc":"2.0","id":2,"result":"0x5"},{"jsonrpc":"2.0","id":3,"result":{"number":"0x1","timestamp":"0x1"}}]"#,
+                            );
+                            let len = batch.len() as u64;
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(OpenBody {
+                                    chunk: Some(batch),
+                                    exact: Some(len),
+                                })
+                                .unwrap()
+                        }
+                    };
+                    Ok::<_, Infallible>(resp)
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    }));
+
+    let proxy = EthonyxHandle::start(&["--el-http-url", &upstream_url]).await;
+    let h2 = h2c_client();
+
+    // Confirm the proxy negotiated h2c upstream during its startup warm-up poll.
+    let (hz_status, hz_body) = get(&h2, &proxy.url("/healthz")).await;
+    assert_eq!(hz_status, StatusCode::OK);
+    let hz: Value = serde_json::from_slice(&hz_body).unwrap();
+    assert_eq!(hz["el"]["transport"], "h2c");
+
+    // 1. Upstream H2 204/304 with END_STREAM=false and content-length must not re-inject
+    // `content-length` or stream forbidden DATA frames downstream over HTTP/2.
+    for (path, expected) in [
+        ("/204-open", StatusCode::NO_CONTENT),
+        ("/304-open", StatusCode::NOT_MODIFIED),
+    ] {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(proxy.url(path))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = h2.request(req).await.unwrap();
+        assert_eq!(resp.status(), expected, "{path}");
+        assert!(
+            resp.headers().get("content-length").is_none(),
+            "{path} must not re-inject content-length: {:?}",
+            resp.headers()
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty(), "{path} must emit no body bytes");
+    }
+
+    // 2. HTTP/2 HEAD responses (local 404, 502 from HEAD 205, and proxied H2 HEAD with
+    // END_STREAM=false) must emit no DATA frames (no RST_STREAM PROTOCOL_ERROR) while
+    // keeping proxied response headers such as Content-Length intact.
+    for (path, expected, expected_cl) in [
+        ("/eth/v1/node/version", StatusCode::NOT_FOUND, None),
+        ("/205-nonzero", StatusCode::BAD_GATEWAY, None),
+        ("/head-open", StatusCode::OK, Some("42")),
+    ] {
+        let req = Request::builder()
+            .method(Method::HEAD)
+            .uri(proxy.url(path))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = h2.request(req).await.unwrap();
+        assert_eq!(resp.status(), expected, "{path}");
+        assert_eq!(
+            resp.headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()),
+            expected_cl,
+            "{path}"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty(), "{path} must emit no body bytes");
+    }
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn http1_protocol_edges_transfer_encoding_205_expect_and_empty_post_cl() {
+    let (upstream_url, _server) = spawn_raw_http1_upstream(|head| {
+        let mut lines = head.lines();
+        let req_line = lines.next().unwrap_or_default();
+        let path = req_line.split_whitespace().nth(1).unwrap_or_default();
+        let mut content_length = None;
+        let mut has_custom_expect = false;
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.trim());
+                } else if name.eq_ignore_ascii_case("expect")
+                    && value.trim().eq_ignore_ascii_case("custom-expectation")
+                {
+                    has_custom_expect = true;
+                }
+            }
+        }
+        if has_custom_expect {
+            return Cow::Borrowed(
+                b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 10\r\nConnection: close\r\n\r\nfrom-upstr",
+            );
+        }
+        match path {
+            "/te-empty" => Cow::Borrowed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: \r\n\r\nbody"),
+            "/te-gzip" => Cow::Borrowed(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
+            ),
+            "/te-gzip-204" => Cow::Borrowed(
+                b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n",
+            ),
+            "/te-gzip-304" => Cow::Borrowed(
+                b"HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n",
+            ),
+            "/te-gzip-head" => Cow::Borrowed(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n",
+            ),
+            "/te-double-chunked" => Cow::Borrowed(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
+            ),
+            "/te-trailing-empty" => Cow::Borrowed(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked,\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            ),
+            "/205-nonzero" => {
+                Cow::Borrowed(b"HTTP/1.1 205 Reset Content\r\nContent-Length: 42\r\n\r\n")
+            }
+            "/205-zero" => Cow::Borrowed(b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n"),
+            "/205-chunked-empty" => Cow::Borrowed(
+                b"HTTP/1.1 205 Reset Content\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            ),
+            "/205-chunked-nonempty" => Cow::Borrowed(
+                b"HTTP/1.1 205 Reset Content\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            ),
+            "/get-205-nonempty" => Cow::Borrowed(
+                b"HTTP/1.1 205 Reset Content\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            ),
+            "/echo-cl" => {
+                let body = content_length.unwrap_or("none");
+                Cow::Owned(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .into_bytes(),
+                )
+            }
+            _ => Cow::Borrowed(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            ),
+        }
+    })
+    .await;
+
+    let proxy = EthonyxHandle::start(&[
+        "--trust-upstream",
+        "--el-http-url",
+        &upstream_url,
+        "--cl-beacon-url",
+        &upstream_url,
+        "--mock-eth-syncing",
+        "--mock-cl-subscriptions",
+        "--mock-cl-node-health",
+    ])
+    .await;
+    let c = client();
+
+    // 1. Unsupported, empty, duplicate-chunked, or trailing-empty upstream Transfer-Encoding
+    // and non-empty GET 205 responses (Content-Length or chunked) must all fail with 502.
+    for path in [
+        "/te-empty",
+        "/te-gzip",
+        "/te-gzip-204",
+        "/te-double-chunked",
+        "/te-trailing-empty",
+        "/205-chunked-nonempty",
+        "/get-205-nonempty",
+    ] {
+        let (status, body) = get(&c, &proxy.url(path)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{path}");
+        assert_eq!(body.as_ref(), b"bad gateway", "{path}");
+    }
+    // RFC 9110 §15.3.6: `HEAD 205 Reset Content` with non-zero `Content-Length` is
+    // rejected as 502 (preserving HTTP/1.1 `HEAD` `Content-Length: 11` for "bad gateway")
+    // while `Content-Length: 0` passes through; empty chunked `205` is drained cleanly.
+    for (method, path, expected, expected_cl) in [
+        (Method::HEAD, "/205-nonzero", StatusCode::BAD_GATEWAY, "11"),
+        (Method::HEAD, "/205-zero", StatusCode::RESET_CONTENT, "0"),
+        (
+            Method::GET,
+            "/205-chunked-empty",
+            StatusCode::RESET_CONTENT,
+            "0",
+        ),
+    ] {
+        let req = Request::builder()
+            .method(method.clone())
+            .uri(proxy.url(path))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = c.request(req).await.unwrap();
+        assert_eq!(resp.status(), expected, "{method} {path}");
+        assert_eq!(
+            resp.headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_cl),
+            "{method} {path}"
+        );
+        assert!(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty(),
+            "{method} {path} must carry zero body bytes"
+        );
+    }
+    // RFC 9112 §6.1 / §6.3: bodyless 304 and non-204/205 HEAD responses may carry
+    // representation Transfer-Encoding metadata (stripped on hop boundary without
+    // synthesizing Content-Length: 0), while HEAD 204 + unsupported TE stays 502.
+    for (method, path, expected_status) in [
+        (Method::GET, "/te-gzip-304", StatusCode::NOT_MODIFIED),
+        (Method::HEAD, "/te-gzip-head", StatusCode::OK),
+        (Method::HEAD, "/te-gzip-204", StatusCode::BAD_GATEWAY),
+    ] {
+        let req = Request::builder()
+            .method(method.clone())
+            .uri(proxy.url(path))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = c.request(req).await.unwrap();
+        assert_eq!(resp.status(), expected_status, "{method} {path}");
+        assert!(
+            !resp.headers().contains_key("transfer-encoding"),
+            "{method} {path} must strip hop-by-hop transfer-encoding"
+        );
+        if expected_status != StatusCode::BAD_GATEWAY {
+            assert!(
+                !resp.headers().contains_key("content-length"),
+                "{method} {path} must not fabricate Content-Length"
+            );
+        }
+        assert!(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty(),
+            "{method} {path} must carry zero body bytes"
+        );
+    }
+
+    // 2. Inbound CL request with unsupported Transfer-Encoding returns 501 Not Implemented.
+    let text = raw_http1_exchange(
+        proxy.port,
+        b"POST /eth/v1/beacon/blocks HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+    )
+    .await;
+    assert!(
+        text.starts_with("HTTP/1.1 501 Not Implemented"),
+        "expected 501 on CL unsupported Transfer-Encoding, got: {text}"
+    );
+
+    // 3. Empty POST/PUT/PATCH restore Content-Length: 0 over HTTP/1.1 while GET omits it.
+    for (method, expected_cl) in [
+        (Method::POST, "0"),
+        (Method::PUT, "0"),
+        (Method::PATCH, "0"),
+        (Method::GET, "none"),
+    ] {
+        let req = Request::builder()
+            .method(method.clone())
+            .uri(proxy.url("/echo-cl"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = c.request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{method}");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), expected_cl.as_bytes(), "{method}");
+    }
+
+    // 4. Non-`100-continue` Expect headers bypass all three local mocks and reach upstream.
+    for (method, path, payload) in [
+        (
+            Method::POST,
+            "/",
+            &br#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}"#[..],
+        ),
+        (
+            Method::POST,
+            "/eth/v1/validator/prepare_beacon_proposer",
+            &b"[]"[..],
+        ),
+        (Method::GET, "/eth/v1/node/health", &b""[..]),
+    ] {
+        let req = Request::builder()
+            .method(method)
+            .uri(proxy.url(path))
+            .header("expect", "custom-expectation")
+            .body(Full::new(Bytes::from_static(payload)))
+            .unwrap();
+        let resp = c.request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::EXPECTATION_FAILED, "{path}");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"from-upstr", "{path}");
+    }
+
     proxy.shutdown().await;
 }

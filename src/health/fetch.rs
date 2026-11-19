@@ -6,10 +6,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Uri, header::CONTENT_TYPE};
-use http_body_util::BodyExt;
 use hyper::body::Body as _;
 
-use crate::response::{ResBody, empty_body, full_body};
+use crate::response::{BodyReadError, ResBody, collect_body, drain_body, empty_body, full_body};
 use crate::transport::{
     HttpTarget, HttpTransport, ProbeMode, ProbeTransportError, ProxyClient, UNTRACKED_TRANSPORT,
 };
@@ -235,34 +234,20 @@ impl<'a> ProbeTarget<'a> {
             // Opportunistically drain small HTTP/1.1 error bodies (e.g. 429/503 JSON)
             // so Hyper keeps the TCP+TLS connection pooled, capped tightly so a stalled
             // error body never burns the full `--health-timeout`.
-            if is_http1
-                && !body.is_end_stream()
-                && body.size_hint().lower() <= MAX_NON_2XX_DRAIN_BYTES as u64
-            {
+            if is_http1 && !body.is_end_stream() {
                 let drain_deadline =
                     deadline.min(tokio::time::Instant::now() + MAX_NON_2XX_DRAIN_TIMEOUT);
-                let _ = tokio::time::timeout_at(
-                    drain_deadline,
-                    http_body_util::Limited::new(body, MAX_NON_2XX_DRAIN_BYTES).collect(),
-                )
-                .await;
+                let _ = drain_body(body, MAX_NON_2XX_DRAIN_BYTES, drain_deadline).await;
             }
             return Err(HealthError::HttpStatus(status));
         }
-        if body.size_hint().lower() > max_body as u64 {
-            return Err(HealthError::decode_msg("length limit exceeded"));
-        }
-        if body.is_end_stream() {
-            return Ok(Bytes::new());
-        }
-        tokio::time::timeout_at(
-            deadline,
-            http_body_util::Limited::new(body, max_body).collect(),
-        )
-        .await
-        .map_err(|_| HealthError::BodyTimeout)?
-        .map(|c| c.to_bytes())
-        .map_err(HealthError::decode)
+        collect_body(body, max_body, Some(deadline))
+            .await
+            .map_err(|err| match err {
+                BodyReadError::TooLarge => HealthError::decode_msg("length limit exceeded"),
+                BodyReadError::TimedOut => HealthError::BodyTimeout,
+                BodyReadError::Body(e) => HealthError::transport(e),
+            })
     }
 }
 
@@ -272,7 +257,7 @@ mod tests {
     use crate::health::el::el_batch_detect;
     use crate::transport::{build_client, build_https_client, build_https_connector};
     use http::{Response, StatusCode};
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use hyper::body::Incoming;
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
