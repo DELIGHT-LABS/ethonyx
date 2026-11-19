@@ -5,8 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
-use hyper::body::Body as _;
+use bytes::Bytes;
 use opentelemetry_http::{HttpClient, HttpError, ResponseBodyTooLarge};
 use tokio::sync::watch;
 use tracing::instrument::WithSubscriber as _;
@@ -131,25 +130,25 @@ impl HttpClient for OtlpHyperClient {
                             .request(req)
                             .await
                             .map_err(|e| -> HttpError { Box::new(e) })?;
-                        let (parts, mut body) = resp.into_parts();
-                        if body.size_hint().lower() > OTLP_MAX_RESPONSE_BODY_BYTES as u64 {
-                            return Err(Box::new(ResponseBodyTooLarge::new()) as HttpError);
-                        }
-                        let mut collected = BytesMut::new();
-                        while let Some(frame) =
-                            std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
-                        {
-                            let frame = frame.map_err(|e| -> HttpError { Box::new(e) })?;
-                            if let Ok(data) = frame.into_data() {
-                                if collected.len().saturating_add(data.len())
-                                    > OTLP_MAX_RESPONSE_BODY_BYTES
-                                {
-                                    return Err(Box::new(ResponseBodyTooLarge::new()) as HttpError);
+                        let (parts, body) = resp.into_parts();
+                        let collected = crate::response::collect_body(
+                            body,
+                            OTLP_MAX_RESPONSE_BODY_BYTES,
+                            None,
+                        )
+                        .await
+                        .map_err(|err| -> HttpError {
+                            match err {
+                                crate::response::BodyReadError::TooLarge => {
+                                    Box::new(ResponseBodyTooLarge::new())
                                 }
-                                collected.extend_from_slice(&data);
+                                crate::response::BodyReadError::TimedOut => {
+                                    "OTLP HTTP export timed out".into()
+                                }
+                                crate::response::BodyReadError::Body(e) => Box::new(e),
                             }
-                        }
-                        Ok(http::Response::from_parts(parts, collected.freeze()))
+                        })?;
+                        Ok(http::Response::from_parts(parts, collected))
                     });
 
                     let sleep = tokio::time::sleep_until(deadline);

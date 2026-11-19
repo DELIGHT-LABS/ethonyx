@@ -689,6 +689,13 @@ async fn http2_websocket_rejects_missing_invalid_and_duplicate_versions_without_
             .unwrap()
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get("sec-websocket-version")
+                .and_then(|v| v.to_str().ok()),
+            Some("13")
+        );
     }
     assert!(
         tokio::time::timeout(Duration::from_millis(100), listener.accept())

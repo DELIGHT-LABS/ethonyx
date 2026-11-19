@@ -1,31 +1,33 @@
 use std::convert::Infallible;
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
-use http_body_util::BodyExt;
-use hyper::body::{Body, Frame, Incoming, SizeHint};
+use http::uri::PathAndQuery;
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version};
+use hyper::body::{Body as _, Incoming};
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{Instrument, debug, info, trace, warn};
 
-use crate::BoxError;
-use crate::headers::{sanitize_response_headers, strip_hop_by_hop};
+use crate::headers::{
+    has_non_100_expect, has_unsupported_transfer_encoding, sanitize_response_headers,
+    strip_hop_by_hop,
+};
 use crate::health;
 use crate::metrics::{MethodBucket, UpstreamLayer};
 use crate::response::{
-    ResBody, empty_body, full_body, raw_json_response, text_response, uri_too_long_response,
+    BodyReadError, PrefixBody, ResBody, collect_prefix_or_stream, drain_body, empty_body,
+    full_body, prometheus_response, raw_json_response, status_response, text_response,
+    uri_too_long_response,
 };
 use crate::state::{AppState, ClState};
 use crate::transport::{HttpTarget, WsTarget};
 use crate::websocket::WsMode;
 
-const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MOCK_DRAIN_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MOCK_INSPECT_BYTES: usize = 64 * 1024;
 
 /// Permit bounding concurrent WebSocket relays across both HTTP/1.1 `Upgrade`
 /// and HTTP/2 Extended `CONNECT` streams under `--max-connections`.
@@ -100,30 +102,45 @@ impl Connection {
         self: Arc<Self>,
         req: Request<Incoming>,
     ) -> Result<Response<ResBody>, Infallible> {
+        let is_head = req.method() == Method::HEAD;
+        // Hyper's HTTP/2 server does not suppress bodies for `Method::HEAD` (unlike
+        // HTTP/1.1, which preserves local `text_response` `Content-Length` while
+        // omitting body bytes on the wire), so strip non-empty bodies on HTTP/2
+        // `HEAD` here while keeping all response headers intact.
+        let strip_head_body = is_head && req.version() == Version::HTTP_2;
+        let finish = |mut resp: Response<ResBody>| {
+            if strip_head_body && !resp.body().is_end_stream() {
+                *resp.body_mut() = empty_body();
+            }
+            Ok(resp)
+        };
         // The same decision drives routing, metrics and access logs. GET/HEAD
         // probes, unconfigured CL/WS routes, and invalid targets return locally
         // without upstream metrics/spans.
         let forward = match classify_request(&req) {
-            Route::Probe(probe) => return Ok(probe.response(req.method(), &self.state)),
+            Route::Probe(probe) => return Ok(probe.response(is_head, &self.state)),
             Route::Reject => {
-                return Ok(text_response(
+                return finish(text_response(
                     StatusCode::BAD_REQUEST,
                     "invalid request target",
                 ));
             }
             Route::Proxy(target) => {
                 let Some(forward) = Forward::resolve(target, &self.state) else {
-                    return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
+                    return finish(text_response(StatusCode::NOT_FOUND, "not found"));
                 };
                 forward
             }
         };
         let (layer, upstream_proto) = forward.layer_and_proto();
-        let upstream_type = layer.as_str();
         let method_bucket = MethodBucket::classify(req.method());
-        let version = req.version();
-        let access_ctx = tracing::enabled!(target: "access_log", tracing::Level::INFO)
-            .then(|| (req.method().clone(), req.uri().clone()));
+        let access_ctx = tracing::enabled!(target: "access_log", tracing::Level::INFO).then(|| {
+            (
+                req.version(),
+                req.method().clone(),
+                req.uri().path_and_query().cloned(),
+            )
+        });
         let otel_enabled = self.state.opts.otel_enabled;
         let span = if otel_enabled || tracing::enabled!(tracing::Level::DEBUG) {
             let span = tracing::info_span!(
@@ -131,7 +148,7 @@ impl Connection {
                 "request",
                 method = %req.method(),
                 path = req.uri().path(),
-                upstream = upstream_type,
+                upstream = layer.as_str(),
                 http.response.status_code = tracing::field::Empty,
             );
             if otel_enabled {
@@ -142,36 +159,30 @@ impl Connection {
             tracing::Span::none()
         };
         let start = std::time::Instant::now();
-        let res = route(req, &self, forward).instrument(span.clone()).await;
-        let response = res.unwrap_or_else(|e| {
-            warn!(
-                upstream = upstream_type,
-                proto = upstream_proto,
-                error = %e,
-                "upstream proxy error"
-            );
-            text_response(StatusCode::BAD_GATEWAY, "bad gateway")
-        });
+        let response = route(req, &self, forward).instrument(span.clone()).await;
         let elapsed = start.elapsed();
         let status = response.status().as_u16();
         if !span.is_disabled() {
             // Pass `i64` so `tracing-opentelemetry` records an integer attribute (`Value::I64`)
             // per OTel HTTP semantic conventions without allocating a formatted `String`.
             span.record("http.response.status_code", i64::from(status));
+            // On `otel` builds, keep this ungated on `otel_enabled` so library callers
+            // with an external `tracing-opentelemetry` layer also receive `Status::Error`
+            // on 5xx (no-op on default builds without the `otel` feature).
             if status >= 500 {
                 crate::otel::mark_span_error(&span);
             }
         }
         drop(span);
-        if let Some((method, uri)) = access_ctx {
+        if let Some((version, method, pq)) = access_ctx {
             info!(
                 target: "access_log",
                 peer = %self.peer,
                 ?version,
                 %method,
-                path = uri.path(),
-                upstream = upstream_type,
-                proto = upstream_proto,
+                path = pq.as_ref().map_or("/", PathAndQuery::path),
+                upstream = layer.as_str(),
+                proto = upstream_proto.as_str(),
                 status,
                 latency_ms = elapsed.as_secs_f64() * 1000.0,
                 "request"
@@ -180,7 +191,7 @@ impl Connection {
         self.state
             .metrics
             .record_request(layer, method_bucket, status, elapsed);
-        Ok(response)
+        finish(response)
     }
 }
 
@@ -207,24 +218,16 @@ enum Probe {
 }
 
 impl Probe {
-    fn response(self, method: &Method, state: &AppState) -> Response<ResBody> {
-        let head = method == Method::HEAD;
+    fn response(self, head: bool, state: &AppState) -> Response<ResBody> {
         match self {
             Self::Health => health::report(state, head),
             Self::Ready => health::ready(state, head),
             Self::Live => text_response(StatusCode::OK, if head { "" } else { "ok" }),
-            Self::Metrics => {
-                let body = if head {
-                    empty_body()
-                } else {
-                    full_body(Bytes::from(state.metrics.render_prometheus()))
-                };
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                    .body(body)
-                    .expect("response builder")
-            }
+            Self::Metrics => prometheus_response(if head {
+                Bytes::new()
+            } else {
+                Bytes::from(state.metrics.render_prometheus())
+            }),
         }
     }
 }
@@ -246,14 +249,18 @@ fn classify_request<B>(req: &Request<B>) -> Route {
             return Route::Probe(probe);
         }
     }
-    // CL routes take precedence over upgrade headers, as in the forwarding path.
-    let is_cl = is_cl_path(path);
-    if !is_cl && let Some(mode) = WsMode::classify(req) {
-        Route::Proxy(Target::WebSocket(mode))
-    } else if req.method() == Method::CONNECT {
-        Route::Reject
-    } else if is_cl {
+    if req.method() == Method::CONNECT {
+        return if !is_cl_path(path) && WsMode::is_extended_connect(req) {
+            Route::Proxy(Target::WebSocket(WsMode::ExtendedConnect))
+        } else {
+            Route::Reject
+        };
+    }
+    // CL routes take precedence over upgrade headers.
+    if is_cl_path(path) {
         Route::Proxy(Target::Cl)
+    } else if WsMode::is_upgrade(req) {
+        Route::Proxy(Target::WebSocket(WsMode::Upgrade))
     } else {
         Route::Proxy(Target::El)
     }
@@ -268,6 +275,21 @@ fn is_cl_path(path: &str) -> bool {
         segment,
         "eth" | "teku" | "prysm" | "nimbus" | "lodestar" | "lighthouse"
     )
+}
+
+#[derive(Clone, Copy)]
+enum UpstreamProto {
+    Http,
+    Ws,
+}
+
+impl UpstreamProto {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "HTTP",
+            Self::Ws => "WS",
+        }
+    }
 }
 
 /// A [`Target`] bound to the configured upstream it requires.
@@ -287,11 +309,11 @@ impl<'a> Forward<'a> {
         })
     }
 
-    const fn layer_and_proto(self) -> (UpstreamLayer, &'static str) {
+    const fn layer_and_proto(self) -> (UpstreamLayer, UpstreamProto) {
         match self {
-            Self::Cl(_) => (UpstreamLayer::Cl, "HTTP"),
-            Self::El => (UpstreamLayer::El, "HTTP"),
-            Self::WebSocket(..) => (UpstreamLayer::El, "WS"),
+            Self::Cl(_) => (UpstreamLayer::Cl, UpstreamProto::Http),
+            Self::El => (UpstreamLayer::El, UpstreamProto::Http),
+            Self::WebSocket(..) => (UpstreamLayer::El, UpstreamProto::Ws),
         }
     }
 }
@@ -300,155 +322,170 @@ async fn route(
     req: Request<Incoming>,
     connection: &Arc<Connection>,
     forward: Forward<'_>,
-) -> Result<Response<ResBody>, BoxError> {
+) -> Response<ResBody> {
     let state = &connection.state;
     trace!(method = %req.method(), path = req.uri().path(), "routing request");
     match forward {
-        Forward::Cl(cl) => proxy_cl(req, state, cl).await,
+        Forward::Cl(cl) => proxy_http(req, state, Some(cl)).await,
+        Forward::El => proxy_http(req, state, None).await,
         Forward::WebSocket(mode, ws) => {
-            crate::websocket::upgrade(req, mode, ws, state, &connection.lifecycle, || {
-                connection.acquire_ws_permit(mode)
-            })
+            Box::pin(crate::websocket::upgrade(
+                req,
+                mode,
+                ws,
+                state,
+                &connection.lifecycle,
+                || connection.acquire_ws_permit(mode),
+            ))
             .await
         }
-        Forward::El => proxy_el(req, state).await,
     }
-}
-
-async fn proxy_cl(
-    req: Request<Incoming>,
-    state: &AppState,
-    cl: &ClState,
-) -> Result<Response<ResBody>, BoxError> {
-    if (req.method() == Method::GET || req.method() == Method::HEAD)
-        && req.uri().path() == "/eth/v1/node/health"
-        && cl.mock_node_health
-    {
-        return Ok(health::node_health(state));
-    }
-    if req.method() == Method::POST
-        && cl.mock_subscriptions
-        && matches!(
-            req.uri().path(),
-            "/eth/v1/validator/prepare_beacon_proposer"
-                | "/eth/v1/validator/beacon_committee_subscriptions"
-                | "/eth/v1/validator/sync_committee_subscriptions"
-        )
-    {
-        if let Err(err) = drain_limited(req.into_body(), state.opts.proxy_timeout).await {
-            return Ok(err.into_response());
-        }
-        return Ok(raw_json_response(
-            StatusCode::OK,
-            Bytes::from_static(b"{\"code\":200,\"message\":\"success\"}"),
-        ));
-    }
-    let (mut parts, body) = req.into_parts();
-    let target = if parts.method == Method::POST
-        && parts.uri.path() == "/eth/v1/validator/register_validator"
-        && let Some(ref mev) = cl.mev_relay
-    {
-        let Ok(replaced) =
-            crate::upstream::replace_uri_path(parts.uri, "/eth/v1/builder/validators")
-        else {
-            return Ok(uri_too_long_response());
-        };
-        parts.uri = replaced;
-        mev
-    } else {
-        &cl.beacon
-    };
-    execute_upstream(parts, box_incoming(body), state, target).await
-}
-
-async fn proxy_el(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
-    let (parts, body) = if req.method() == Method::POST && state.opts.mock_eth_syncing {
-        let (parts, body) = req.into_parts();
-        let bytes = match collect_limited(body, state.opts.proxy_timeout).await {
-            Ok(bytes) => bytes,
-            Err(err) => return Ok(err.into_response()),
-        };
-        if let Some(mock_res) = try_mock_eth_syncing(&bytes) {
-            return Ok(mock_res);
-        }
-        (parts, full_body(bytes))
-    } else {
-        let (parts, body) = req.into_parts();
-        (parts, box_incoming(body))
-    };
-    // Select at dispatch, after any mock body inspection: local replies need
-    // no transport lookup, and forwarded requests follow the latest verdict.
-    execute_upstream(parts, body, state, &state.el).await
 }
 
 #[derive(Clone, Copy)]
-struct BodyReadError {
-    status: StatusCode,
-    message: &'static str,
+enum LocalMock {
+    NodeHealth,
+    ClSubscription,
+    ElSyncing,
 }
 
-impl BodyReadError {
-    fn into_response(self) -> Response<ResBody> {
-        text_response(self.status, self.message)
+async fn proxy_http(
+    req: Request<Incoming>,
+    state: &AppState,
+    cl: Option<&ClState>,
+) -> Response<ResBody> {
+    let (parts, body) = req.into_parts();
+    if has_unsupported_transfer_encoding(&parts.headers) {
+        return text_response(StatusCode::NOT_IMPLEMENTED, "unsupported transfer encoding");
     }
+
+    let mock = match cl {
+        Some(cl)
+            if cl.mock_node_health
+                && matches!(parts.method, Method::GET | Method::HEAD)
+                && parts.uri.path() == "/eth/v1/node/health" =>
+        {
+            Some(LocalMock::NodeHealth)
+        }
+        Some(cl)
+            if cl.mock_subscriptions
+                && parts.method == Method::POST
+                && matches!(
+                    parts.uri.path(),
+                    "/eth/v1/validator/prepare_beacon_proposer"
+                        | "/eth/v1/validator/beacon_committee_subscriptions"
+                        | "/eth/v1/validator/sync_committee_subscriptions"
+                ) =>
+        {
+            Some(LocalMock::ClSubscription)
+        }
+        None if state.opts.mock_eth_syncing && parts.method == Method::POST => {
+            Some(LocalMock::ElSyncing)
+        }
+        _ => None,
+    };
+
+    let (body, deadline) = match mock {
+        Some(mock) if !has_non_100_expect(&parts.headers) => match mock {
+            LocalMock::NodeHealth => return health::node_health(state, parts.uri.query()),
+            LocalMock::ClSubscription => {
+                let deadline = tokio::time::Instant::now() + state.opts.proxy_timeout;
+                if let Err(err) = drain_body(body, MAX_MOCK_DRAIN_BYTES, deadline).await {
+                    return body_read_error_response(err);
+                }
+                return raw_json_response(
+                    StatusCode::OK,
+                    Bytes::from_static(b"{\"code\":200,\"message\":\"success\"}"),
+                );
+            }
+            LocalMock::ElSyncing => {
+                let deadline = tokio::time::Instant::now() + state.opts.proxy_timeout;
+                match collect_prefix_or_stream(body, MAX_MOCK_INSPECT_BYTES, deadline).await {
+                    Ok(PrefixBody::Complete(bytes)) => {
+                        if let Some(mock_res) = try_mock_eth_syncing(&bytes) {
+                            return mock_res;
+                        }
+                        (full_body(bytes), Some(deadline))
+                    }
+                    Ok(PrefixBody::Overflow { prefix, rest }) => {
+                        (ResBody::prefixed(prefix, rest), Some(deadline))
+                    }
+                    Err(err) => return body_read_error_response(err),
+                }
+            }
+        },
+        _ => (ResBody::incoming(body), None),
+    };
+
+    let (target, layer, path_override) = match cl {
+        Some(cl) => {
+            let (target, path_override) = if let Some(mev) = &cl.mev_relay
+                && parts.method == Method::POST
+                && parts.uri.path() == "/eth/v1/validator/register_validator"
+            {
+                (mev, Some("/eth/v1/builder/validators"))
+            } else {
+                (&cl.beacon, None)
+            };
+            (target, UpstreamLayer::Cl, path_override)
+        }
+        None => (&state.el, UpstreamLayer::El, None),
+    };
+    // Select EL transport at dispatch, after any mock body inspection: local replies need
+    // no transport lookup, and forwarded requests follow the latest verdict.
+    execute_upstream(parts, body, state, target, layer, path_override, deadline).await
 }
 
-fn map_limited_body_error(err: BoxError) -> BodyReadError {
-    if err.is::<http_body_util::LengthLimitError>() {
-        BodyReadError {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: "request body exceeds limit",
+fn body_read_error_response(err: BodyReadError<hyper::Error>) -> Response<ResBody> {
+    match err {
+        BodyReadError::TooLarge => {
+            text_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds limit")
         }
-    } else {
-        debug!(error = %err, "failed to read request body");
-        BodyReadError {
-            status: StatusCode::BAD_REQUEST,
-            message: "failed to read request body",
+        BodyReadError::TimedOut => {
+            text_response(StatusCode::REQUEST_TIMEOUT, "request body timed out")
+        }
+        BodyReadError::Body(err) => {
+            debug!(error = %err, "failed to read request body");
+            text_response(StatusCode::BAD_REQUEST, "failed to read request body")
         }
     }
-}
-
-async fn run_limited_body<T, F>(timeout: Duration, fut: F) -> Result<T, BodyReadError>
-where
-    F: Future<Output = Result<T, BoxError>>,
-{
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(val)) => Ok(val),
-        Ok(Err(err)) => Err(map_limited_body_error(err)),
-        Err(_) => Err(BodyReadError {
-            status: StatusCode::REQUEST_TIMEOUT,
-            message: "request body timed out",
-        }),
-    }
-}
-
-async fn drain_limited(body: Incoming, timeout: Duration) -> Result<(), BodyReadError> {
-    run_limited_body(timeout, async move {
-        let mut limited = http_body_util::Limited::new(body, MAX_BUFFERED_REQUEST_BYTES);
-        while let Some(frame) = limited.frame().await {
-            let _ = frame?;
-        }
-        Ok(())
-    })
-    .await
-}
-
-async fn collect_limited(body: Incoming, timeout: Duration) -> Result<Bytes, BodyReadError> {
-    run_limited_body(timeout, async move {
-        let collected = http_body_util::Limited::new(body, MAX_BUFFERED_REQUEST_BYTES)
-            .collect()
-            .await?;
-        Ok(collected.to_bytes())
-    })
-    .await
 }
 
 fn try_mock_eth_syncing(bytes: &[u8]) -> Option<Response<ResBody>> {
     match crate::rpc::mock_syncing(bytes) {
         crate::rpc::MockResult::Forward => None,
-        crate::rpc::MockResult::Silent => Some(text_response(StatusCode::NO_CONTENT, "")),
+        crate::rpc::MockResult::Silent => Some(status_response(StatusCode::NO_CONTENT)),
         crate::rpc::MockResult::Reply(body) => {
             Some(raw_json_response(StatusCode::OK, Bytes::from(body)))
+        }
+    }
+}
+
+/// Upstream response framing disposition classified once from `(status, is_head)`
+/// after rejecting `1xx` responses.
+#[derive(Clone, Copy)]
+enum RespFraming {
+    /// `204 No Content`: never carries a body; strips `Content-Length` and rejects
+    /// unsupported `Transfer-Encoding` codings.
+    NoContent,
+    /// `205 Reset Content`: MUST NOT carry message content; rejects unsupported
+    /// `Transfer-Encoding` and non-zero `Content-Length`, then drains with a 0-byte cap.
+    ResetContent,
+    /// `304 Not Modified` or `HEAD` (except `204`/`205`): carries no wire body and
+    /// may advertise representation `Transfer-Encoding` as metadata (stripped on hop).
+    BodylessMetadata,
+    /// Normal response carrying a streamed message body.
+    Stream,
+}
+
+impl RespFraming {
+    const fn classify(status: StatusCode, is_head: bool) -> Self {
+        match status {
+            StatusCode::NO_CONTENT => Self::NoContent,
+            StatusCode::RESET_CONTENT => Self::ResetContent,
+            StatusCode::NOT_MODIFIED => Self::BodylessMetadata,
+            _ if is_head => Self::BodylessMetadata,
+            _ => Self::Stream,
         }
     }
 }
@@ -458,17 +495,33 @@ async fn execute_upstream(
     body: ResBody,
     state: &AppState,
     target: &HttpTarget,
-) -> Result<Response<ResBody>, BoxError> {
-    let Ok(rewritten) = target.upstream.rewrite_uri(parts.uri) else {
-        return Ok(uri_too_long_response());
+    layer: UpstreamLayer,
+    path_override: Option<&'static str>,
+    deadline: Option<tokio::time::Instant>,
+) -> Response<ResBody> {
+    let Ok(rewritten) = target
+        .upstream
+        .rewrite_uri_with_path(parts.uri, path_override)
+    else {
+        return uri_too_long_response();
     };
     parts.uri = rewritten;
     // Strip hop-by-hop and Connection-nominated headers BEFORE injecting OTel
     // trace context so `Connection: traceparent` cannot strip outgoing spans.
     strip_hop_by_hop(&mut parts.headers);
+    // `strip_hop_by_hop` drops `Content-Length` so Hyper recalculates framing,
+    // but Hyper's HTTP/1.1 client omits `Content-Length` when `is_end_stream()`.
+    // Restore `Content-Length: 0` on bodyless payload methods (matching Hyper's
+    // HTTP/2 client and RFC 9110 §8.6) so strict upstreams do not return `411`.
+    if body.is_end_stream() && matches!(parts.method, Method::POST | Method::PUT | Method::PATCH) {
+        parts
+            .headers
+            .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    }
     if state.opts.otel_enabled {
         crate::otel::propagate_context(&mut parts.headers);
     }
+    let is_head = parts.method == Method::HEAD;
     parts.extensions.clear();
     // The inbound version (e.g. HTTP/2) must not be forced onto the upstream
     // connection — normalize so the client uses whatever the upstream negotiates
@@ -476,30 +529,105 @@ async fn execute_upstream(
     parts.version = Version::HTTP_11;
     let upstream_req = Request::from_parts(parts, body);
 
-    let resp = tokio::time::timeout(
-        state.opts.proxy_timeout,
+    let deadline =
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + state.opts.proxy_timeout);
+    let resp = match tokio::time::timeout_at(
+        deadline,
         target.transport.request(&state.client, upstream_req),
     )
     .await
-    .map_err(|_| -> BoxError { "upstream timeout".into() })??;
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(err)) => return bad_gateway(layer, err),
+        Err(_) => return bad_gateway(layer, "upstream timeout"),
+    };
 
     let (mut resp_parts, resp_body) = resp.into_parts();
+    if resp_parts.status.is_informational() {
+        return bad_gateway(layer, "unexpected 1xx upstream response");
+    }
+    let framing = RespFraming::classify(resp_parts.status, is_head);
+    // RFC 9112 §6.1 / §6.3: `304` and non-204/205 `HEAD` responses carry no wire body
+    // and may advertise representation transfer codings as metadata (stripped below on
+    // the hop boundary); all other responses reject unsupported transfer codings.
+    if !matches!(framing, RespFraming::BodylessMetadata)
+        && has_unsupported_transfer_encoding(&resp_parts.headers)
+    {
+        return bad_gateway(layer, "unsupported upstream transfer-encoding");
+    }
+    // Normalize the upstream hop's version and clear client-side extensions
+    // (`ReasonPhrase`, `OnUpgrade`) so HTTP/2 upstreams keep Hyper's HTTP/1.1
+    // fast path and HTTP/1.0 upstreams cannot downgrade downstream keep-alive.
+    resp_parts.version = Version::HTTP_11;
+    resp_parts.extensions.clear();
     sanitize_response_headers(resp_parts.status, &mut resp_parts.headers);
-    let idle_timeout = response_idle_timeout(
-        &resp_parts.headers,
-        state.opts.proxy_timeout,
-        state.opts.sse_idle_timeout,
+    let body = match framing {
+        RespFraming::ResetContent => {
+            // RFC 9110 §15.3.6: `205 Reset Content` MUST NOT carry message content,
+            // but valid upstreams may frame an empty body as chunked (`0\r\n\r\n`),
+            // EOF, or an open H2 stream before `END_STREAM`. Reject non-zero
+            // `Content-Length` upfront, then drain with a 0-byte cap (zero-poll on
+            // `is_end_stream()`, preserves H1 keep-alive on empty chunked, and
+            // rejects any non-empty payload as `502`).
+            if resp_parts
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .is_some_and(|v| v != "0")
+            {
+                return bad_gateway(layer, "non-empty 205 upstream response");
+            }
+            if let Err(err) = drain_body(resp_body, 0, deadline).await {
+                return match err {
+                    BodyReadError::TooLarge => {
+                        bad_gateway(layer, "non-empty 205 upstream response")
+                    }
+                    BodyReadError::TimedOut => bad_gateway(layer, "upstream 205 body timeout"),
+                    BodyReadError::Body(err) => {
+                        bad_gateway(layer, format_args!("upstream 205 body error: {err}"))
+                    }
+                };
+            }
+            empty_body()
+        }
+        RespFraming::NoContent | RespFraming::BodylessMetadata => {
+            // Collapse `HEAD` and bodyless statuses unconditionally so downstream
+            // never wraps `Incoming` in `IdleTimeoutBody`, re-inserts `content-length`
+            // from an unclosed H2 `204`/`304`, or pipes forbidden `DATA` frames.
+            empty_body()
+        }
+        RespFraming::Stream => ResBody::streaming(
+            resp_body,
+            response_idle_timeout(
+                &resp_parts.headers,
+                state.opts.proxy_timeout,
+                state.opts.sse_idle_timeout,
+            ),
+        ),
+    };
+    Response::from_parts(resp_parts, body)
+}
+
+fn bad_gateway(layer: UpstreamLayer, error: impl std::fmt::Display) -> Response<ResBody> {
+    warn!(
+        upstream = layer.as_str(),
+        proto = UpstreamProto::Http.as_str(),
+        %error,
+        "upstream proxy error"
     );
-    let body = IdleTimeoutBody::new(resp_body, idle_timeout).boxed_unsync();
-    Ok(Response::from_parts(resp_parts, body))
+    text_response(StatusCode::BAD_GATEWAY, "bad gateway")
 }
 
 fn is_event_stream(headers: &HeaderMap) -> bool {
-    headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|ct| ct.split(';').next())
-        .is_some_and(|media| media.trim_ascii().eq_ignore_ascii_case("text/event-stream"))
+    headers.get(http::header::CONTENT_TYPE).is_some_and(|v| {
+        let bytes = v.as_bytes();
+        let media = bytes
+            .iter()
+            .position(|&b| b == b';')
+            .map_or(bytes, |idx| &bytes[..idx]);
+        media
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"text/event-stream")
+    })
 }
 
 fn response_idle_timeout(
@@ -514,93 +642,9 @@ fn response_idle_timeout(
     }
 }
 
-/// Streaming response body wrapper that enforces a per-frame idle timeout while
-/// preserving `Body::size_hint` and `Body::is_end_stream` (keeping `Content-Length`
-/// intact on HTTP/1.1 responses) and allocating `Sleep` lazily only if `Pending`.
-struct IdleTimeoutBody<B> {
-    inner: B,
-    timeout: Option<Duration>,
-    deadline: crate::lifecycle::LazyDeadline,
-    done: bool,
-}
-
-impl<B> IdleTimeoutBody<B> {
-    const fn new(inner: B, timeout: Option<Duration>) -> Self {
-        Self {
-            inner,
-            timeout,
-            deadline: crate::lifecycle::LazyDeadline::new(),
-            done: false,
-        }
-    }
-}
-
-impl<B> Body for IdleTimeoutBody<B>
-where
-    B: Body<Data = Bytes> + Unpin,
-    B::Error: Into<BoxError>,
-{
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = &mut *self;
-        if this.done {
-            return Poll::Ready(None);
-        }
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                this.deadline.disarm();
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(Some(Err(err))) => {
-                this.deadline.disarm();
-                this.done = true;
-                Poll::Ready(Some(Err(err.into())))
-            }
-            Poll::Ready(None) => {
-                this.deadline.disarm();
-                this.done = true;
-                Poll::Ready(None)
-            }
-            Poll::Pending => {
-                let Some(duration) = this.timeout else {
-                    return Poll::Pending;
-                };
-                if this.deadline.poll_expired(cx, duration) {
-                    this.done = true;
-                    Poll::Ready(Some(Err("response body idle timeout".into())))
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.done || self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-fn box_incoming<B>(body: B) -> ResBody
-where
-    B: Body<Data = Bytes> + Send + 'static,
-    B::Error: Into<BoxError>,
-{
-    body.map_err(Into::into).boxed_unsync()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::Full;
 
     #[test]
     fn test_is_cl_path() {
@@ -678,7 +722,7 @@ mod tests {
                     assert_eq!(
                         classify_request(&req),
                         if method == Method::POST {
-                            // Malformed H1 upgrades still reach Tungstenite's validator.
+                            // Non-GET H1 upgrades are rejected early in `WsMode::response`.
                             Route::Proxy(Target::WebSocket(WsMode::Upgrade))
                         } else {
                             expected
@@ -710,15 +754,24 @@ mod tests {
                 .insert(hyper::ext::Protocol::from_static("websocket"));
             assert_eq!(classify_request(&connect_req), Route::Reject);
         }
-        let mut req = Request::builder()
-            .version(Version::HTTP_2)
-            .method(Method::CONNECT)
-            .uri("/")
-            .body(())
-            .unwrap();
-        req.extensions_mut()
-            .insert(hyper::ext::Protocol::from_static("other"));
-        assert_eq!(classify_request(&req), Route::Reject);
+        // Origin-form `CONNECT /` with HTTP/1.1 Upgrade headers (and non-websocket
+        // HTTP/2 CONNECT + Upgrade headers) must still be rejected as `Route::Reject`.
+        for version in [Version::HTTP_10, Version::HTTP_11, Version::HTTP_2] {
+            let mut bad_connect = Request::builder()
+                .version(version)
+                .method(Method::CONNECT)
+                .uri("/")
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .body(())
+                .unwrap();
+            if version == Version::HTTP_2 {
+                bad_connect
+                    .extensions_mut()
+                    .insert(hyper::ext::Protocol::from_static("other"));
+            }
+            assert_eq!(classify_request(&bad_connect), Route::Reject);
+        }
 
         let root_get = Request::builder()
             .method(Method::GET)
@@ -763,11 +816,16 @@ mod tests {
         let req = r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":101}"#;
         assert!(try_mock_eth_syncing(req.as_bytes()).is_none());
 
-        // Notification eth_syncing returns 204 No Content with an empty body
-        let notif = r#"{"jsonrpc":"2.0","method":"eth_syncing"}"#;
-        let res = try_mock_eth_syncing(notif.as_bytes()).unwrap();
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
-        assert!(res.body().is_end_stream());
+        // Notification eth_syncing returns 204 No Content with an empty body and no headers
+        for notif in [
+            r#"{"jsonrpc":"2.0","method":"eth_syncing"}"#,
+            r#"[{"jsonrpc":"2.0","method":"eth_syncing"}]"#,
+        ] {
+            let res = try_mock_eth_syncing(notif.as_bytes()).unwrap();
+            assert_eq!(res.status(), StatusCode::NO_CONTENT);
+            assert!(res.body().is_end_stream());
+            assert!(res.headers().is_empty());
+        }
 
         // Batch eth_syncing request
         let batch = r#"[{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}]"#;
@@ -813,75 +871,6 @@ mod tests {
                 "ct={ct} disabled"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn idle_timeout_body_preserves_size_hint_and_avoids_timer_when_immediately_ready() {
-        let payload = Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x1\"}");
-        let mut body =
-            IdleTimeoutBody::new(Full::new(payload.clone()), Some(Duration::from_secs(5)));
-        assert!(!body.is_end_stream());
-        assert_eq!(body.size_hint().exact(), Some(payload.len() as u64));
-
-        let collected = (&mut body).collect().await.unwrap().to_bytes();
-        assert_eq!(collected, payload);
-        assert!(
-            !body.deadline.is_allocated(),
-            "immediate bodies must not allocate Sleep"
-        );
-        assert!(body.is_end_stream());
-
-        let empty = IdleTimeoutBody::new(Full::new(Bytes::new()), Some(Duration::from_secs(5)));
-        assert!(empty.is_end_stream());
-        assert_eq!(empty.size_hint().exact(), Some(0));
-    }
-
-    struct ChannelBody(tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, Infallible>>);
-
-    impl Body for ChannelBody {
-        type Data = Bytes;
-        type Error = Infallible;
-
-        fn poll_frame(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            self.0.poll_recv(cx)
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_timeout_body_resets_between_chunks_and_aborts_when_stalled() {
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let mut body = IdleTimeoutBody::new(ChannelBody(rx), Some(Duration::from_secs(10)));
-
-        let reader = tokio::spawn(async move {
-            let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
-            assert_eq!(first, Bytes::from_static(b"chunk-1"));
-            let second = body.frame().await.unwrap().unwrap().into_data().unwrap();
-            assert_eq!(second, Bytes::from_static(b"chunk-2"));
-            let err = body.frame().await.unwrap().unwrap_err();
-            assert_eq!(err.to_string(), "response body idle timeout");
-            assert!(body.frame().await.is_none(), "body must fuse after timeout");
-        });
-
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(7)).await;
-        tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-1"))))
-            .await
-            .unwrap();
-        tokio::task::yield_now().await;
-
-        // Another 7s (14s total > 10s, but < 10s since chunk-1) must succeed.
-        tokio::time::advance(Duration::from_secs(7)).await;
-        tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-2"))))
-            .await
-            .unwrap();
-        tokio::task::yield_now().await;
-
-        // Stalling > 10s with tx still open triggers the idle timeout.
-        tokio::time::advance(Duration::from_secs(11)).await;
-        reader.await.unwrap();
     }
 
     #[test]
@@ -948,5 +937,46 @@ mod tests {
         assert!(p1_reused.is_some());
         drop((p2, p1_reused));
         assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn probes_match_head_headers_and_skip_bodies() {
+        use clap::Parser;
+
+        let cfg = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+        ]);
+        let parsed = cfg.parse_validated().unwrap();
+        let (state, _) = AppState::start(
+            parsed.opts,
+            parsed.upstreams,
+            parsed.health,
+            crate::metrics::ServerMetrics::default(),
+        )
+        .await;
+        state.metrics.inc_saturated();
+
+        for (head, has_body) in [(false, true), (true, false)] {
+            let res = Probe::Metrics.response(head, &state);
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(
+                res.headers()[http::header::CONTENT_TYPE],
+                "text/plain; version=0.0.4; charset=utf-8"
+            );
+            assert_eq!(res.body().is_end_stream(), !has_body, "head={head}");
+        }
+
+        // Every probe answers `HEAD` with the status and headers of its `GET` and no body.
+        for probe in [Probe::Health, Probe::Ready, Probe::Live, Probe::Metrics] {
+            let get = probe.response(false, &state);
+            let head = probe.response(true, &state);
+            assert_eq!(head.status(), get.status(), "{probe:?}");
+            assert_eq!(head.headers(), get.headers(), "{probe:?}");
+            assert!(!get.body().is_end_stream(), "{probe:?}");
+            assert!(head.body().is_end_stream(), "{probe:?}");
+        }
     }
 }

@@ -252,18 +252,47 @@ pub(crate) fn ready(state: &AppState, head: bool) -> Response<ResBody> {
 ///   lagging behind reference RPCs, or stale under `--readyz-strict`.
 ///
 /// Serves an empty body with `content-type: application/json` in compliance with the spec.
-pub(crate) fn node_health(state: &AppState) -> Response<ResBody> {
+pub(crate) fn node_health(state: &AppState, query: Option<&str>) -> Response<ResBody> {
+    let Ok(syncing_status) = parse_syncing_status(query) else {
+        return crate::response::text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid syncing_status query parameter",
+        );
+    };
     let code = match &state.health {
         HealthSource::Trusted => StatusCode::OK,
         HealthSource::Polled { rx, policy } => {
             let probe = rx.borrow();
-            classify_node_health(evaluate_readiness(*policy, &probe))
+            classify_node_health(evaluate_readiness(*policy, &probe), syncing_status)
         }
     };
     empty_json_response(code)
 }
 
-fn classify_node_health(eval: ReadinessEval<'_>) -> StatusCode {
+fn parse_syncing_status(query: Option<&str>) -> Result<StatusCode, ()> {
+    let Some(query) = query else {
+        return Ok(StatusCode::PARTIAL_CONTENT);
+    };
+    let mut custom = None;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            if pair == "syncing_status" {
+                return Err(());
+            }
+            continue;
+        };
+        if key == "syncing_status" {
+            let code = StatusCode::from_bytes(value.as_bytes()).map_err(|_| ())?;
+            if !(200..=599).contains(&code.as_u16()) {
+                return Err(());
+            }
+            custom = Some(code);
+        }
+    }
+    Ok(custom.unwrap_or(StatusCode::PARTIAL_CONTENT))
+}
+
+fn classify_node_health(eval: ReadinessEval<'_>, syncing_status: StatusCode) -> StatusCode {
     if eval.is_ready() {
         return StatusCode::OK;
     }
@@ -272,7 +301,7 @@ fn classify_node_health(eval: ReadinessEval<'_>) -> StatusCode {
     };
     let both_reachable = eval.el_sync.is_reachable() && cl_sync.is_reachable();
     if both_reachable && (eval.el_sync.is_syncing() || cl_sync.is_syncing()) {
-        StatusCode::PARTIAL_CONTENT
+        syncing_status
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
@@ -735,16 +764,23 @@ mod tests {
         // 1. Ready -> 200 OK (default and strict with fresh block)
         let ready_probe = mk_dual_probe(Ok(synced_el), Ok(fresh_block), Ok(synced_cl()), None);
         assert_eq!(
-            classify_node_health(evaluate_readiness(default_policy, &ready_probe)),
+            classify_node_health(
+                evaluate_readiness(default_policy, &ready_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::OK
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(strict_policy, &ready_probe)),
+            classify_node_health(
+                evaluate_readiness(strict_policy, &ready_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::OK
         );
 
-        // 2. EL syncing + CL reachable -> 206 Partial Content (even when block is stale/missing
-        // under --readyz-strict, CL reports `is_optimistic: true`, or node lags behind reference!)
+        // 2. EL syncing + CL reachable -> 206 Partial Content (or custom `syncing_status`
+        // when provided, even when block is stale/missing under --readyz-strict, CL reports
+        // `is_optimistic: true`, or node lags behind reference!)
         let el_sync_probe = mk_dual_probe(
             Ok(syncing_el),
             Err(HealthError::decode_msg("latest block not yet populated")),
@@ -761,11 +797,24 @@ mod tests {
             }),
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(default_policy, &el_sync_probe)),
+            classify_node_health(
+                evaluate_readiness(default_policy, &el_sync_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::PARTIAL_CONTENT
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(strict_policy, &el_sync_probe)),
+            classify_node_health(
+                evaluate_readiness(default_policy, &el_sync_probe),
+                StatusCode::OK
+            ),
+            StatusCode::OK
+        );
+        assert_eq!(
+            classify_node_health(
+                evaluate_readiness(strict_policy, &el_sync_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::PARTIAL_CONTENT
         );
 
@@ -776,7 +825,10 @@ mod tests {
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(default_policy, &el_sync_bool_probe)),
+            classify_node_health(
+                evaluate_readiness(default_policy, &el_sync_bool_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::PARTIAL_CONTENT
         );
 
@@ -788,7 +840,10 @@ mod tests {
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(default_policy, &cl_down_probe)),
+            classify_node_health(
+                evaluate_readiness(default_policy, &cl_down_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
@@ -800,14 +855,20 @@ mod tests {
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(default_policy, &el_down_probe)),
+            classify_node_health(
+                evaluate_readiness(default_policy, &el_down_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
         // 5. CL syncing + EL reachable under --readyz-strict -> 206, unless EL claims synced with unreadable block -> 503
         let cl_sync_probe = mk_dual_probe(Ok(synced_el), Ok(stale_block), Ok(syncing_cl()), None);
         assert_eq!(
-            classify_node_health(evaluate_readiness(strict_clock_policy, &cl_sync_probe)),
+            classify_node_health(
+                evaluate_readiness(strict_clock_policy, &cl_sync_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::PARTIAL_CONTENT
         );
         let strict_block_err_probe = mk_dual_probe(
@@ -817,7 +878,10 @@ mod tests {
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(strict_policy, &strict_block_err_probe)),
+            classify_node_health(
+                evaluate_readiness(strict_policy, &strict_block_err_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
@@ -833,7 +897,10 @@ mod tests {
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(default_policy, &silent_optimistic_probe)),
+            classify_node_health(
+                evaluate_readiness(default_policy, &silent_optimistic_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
@@ -847,7 +914,10 @@ mod tests {
             None,
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(default_policy, &el_offline_probe)),
+            classify_node_health(
+                evaluate_readiness(default_policy, &el_offline_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
@@ -864,8 +934,42 @@ mod tests {
             }),
         );
         assert_eq!(
-            classify_node_health(evaluate_readiness(default_policy, &lagging_synced_probe)),
+            classify_node_health(
+                evaluate_readiness(default_policy, &lagging_synced_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn parse_syncing_status_accepts_canonical_2xx_to_5xx_and_rejects_non_canonical_values() {
+        assert_eq!(parse_syncing_status(None), Ok(StatusCode::PARTIAL_CONTENT));
+        assert_eq!(
+            parse_syncing_status(Some("syncing_status=200")),
+            Ok(StatusCode::OK)
+        );
+        assert_eq!(
+            parse_syncing_status(Some("foo=1&syncing_status=503")),
+            Ok(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(
+            parse_syncing_status(Some("syncing_status=204&syncing_status=200")),
+            Ok(StatusCode::OK)
+        );
+        for bad in [
+            "syncing_status",
+            "syncing_status=",
+            "syncing_status=+200",
+            "syncing_status=00200",
+            "syncing_status=0200",
+            "syncing_status=100",
+            "syncing_status=199",
+            "syncing_status=600",
+            "syncing_status=200 ",
+            "syncing_status=abc",
+        ] {
+            assert_eq!(parse_syncing_status(Some(bad)), Err(()), "{bad}");
+        }
     }
 }

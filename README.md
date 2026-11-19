@@ -17,7 +17,7 @@ nodes and optional **Consensus Layer** (CL) Beacon node pairs (supports both `EL
 | `GET/HEAD /readyz`                   | Readiness gate (200 / 503; data-plane queries always pass through) |
 | `GET/HEAD /healthz`                  | State snapshot (always 200) |
 | `GET/HEAD /metrics`                  | Prometheus metrics scrape endpoint |
-| `GET/HEAD /eth/v1/node/health`       | ethonyx node health (200 / 206 / 503) if `--mock-cl-node-health` set, else `--cl-beacon-url` (`404` in EL-only mode) |
+| `GET/HEAD /eth/v1/node/health`       | ethonyx node health (`200` / `206` or `?syncing_status` / `400` / `503`) if `--mock-cl-node-health` set, else `--cl-beacon-url` (`404` in EL-only mode) |
 | `POST /eth/v1/validator/register_validator` | `--cl-mev-relay-url` (rewritten to `/eth/v1/builder/validators`) if set, else `--cl-beacon-url` (`404` in EL-only mode) |
 | `POST /eth/v1/validator/{prepare_beacon_proposer, beacon_committee_subscriptions, sync_committee_subscriptions}` | `200 OK` if `--mock-cl-subscriptions` set, else `--cl-beacon-url` (`404` in EL-only mode) |
 | `/eth/...`, `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...` | `--cl-beacon-url` (`404` when `--cl-beacon-url` is omitted) |
@@ -398,13 +398,13 @@ When running `ethonyx` against a fallback/secondary node or a commercial paid RP
 | `--trust-upstream`                       | `false` | Disable background health polling (0 RPC cost) and always report ready/200 (incompatible with `--readyz-strict` / `--el-reference-url`). |
 | `--mock-cl-subscriptions`                | `false` | Intercept `prepare_beacon_proposer`, `beacon_committee_subscriptions`, and `sync_committee_subscriptions` with `200 OK` (requires `--cl-beacon-url`). |
 | `--mock-eth-syncing`                     | `false` | Statically mock `eth_syncing` JSON-RPC (HTTP & WebSocket) with `result: false`. |
-| `--mock-cl-node-health`                  | `false` | Intercept `GET/HEAD /eth/v1/node/health` locally (`200`/`206`/`503`, or `200 OK` with `--trust-upstream`; requires `--cl-beacon-url`). |
+| `--mock-cl-node-health`                  | `false` | Intercept `GET/HEAD /eth/v1/node/health` locally (`200`/`206` or `?syncing_status`/`400`/`503`, or `200 OK` with `--trust-upstream`; requires `--cl-beacon-url`). |
 | `--cl-mev-relay-url`                     | `none`  | Optional upstream MEV Relay URL (`ETHONYX_CL_MEV_RELAY_URL`; requires `--cl-beacon-url`). |
 
 - **`--trust-upstream`**: When enabled, `ethonyx` trusts the upstream node and skips background EL/CL health polling (consuming zero Compute Units / API credits on commercial providers). `/healthz` reports `"mode": "trusted"` with only the active `transport` per layer (no fabricated peer or block numbers), and `/metrics` omits unpolled upstream gauges.
 - **`--mock-cl-subscriptions`**: Intercepts `POST /eth/v1/validator/prepare_beacon_proposer`, `POST /eth/v1/validator/beacon_committee_subscriptions`, and `POST /eth/v1/validator/sync_committee_subscriptions` requests (sent periodically by SSV Node / Validator Clients) and returns `HTTP 200 OK` (`{"code":200,"message":"success"}`) locally, shielding against 400 errors from commercial providers that block write-only validator APIs.
 - **`--mock-eth-syncing`**: Intercepts `eth_syncing` JSON-RPC calls over HTTP POST and WebSocket frames locally (`result: false`), shielding commercial providers from downstream client sync polls.
-- **`--mock-cl-node-health`**: Intercepts `GET/HEAD /eth/v1/node/health` requests locally using ethonyx's cached readiness state (`200` ready, `206` syncing while both layers are reachable, `503` unhealthy/stale; always `200 OK` under `--trust-upstream`), shielding commercial providers from beacon node health probes.
+- **`--mock-cl-node-health`**: Intercepts `GET/HEAD /eth/v1/node/health` requests locally using ethonyx's cached readiness state (`200` ready, `206` or the Beacon API `?syncing_status=<code>` override in `200..=599` while syncing and both layers are reachable, `400` on invalid `?syncing_status`, `503` unhealthy/stale; always `200 OK` under `--trust-upstream`), shielding commercial providers from beacon node health probes.
 - **`--cl-mev-relay-url`**: When configured (e.g., `https://boost-relay-hoodi.flashbots.net`), `ethonyx` intercepts `POST /eth/v1/validator/register_validator` requests from validator clients (such as SSV Node), rewrites the request path to `/eth/v1/builder/validators`, and forwards them directly to the specified MEV Relay.
 
 With `--trust-upstream`, cleartext HTTP uses HTTP/1.1 because health-based h2c
@@ -414,9 +414,13 @@ never retried across protocols.
 The `eth_syncing` mock handles JSON-RPC 2.0 calls and entirely local batches.
 Notifications (no `id`) produce HTTP `204` or no WebSocket message; explicit
 `id: null` still receives a reply. Mixed batches and invalid requests are
-forwarded intact. HTTP POST bodies inspected by this opt-in mock are limited to
-64 MiB (`413` on overflow) and `--proxy-timeout` (`408` on a stalled body).
-Ordinary HTTP forwarding continues to stream bodies.
+forwarded intact. HTTP POST bodies under `--mock-eth-syncing` inspect up to a
+64 KiB prefix and forward upstream under one shared `--proxy-timeout` budget
+(returning `408` if the prefix itself stalls), streaming larger bodies straight
+through to upstream without buffering or `413` (a client stall after switching
+to streaming surfaces as an upstream timeout `502`); `--mock-cl-subscriptions`
+drains request bodies up to 64 MiB (`413` on overflow) and `--proxy-timeout`
+(`408` on a stalled body). Ordinary HTTP forwarding continues to stream bodies.
 
 ## Development
 

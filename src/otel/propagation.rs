@@ -6,8 +6,7 @@ use opentelemetry::propagation::TextMapPropagator as _;
 use opentelemetry::trace::TraceContextExt as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
-const TRACEPARENT: http::HeaderName = http::HeaderName::from_static("traceparent");
-const TRACESTATE: http::HeaderName = http::HeaderName::from_static("tracestate");
+use crate::headers::{TRACEPARENT, TRACESTATE};
 
 struct HeaderMapCarrier<'a>(&'a mut http::HeaderMap);
 

@@ -693,6 +693,63 @@ async fn test_cl_node_health_intercept_and_passthrough() {
     assert_eq!(body_tr_nh.as_ref(), b"{\"error\": \"Unsupported method\"}");
 
     ethonyx_trust.shutdown().await;
+
+    // 4. Syncing node with `--mock-cl-node-health`: verify `?syncing_status=<code>`,
+    // invalid query 400, and HTTP/2 HEAD error/override responses without DATA frames.
+    let cl_syncing = MockServer::start(cl_sync_mock(
+        json!({"is_syncing": true, "sync_distance": "4", "head_slot": "100"}),
+        Some(12),
+    ))
+    .await;
+    let ethonyx_syncing = EthonyxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl_syncing.url,
+        "--mock-cl-node-health",
+    ])
+    .await;
+    let h2 = h2c_client();
+
+    let (status_default_sync, body_default_sync) =
+        get(&c, &ethonyx_syncing.url("/eth/v1/node/health")).await;
+    assert_eq!(status_default_sync, StatusCode::PARTIAL_CONTENT);
+    assert!(body_default_sync.is_empty());
+
+    let (status_override, body_override) = get(
+        &c,
+        &ethonyx_syncing.url("/eth/v1/node/health?syncing_status=200"),
+    )
+    .await;
+    assert_eq!(status_override, StatusCode::OK);
+    assert!(body_override.is_empty());
+
+    let (status_invalid, _) = get(
+        &c,
+        &ethonyx_syncing.url("/eth/v1/node/health?syncing_status=invalid"),
+    )
+    .await;
+    assert_eq!(status_invalid, StatusCode::BAD_REQUEST);
+
+    for (path, expected) in [
+        ("/eth/v1/node/health?syncing_status=200", StatusCode::OK),
+        (
+            "/eth/v1/node/health?syncing_status=invalid",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let req = Request::builder()
+            .method(Method::HEAD)
+            .uri(ethonyx_syncing.url(path))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = h2.request(req).await.unwrap();
+        assert_eq!(resp.status(), expected, "{path}");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty(), "{path} must emit no body bytes");
+    }
+
+    ethonyx_syncing.shutdown().await;
 }
 
 #[tokio::test]
