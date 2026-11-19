@@ -477,38 +477,12 @@ mod tests {
 
     #[tokio::test]
     async fn send_records_the_negotiated_version_for_tls_targets_only() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         // `TlsAuto` inspects only the response version, so a cleartext HTTP/1.1 peer suffices.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let uri: http::Uri = format!("http://{}/", listener.local_addr().unwrap())
-            .parse()
-            .unwrap();
-        struct AbortOnDrop(tokio::task::JoinHandle<()>);
-        impl Drop for AbortOnDrop {
-            fn drop(&mut self) {
-                self.0.abort();
-            }
-        }
-        let _server = AbortOnDrop(tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let mut head = Vec::new();
-                let mut buf = [0u8; 256];
-                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let Ok(n) = stream.read(&mut buf).await else {
-                        break;
-                    };
-                    if n == 0 {
-                        break;
-                    }
-                    head.extend_from_slice(&buf[..n]);
-                }
-                let _ = stream
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                    .await;
-                let _ = stream.shutdown().await;
-            }
-        }));
+        let (addr, _server) = crate::test_util::spawn_http_mock(|_| async {
+            Response::new(crate::response::empty_body())
+        })
+        .await;
+        let uri: http::Uri = format!("http://{addr}/").parse().unwrap();
         let client = build_https_client();
         let request = || {
             let mut req = Request::new(crate::response::empty_body());

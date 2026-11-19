@@ -314,6 +314,64 @@ where
 }
 
 #[cfg(test)]
+pub(crate) mod test_util {
+    /// Abort a background mock server task on drop so unit tests never leak listeners.
+    pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
+
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    /// Loop-peek up to 3 bytes to detect an HTTP/2 client preface (`"PRI"`) safely
+    /// even if TCP delivers the preface split across 1–2 byte segments.
+    pub(crate) async fn peek_is_h2_preface(stream: &tokio::net::TcpStream) -> bool {
+        let mut buf = [0u8; 3];
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                match stream.peek(&mut buf).await {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) if n >= 3 => return &buf == b"PRI",
+                    Ok(n) if !b"PRI".starts_with(&buf[..n]) => return false,
+                    Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Spawn an HTTP/1.1 + `h2c` mock server on an ephemeral loopback port, aborting on drop.
+    pub(crate) async fn spawn_http_mock<F, Fut>(handler: F) -> (std::net::SocketAddr, AbortOnDrop)
+    where
+        F: Fn(http::Request<hyper::body::Incoming>) -> Fut + Clone + Send + Sync + 'static,
+        Fut:
+            std::future::Future<Output = http::Response<crate::response::ResBody>> + Send + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = AbortOnDrop(tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(move |req| {
+                        let fut = handler(req);
+                        async move { Ok::<_, std::convert::Infallible>(fut.await) }
+                    });
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                    .await;
+                });
+            }
+        }));
+        (addr, task)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

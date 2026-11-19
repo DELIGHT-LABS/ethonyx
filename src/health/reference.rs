@@ -394,20 +394,10 @@ mod tests {
         use bytes::Bytes;
         use http::Response;
         use http_body_util::BodyExt;
-        use hyper::service::service_fn;
-        use hyper_util::rt::{TokioExecutor, TokioIo};
-        use hyper_util::server::conn::auto;
-        use tokio::net::TcpListener;
 
         use crate::response::full_body;
+        use crate::test_util::spawn_http_mock;
         use crate::transport::build_https_client;
-
-        struct AbortOnDrop(tokio::task::JoinHandle<()>);
-        impl Drop for AbortOnDrop {
-            fn drop(&mut self) {
-                self.0.abort();
-            }
-        }
 
         // Local node starts at 997 (`lag = 3` behind head 1000) and would advance to 999
         // if queried a second time when the slow peer arrives.
@@ -417,45 +407,28 @@ mod tests {
         let lh = Arc::clone(&local_head);
         let lbc = Arc::clone(&local_block_calls);
         let fcid = Arc::clone(&fail_local_cid);
-        let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local_addr = local_listener.local_addr().unwrap();
-        let _local_srv = AbortOnDrop(tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = local_listener.accept().await else {
-                    break;
+        let (local_addr, _local_srv) = spawn_http_mock(move |req| {
+            let lh = Arc::clone(&lh);
+            let lbc = Arc::clone(&lbc);
+            let fcid = Arc::clone(&fcid);
+            async move {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                let reply = if body.windows(11).any(|w| w == b"eth_chainId") {
+                    if fcid.load(Ordering::SeqCst) {
+                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"down"}}"#
+                            .to_string()
+                    } else {
+                        r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#.to_string()
+                    }
+                } else {
+                    lbc.fetch_add(1, Ordering::SeqCst);
+                    let cur = lh.fetch_add(2, Ordering::SeqCst);
+                    format!(r#"{{"jsonrpc":"2.0","id":1,"result":"0x{cur:x}"}}"#)
                 };
-                let lh = Arc::clone(&lh);
-                let lbc = Arc::clone(&lbc);
-                let fcid = Arc::clone(&fcid);
-                tokio::spawn(async move {
-                    let svc = service_fn(move |req: http::Request<hyper::body::Incoming>| {
-                        let lh = Arc::clone(&lh);
-                        let lbc = Arc::clone(&lbc);
-                        let fcid = Arc::clone(&fcid);
-                        async move {
-                            let body = req.into_body().collect().await.unwrap().to_bytes();
-                            let reply = if body.windows(11).any(|w| w == b"eth_chainId") {
-                                if fcid.load(Ordering::SeqCst) {
-                                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"down"}}"#.to_string()
-                                } else {
-                                    r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#.to_string()
-                                }
-                            } else {
-                                lbc.fetch_add(1, Ordering::SeqCst);
-                                let cur = lh.fetch_add(2, Ordering::SeqCst);
-                                format!(r#"{{"jsonrpc":"2.0","id":1,"result":"0x{cur:x}"}}"#)
-                            };
-                            Ok::<_, std::convert::Infallible>(Response::new(full_body(
-                                Bytes::from(reply),
-                            )))
-                        }
-                    });
-                    let _ = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection(TokioIo::new(stream), svc)
-                        .await;
-                });
+                Response::new(full_body(Bytes::from(reply)))
             }
-        }));
+        })
+        .await;
 
         let ref_head = Arc::new(AtomicU64::new(1000));
         let ref_calls = Arc::new(AtomicUsize::new(0));
@@ -463,42 +436,23 @@ mod tests {
             let rh = Arc::clone(&ref_head);
             let rc = Arc::clone(&ref_calls);
             async move {
-                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let addr = listener.local_addr().unwrap();
-                let srv = AbortOnDrop(tokio::spawn(async move {
-                    loop {
-                        let Ok((stream, _)) = listener.accept().await else {
-                            break;
-                        };
-                        let rh = Arc::clone(&rh);
-                        let rc = Arc::clone(&rc);
-                        tokio::spawn(async move {
-                            let svc = service_fn(
-                                move |req: http::Request<hyper::body::Incoming>| {
-                                    let rh = Arc::clone(&rh);
-                                    let rc = Arc::clone(&rc);
-                                    async move {
-                                        rc.fetch_add(1, Ordering::SeqCst);
-                                        let _ = req.into_body().collect().await.unwrap().to_bytes();
-                                        if !delay.is_zero() {
-                                            tokio::time::sleep(delay).await;
-                                        }
-                                        let res = format!(
-                                            r#"[{{"jsonrpc":"2.0","id":1,"result":"0x1"}},{{"jsonrpc":"2.0","id":2,"result":"0x{:x}"}}]"#,
-                                            rh.load(Ordering::SeqCst)
-                                        );
-                                        Ok::<_, std::convert::Infallible>(Response::new(full_body(
-                                            Bytes::from(res),
-                                        )))
-                                    }
-                                },
-                            );
-                            let _ = auto::Builder::new(TokioExecutor::new())
-                                .serve_connection(TokioIo::new(stream), svc)
-                                .await;
-                        });
+                let (addr, srv) = spawn_http_mock(move |req| {
+                    let rh = Arc::clone(&rh);
+                    let rc = Arc::clone(&rc);
+                    async move {
+                        rc.fetch_add(1, Ordering::SeqCst);
+                        let _ = req.into_body().collect().await.unwrap().to_bytes();
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let res = format!(
+                            r#"[{{"jsonrpc":"2.0","id":1,"result":"0x1"}},{{"jsonrpc":"2.0","id":2,"result":"0x{:x}"}}]"#,
+                            rh.load(Ordering::SeqCst)
+                        );
+                        Response::new(full_body(Bytes::from(res)))
                     }
-                }));
+                })
+                .await;
                 (
                     HttpUpstream::parse("--el-reference-url", &format!("http://{addr}")).unwrap(),
                     srv,

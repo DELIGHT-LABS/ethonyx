@@ -281,12 +281,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    struct AbortOnDrop(tokio::task::JoinHandle<()>);
-    impl Drop for AbortOnDrop {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
-    }
+    use crate::test_util::{AbortOnDrop, peek_is_h2_preface, spawn_http_mock};
 
     async fn serve_h1_once(
         stream: tokio::net::TcpStream,
@@ -353,41 +348,23 @@ mod tests {
 
     #[tokio::test]
     async fn reference_probes_leave_the_local_transport_untouched() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let reference = HttpUpstream::parse(
-            "--el-reference-url",
-            &format!("http://{}", listener.local_addr().unwrap()),
-        )
-        .unwrap();
         let oversized = Arc::new(AtomicBool::new(false));
         let oversized_srv = Arc::clone(&oversized);
-        let _server = AbortOnDrop(tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let oversized_conn = Arc::clone(&oversized_srv);
-                tokio::spawn(async move {
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let huge = oversized_conn.load(Ordering::SeqCst);
-                        async move {
-                            let _ = req.into_body().collect().await;
-                            let body = if huge {
-                                Bytes::from(vec![b'x'; MAX_SMALL_PROBE_BODY_BYTES + 1])
-                            } else {
-                                Bytes::from_static(b"{}")
-                            };
-                            Ok::<_, Infallible>(
-                                Response::builder()
-                                    .status(StatusCode::OK)
-                                    .body(Full::new(body))
-                                    .unwrap(),
-                            )
-                        }
-                    });
-                    let _ = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection(TokioIo::new(stream), svc)
-                        .await;
-                });
+        let (addr, _server) = spawn_http_mock(move |req| {
+            let huge = oversized_srv.load(Ordering::SeqCst);
+            async move {
+                let _ = req.into_body().collect().await;
+                let body = if huge {
+                    Bytes::from(vec![b'x'; MAX_SMALL_PROBE_BODY_BYTES + 1])
+                } else {
+                    Bytes::from_static(b"{}")
+                };
+                Response::new(full_body(body))
             }
-        }));
+        })
+        .await;
+        let reference =
+            HttpUpstream::parse("--el-reference-url", &format!("http://{addr}")).unwrap();
         let client = build_https_client();
         // A TLS local target that has not answered yet: any response recorded against it
         // would move its label off "HTTPS (ALPN)".
@@ -423,8 +400,7 @@ mod tests {
         let _server = AbortOnDrop(tokio::spawn(async move {
             let mut held = Vec::new();
             while let Ok((stream, _)) = listener.accept().await {
-                let mut preface = [0; 3];
-                if stream.peek(&mut preface).await.unwrap_or(0) == 3 && &preface == b"PRI" {
+                if peek_is_h2_preface(&stream).await {
                     drop(stream);
                     continue;
                 }
@@ -497,9 +473,7 @@ mod tests {
                 let hang = Arc::clone(&hang);
                 let counts = Arc::clone(&counts);
                 tokio::spawn(async move {
-                    let mut preface = [0; 3];
-                    let is_h2 =
-                        stream.peek(&mut preface).await.unwrap_or(0) == 3 && &preface == b"PRI";
+                    let is_h2 = peek_is_h2_preface(&stream).await;
                     counts[usize::from(is_h2)].fetch_add(1, Ordering::SeqCst);
                     if is_h2
                         && db
@@ -662,9 +636,7 @@ mod tests {
             while let Ok((stream, _)) = listener.accept().await {
                 let counts = counts.clone();
                 tokio::spawn(async move {
-                    let mut preface = [0; 3];
-                    let h2 =
-                        stream.peek(&mut preface).await.unwrap_or(0) == 3 && &preface == b"PRI";
+                    let h2 = peek_is_h2_preface(&stream).await;
                     counts[usize::from(h2)].fetch_add(1, Ordering::Relaxed);
                     let svc = service_fn(|req: Request<Incoming>| async move {
                         let _ = req.into_body().collect().await;
