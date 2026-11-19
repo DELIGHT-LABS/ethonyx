@@ -5,21 +5,6 @@ use ethonyx::run;
 use serde_json::json;
 
 #[tokio::test]
-async fn livez_returns_200_ok() {
-    let el = MockServer::start(ok_handler()).await;
-    let cl = MockServer::start(ok_handler()).await;
-    let ethonyx =
-        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
-
-    let c = client();
-    let (status, body) = get(&c, &ethonyx.url("/livez")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(&body[..], b"ok");
-
-    ethonyx.shutdown().await;
-}
-
-#[tokio::test]
 async fn el_upstream_h2c_is_auto_detected() {
     // No flag: when the EL serves h2c, the health poller detects it (it prefers
     // h2c) and the data-plane forwards over HTTP/2. The mock records the version
@@ -765,19 +750,12 @@ async fn health_rejects_array_envelopes_and_data_without_losing_partial_results(
         )
     }))
     .await;
+    // Individual malformed CL envelope shapes are unit-tested in `health::cl`; here
+    // verify end-to-end that an array/non-object response on either endpoint fails only
+    // that endpoint while preserving the valid sibling result (including raw ID-less EL replies).
     for (syncing, peer_count, valid_syncing, valid_peers) in [
-        (synced, peers, true, true),
-        (r#"[["123","0",false]]"#, peers, false, true),
         (r#"{"data":["123","0",false]}"#, peers, false, true),
-        (
-            r#"[{"head_slot":"123","sync_distance":"0","is_syncing":false}]"#,
-            peers,
-            false,
-            true,
-        ),
-        (synced, r#"[["64"]]"#, true, false),
         (synced, r#"{"data":["64"]}"#, true, false),
-        (synced, r#"[{"connected":"64"}]"#, true, false),
     ] {
         let cl = MockServer::start(Arc::new(move |req| {
             (
@@ -807,64 +785,62 @@ async fn health_rejects_array_envelopes_and_data_without_losing_partial_results(
             "{syncing}"
         );
         let (status, body) = get(&c, &proxy.url("/healthz")).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "{syncing} / {peer_count}");
         let report: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(report["el"]["syncing"], false);
+        assert_eq!(report["el"]["syncing"], false, "{syncing} / {peer_count}");
         assert_eq!(
             report["cl"]["syncing"].as_bool(),
-            valid_syncing.then_some(false)
+            valid_syncing.then_some(false),
+            "{syncing} / {peer_count}"
         );
-        assert_eq!(report["cl"]["peers"].as_u64(), valid_peers.then_some(64));
-        if !valid_syncing || !valid_peers {
-            assert!(!report["cl"]["errors"].as_array().unwrap().is_empty());
-        }
+        assert_eq!(
+            report["cl"]["peers"].as_u64(),
+            valid_peers.then_some(64),
+            "{syncing} / {peer_count}"
+        );
+        assert!(
+            !report["cl"]["errors"].as_array().unwrap().is_empty(),
+            "{syncing} / {peer_count}: {report}"
+        );
         proxy.shutdown().await;
     }
 }
 
 #[tokio::test]
 async fn readyz_strict_rejects_malformed_hex_quantities_in_el_probes() {
+    // Exhaustive malformed hex inputs are unit-tested in `health::el`; verify end-to-end
+    // that a non-canonical quantity ("0x00") gates `/readyz` under `--readyz-strict`.
     let now_hex = format!("0x{:x}", now_unix());
-    for bad_hex in ["0x+10", "0x0x10", "0x00", "ff"] {
-        let ts = now_hex.clone();
-        let el = MockServer::start(jsonrpc_mock(move |method| {
-            RpcMockReply::Result(match method {
-                "eth_syncing" => json!(false),
-                "net_peerCount" => json!("0x10"),
-                "eth_getBlockByNumber" => json!({"number": bad_hex, "timestamp": ts}),
-                _ => json!(null),
-            })
-        }))
-        .await;
-        let cl = MockServer::start(cl_sync_mock(
-            json!({"head_slot": "1", "sync_distance": "0", "is_syncing": false}),
-            Some(8),
-        ))
-        .await;
-        let proxy = EthonyxHandle::start(&[
-            "--el-http-url",
-            &el.url,
-            "--cl-beacon-url",
-            &cl.url,
-            "--readyz-strict",
-        ])
-        .await;
-        let c = client();
-        let (status, body) = get(&c, &proxy.url("/readyz")).await;
-        assert_eq!(
-            status,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{bad_hex}: {body:?}"
-        );
-        let (_, hz) = get(&c, &proxy.url("/healthz")).await;
-        let hv: Value = serde_json::from_slice(&hz).unwrap();
-        assert!(hv["el"]["block_number"].is_null(), "{bad_hex}: {hv}");
-        assert!(
-            !hv["el"]["errors"].as_array().unwrap().is_empty(),
-            "{bad_hex}: {hv}"
-        );
-        proxy.shutdown().await;
-    }
+    let el = MockServer::start(jsonrpc_mock(move |method| {
+        RpcMockReply::Result(match method {
+            "eth_syncing" => json!(false),
+            "net_peerCount" => json!("0x10"),
+            "eth_getBlockByNumber" => json!({"number": "0x00", "timestamp": now_hex}),
+            _ => json!(null),
+        })
+    }))
+    .await;
+    let cl = MockServer::start(cl_sync_mock(
+        json!({"head_slot": "1", "sync_distance": "0", "is_syncing": false}),
+        Some(8),
+    ))
+    .await;
+    let proxy = EthonyxHandle::start(&[
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--readyz-strict",
+    ])
+    .await;
+    let c = client();
+    let (status, body) = get(&c, &proxy.url("/readyz")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+    let (_, hz) = get(&c, &proxy.url("/healthz")).await;
+    let hv: Value = serde_json::from_slice(&hz).unwrap();
+    assert!(hv["el"]["block_number"].is_null(), "{hv}");
+    assert!(!hv["el"]["errors"].as_array().unwrap().is_empty(), "{hv}");
+    proxy.shutdown().await;
 }
 
 #[tokio::test]
@@ -948,11 +924,34 @@ async fn node_health_returns_503_on_partial_outage_or_strict_staleness_and_206_w
 }
 
 #[tokio::test]
-async fn trust_upstream_reports_honest_healthz_mode_without_fabricated_fields() {
+async fn trust_upstream_serves_livez_and_reports_honest_healthz_mode() {
     let c = client();
 
     // 1. EL-only `--trust-upstream`: omits `cl` completely on both `/healthz` and `/readyz`.
     let trusted_el = EthonyxHandle::start_trusted(&[]).await;
+    let (live_st, live_body) = get(&c, &trusted_el.url("/livez")).await;
+    assert_eq!(live_st, StatusCode::OK);
+    assert_eq!(&live_body[..], b"ok");
+    let head_live = c
+        .request(
+            Request::builder()
+                .method(Method::HEAD)
+                .uri(trusted_el.url("/livez"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head_live.status(), StatusCode::OK);
+    assert!(
+        head_live
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
     let (status_el, body_el) = get(&c, &trusted_el.url("/healthz")).await;
     assert_eq!(status_el, StatusCode::OK);
     let snap_el: Value = serde_json::from_slice(&body_el).unwrap();
@@ -1457,6 +1456,92 @@ async fn multi_reference_rpc_gates_block_lag_passes_queries_and_handles_two_stri
 }
 
 #[tokio::test]
+async fn reference_publish_keeps_the_newest_local_half() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    // The local head grows with every health batch so each local poll is distinguishable.
+    let local_batches = Arc::new(AtomicU64::new(0));
+    let lb = local_batches.clone();
+    let local_el = MockServer::start(jsonrpc_mock(move |method| {
+        RpcMockReply::Result(match method {
+            "eth_syncing" => {
+                lb.fetch_add(1, Ordering::Relaxed);
+                json!(false)
+            }
+            "net_peerCount" => json!("0x2"),
+            "eth_getBlockByNumber" => json!({
+                "number": format!("0x{:x}", lb.load(Ordering::Relaxed)),
+                "timestamp": "0x67000000",
+            }),
+            _ => json!("0x1"),
+        })
+    }))
+    .await;
+    let ref_rounds = Arc::new(AtomicUsize::new(0));
+    let rr = ref_rounds.clone();
+    let peer_ref = MockServer::start(jsonrpc_mock(move |method| {
+        if method == "eth_blockNumber" {
+            rr.fetch_add(1, Ordering::Relaxed);
+        }
+        RpcMockReply::Result(json!("0x1"))
+    }))
+    .await;
+
+    // Local polls are slow (350ms) and reference rounds frequent (35ms): two reference
+    // rounds complete well before the next local poll.
+    let proxy = EthonyxHandle::start_tuned(
+        &[
+            "--el-http-url",
+            &local_el.url,
+            "--el-reference-url",
+            &peer_ref.url,
+        ],
+        |cfg| {
+            cfg.health_poll_interval = Duration::from_millis(350);
+            cfg.el_reference_poll_interval = Some(Duration::from_millis(35));
+        },
+    )
+    .await;
+    let c = client();
+    let local_head = || async {
+        let (_, body) = get(&c, &proxy.url("/healthz")).await;
+        let snapshot: Value = serde_json::from_slice(&body).unwrap();
+        snapshot["el"]["block_number"].as_u64().unwrap()
+    };
+
+    // Head 1 is the warm-up poll; anything above was published by a background local poll.
+    let published = wait_for(|| async {
+        match local_head().await {
+            head if head > 1 => Ok(head),
+            head => Err(head.to_string()),
+        }
+    })
+    .await;
+    let rounds = ref_rounds.load(Ordering::Relaxed);
+    wait_for(|| {
+        let now = ref_rounds.load(Ordering::Relaxed);
+        async move {
+            if now >= rounds + 2 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "reference rounds {now}, waiting for {}",
+                    rounds + 2
+                ))
+            }
+        }
+    })
+    .await;
+    let head = local_head().await;
+    assert!(
+        head >= published,
+        "a reference publish replaced the local half with an older one: {published} -> {head}"
+    );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn shorter_reference_poll_interval_never_starves_longer_local_health_poll() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1539,13 +1624,12 @@ async fn shorter_reference_poll_interval_never_starves_longer_local_health_poll(
 }
 
 #[tokio::test]
-async fn reference_gate_handles_local_rpc_glitches_via_unified_two_strike_without_cross_poll_skew()
-{
+async fn reference_gate_ignores_stale_local_block_on_local_block_number_glitch() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // 1. Sub-second chain (40ms blocks) with `health_poll_interval` (240ms) > `el_reference_poll_interval` (90ms):
-    //    when local `eth_blockNumber` fails, the reference gate must NOT subtract a stale `local.el_block`
-    //    and fabricate false 503s; instead it retains `200` on strike 1 and fails open `200` on strike 2.
+    // Sub-second chain (40ms blocks) with `health_poll_interval` (240ms) > `el_reference_poll_interval` (90ms):
+    // when local `eth_blockNumber` fails, the reference gate must NOT subtract a stale `local.el_block`
+    // and fabricate false 503s; instead it retains `200` on strike 1 and fails open `200` on strike 2.
     let t0 = std::time::Instant::now();
     let head = move || 1_000 + (t0.elapsed().as_millis() / 40) as u64;
     let fail_local_block_num = Arc::new(AtomicBool::new(false));
@@ -1625,11 +1709,17 @@ async fn reference_gate_handles_local_rpc_glitches_via_unified_two_strike_withou
         tokio::time::sleep(Duration::from_millis(12)).await;
     }
     fast_proxy.shutdown().await;
+}
 
-    // 2. Local `eth_chainId` failure while lagging (50 vs 100):
-    //    must hold 503 on strike 1 (`Retained`) with `reference_health_status == 0` and recorded error,
-    //    then fail open (`200`) on strike 2 (`Unavailable`).
+#[tokio::test]
+async fn reference_gate_retains_503_on_first_local_chain_id_glitch_then_fails_open() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Local `eth_chainId` failure while lagging (50 vs 100): must hold 503 on strike 1
+    // (`Retained`) with `reference_health_status == 0` and recorded error, then fail open
+    // (`200`) on strike 2 (`Unavailable`).
     let fail_local_chain = Arc::new(AtomicBool::new(false));
+    let c = client();
     let fail_cid = fail_local_chain.clone();
     let lag_el = MockServer::start(jsonrpc_mock(move |method| {
         if method == "eth_chainId" && fail_cid.load(Ordering::Acquire) {

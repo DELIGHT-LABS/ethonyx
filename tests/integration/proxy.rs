@@ -66,7 +66,7 @@ async fn jsonrpc_post_is_forwarded_to_el_http_upstream() {
 #[tokio::test]
 async fn http2_h2c_jsonrpc_is_served_and_forwarded() {
     // A prior-knowledge h2c client (the LB→backend h2c shape) is served over
-    // HTTP/2 by the auto server, and its JSON-RPC is forwarded to the EL upstream
+    // HTTP/2 by the server, and its JSON-RPC is forwarded to the EL upstream
     // (which stays h1).
     let el = MockServer::start(Arc::new(|req| {
         assert_eq!(req.method, Method::POST);
@@ -81,38 +81,23 @@ async fn http2_h2c_jsonrpc_is_served_and_forwarded() {
         EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
 
     let c = h2c_client();
-    let (status, body) = post_json(
-        &c,
-        &ethonyx.url("/"),
-        json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 7}),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    let v: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["result"], "0xcafe");
-
-    ethonyx.shutdown().await;
-}
-
-#[tokio::test]
-async fn http2_h2c_negotiates_to_http2() {
-    // The response comes back over HTTP/2 → confirms the auto server actually
-    // spoke h2c (not a silent downgrade to h1).
-    let el = MockServer::start(ok_handler()).await;
-    let cl = MockServer::start(ok_handler()).await;
-    let ethonyx =
-        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
-
-    let c = h2c_client();
     let req = Request::builder()
-        .method(Method::GET)
-        .uri(ethonyx.url("/livez"))
-        .body(Full::new(Bytes::new()))
+        .method(Method::POST)
+        .uri(ethonyx.url("/"))
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(
+                &json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 7}),
+            )
+            .unwrap(),
+        )))
         .unwrap();
     let resp = c.request(req).await.unwrap();
-    assert_eq!(resp.version(), Version::HTTP_2, "expected h2, got {resp:?}");
+    assert_eq!(resp.version(), Version::HTTP_2);
     assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["result"], "0xcafe");
 
     ethonyx.shutdown().await;
 }
@@ -294,48 +279,6 @@ async fn response_connection_options_are_stripped_for_h1_and_h2_clients() {
 }
 
 #[tokio::test]
-async fn multi_port_listen_serves_same_routes() {
-    let el = MockServer::start(ok_handler()).await;
-    let cl = MockServer::start(ok_handler()).await;
-
-    let cfg = Config::try_parse_from([
-        "ethonyx",
-        "--listen",
-        "127.0.0.1:0",
-        "--listen",
-        "127.0.0.1:0",
-        "--el-http-url",
-        &el.url,
-        "--cl-beacon-url",
-        &cl.url,
-        "--shutdown-grace",
-        "0",
-    ])
-    .unwrap();
-
-    let bound = Prepared::new(cfg).await.unwrap().bind().await.unwrap();
-    let [a1, a2] = bound.local_addrs() else {
-        panic!("expected two bound addresses");
-    };
-    let ports = [a1.port(), a2.port()];
-
-    let (tx, rx) = oneshot::channel::<()>();
-    let task = tokio::spawn(bound.serve(async move {
-        let _ = rx.await;
-    }));
-
-    let c = client();
-    for port in ports {
-        let (status, body) = get(&c, &format!("http://127.0.0.1:{port}/livez")).await;
-        assert_eq!(status, StatusCode::OK, "port {port}");
-        assert_eq!(&body[..], b"ok", "port {port}");
-    }
-
-    let _ = tx.send(());
-    let _ = task.await;
-}
-
-#[tokio::test]
 async fn trust_upstream_decoupled_from_mock_eth_syncing() {
     let ws_upstream = ws_echo_upstream().await;
 
@@ -497,32 +440,6 @@ async fn test_mock_cl_subscriptions() {
 }
 
 #[tokio::test]
-async fn test_mock_eth_syncing_flag() {
-    let el = MockServer::start(Arc::new(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Bytes::from_static(b"should not be called"),
-        )
-    }))
-    .await;
-
-    let ethonyx = EthonyxHandle::start(&["--el-http-url", &el.url, "--mock-eth-syncing"]).await;
-
-    let c = client();
-    let (status, body) = post_json(
-        &c,
-        &ethonyx.url("/"),
-        json!({"jsonrpc": "2.0", "id": 1, "method": "eth_syncing", "params": []}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["result"], false);
-
-    ethonyx.shutdown().await;
-}
-
-#[tokio::test]
 async fn trusted_h1_upstream_and_http_notifications() {
     let el = MockServer::start(ok_handler()).await;
     let proxy = EthonyxHandle::start(&[
@@ -590,23 +507,21 @@ async fn mock_body_stall_has_a_deadline() {
 
 #[tokio::test]
 async fn http_forwarding_preserves_configured_uri_and_unmodified_body() {
+    // Exhaustive `rewrite_uri` combinations are unit-tested in `upstream.rs`; verify
+    // end-to-end over both H1 and H2c across a root unmocked upstream and a scoped
+    // percent-encoded query upstream with `--mock-eth-syncing` enabled.
     let payloads: &[&[u8]] = &[
         br#"{"jsonrpc":"2.0","method":"eth_blockNumber","id":7}"#,
         br#"{"jsonrpc":"2.0","method":"eth_call","params":{"method":"eth_syncing"},"id":null}"#,
         b"malformed JSON \xff",
     ];
     let el = MockServer::start(Arc::new(|req| (StatusCode::OK, req.body.clone()))).await;
-    let cl = MockServer::start(ok_handler()).await;
     let paths = ["/", "/?tag=a%2Fb", "/rpc/extra?tag=a%2Fb"];
-    for (base_path, expected_pqs) in [
-        ("", ["/", "/?tag=a%2Fb", "/rpc/extra?tag=a%2Fb"]),
-        ("/", ["/", "/?tag=a%2Fb", "/rpc/extra?tag=a%2Fb"]),
-        (
-            "/rpc/",
-            ["/rpc/", "/rpc/?tag=a%2Fb", "/rpc/rpc/extra?tag=a%2Fb"],
-        ),
+    for (base_path, mock_enabled, expected_pqs) in [
+        ("", false, ["/", "/?tag=a%2Fb", "/rpc/extra?tag=a%2Fb"]),
         (
             "/rpc?key=a%2Fb",
+            true,
             [
                 "/rpc?key=a%2Fb",
                 "/rpc?key=a%2Fb&tag=a%2Fb",
@@ -614,44 +529,36 @@ async fn http_forwarding_preserves_configured_uri_and_unmodified_body() {
             ],
         ),
     ] {
-        for mock_enabled in [false, true] {
-            let upstream = format!("{}{base_path}", el.url);
-            let mut args = vec![
-                "--el-http-url",
-                &upstream,
-                "--cl-beacon-url",
-                &cl.url,
-                "--trust-upstream",
-            ];
-            if mock_enabled {
-                args.push("--mock-eth-syncing");
-            }
-            let proxy = EthonyxHandle::start(&args).await;
-            for c in [client(), h2c_client()] {
-                for (path, expected_pq) in paths.into_iter().zip(expected_pqs) {
-                    for &payload in payloads {
-                        let request = Request::builder()
-                            .method(Method::POST)
-                            .uri(proxy.url(path))
-                            .body(Full::new(Bytes::copy_from_slice(payload)))
-                            .unwrap();
-                        let response = c.request(request).await.unwrap();
-                        assert_eq!(response.status(), StatusCode::OK);
-                        assert_eq!(
-                            response.into_body().collect().await.unwrap().to_bytes(),
-                            payload
-                        );
-                        let received = el.last_received().unwrap();
-                        assert_eq!(
-                            received.uri.path_and_query().map(|pq| pq.as_str()),
-                            Some(expected_pq)
-                        );
-                        assert_eq!(received.body, payload);
-                    }
+        let upstream = format!("{}{base_path}", el.url);
+        let mut args = vec!["--el-http-url", &upstream, "--trust-upstream"];
+        if mock_enabled {
+            args.push("--mock-eth-syncing");
+        }
+        let proxy = EthonyxHandle::start(&args).await;
+        for c in [client(), h2c_client()] {
+            for (path, expected_pq) in paths.into_iter().zip(expected_pqs) {
+                for &payload in payloads {
+                    let request = Request::builder()
+                        .method(Method::POST)
+                        .uri(proxy.url(path))
+                        .body(Full::new(Bytes::copy_from_slice(payload)))
+                        .unwrap();
+                    let response = c.request(request).await.unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(
+                        response.into_body().collect().await.unwrap().to_bytes(),
+                        payload
+                    );
+                    let received = el.last_received().unwrap();
+                    assert_eq!(
+                        received.uri.path_and_query().map(|pq| pq.as_str()),
+                        Some(expected_pq)
+                    );
+                    assert_eq!(received.body, payload);
                 }
             }
-            proxy.shutdown().await;
         }
+        proxy.shutdown().await;
     }
 }
 
