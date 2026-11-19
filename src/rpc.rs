@@ -379,9 +379,29 @@ mod tests {
         ));
     }
 
+    const EXHAUSTIVE_SEEDS: [&[u8]; 4] = [
+        br#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}"#,
+        br#"{"jsonrpc":"2.\u0030","meth\u006fd":"eth_\u0073yncing","id":"x\\y"}"#,
+        br#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#,
+        br#"[{"jsonrpc":"2.0","method":"eth_syncing"},{"jsonrpc":"2.0","method":"eth_call","id":2}]"#,
+    ];
+
     #[test]
-    #[ignore = "sustained seeded differential stress; run explicitly in release mode"]
+    #[ignore = "sustained seeded differential stress; run explicitly"]
     fn prefilter_seeded_stress_matches_full_parser() {
+        for seed in EXHAUSTIVE_SEEDS {
+            for index in 0..seed.len() {
+                let mut mutated = seed.to_vec();
+                for byte in 0..=u8::MAX {
+                    mutated[index] = byte;
+                    assert_eq!(
+                        mock_syncing(&mutated),
+                        parse_mock_syncing(&mutated),
+                        "seed={seed:?}, index={index}, byte={byte}"
+                    );
+                }
+            }
+        }
         fn next(state: &mut u64) -> u64 {
             *state ^= *state << 13;
             *state ^= *state >> 7;
@@ -484,20 +504,28 @@ mod tests {
 
     #[test]
     fn prefilter_matches_full_parser_under_byte_mutations() {
-        // Every possible byte at each position covers malformed JSON, UTF-8,
-        // escaped delimiters, changed field names and duplicate-key boundaries.
-        for seed in [
-            br#"{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}"#.as_slice(),
-            br#"{"jsonrpc":"2.\u0030","meth\u006fd":"eth_\u0073yncing","id":"x\\y"}"#,
-            br#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#,
-            br#"[{"jsonrpc":"2.0","method":"eth_syncing"},{"jsonrpc":"2.0","method":"eth_call","id":2}]"#,
-        ] {
+        // Prefix truncations plus boundary bytes covering NUL, JSON whitespace,
+        // quotes, delimiters, escapes, method/version chars, and invalid UTF-8
+        // (full 0..=255 sweep runs in `prefilter_seeded_stress_matches_full_parser`).
+        const BOUNDARY_BYTES: &[u8] = &[
+            0x00, b'\t', b'\n', b'\r', b' ', b'"', b',', b'-', b'0', b'1', b'2', b':', b'[', b'\\',
+            b']', b'_', b'a', b'e', b'f', b'm', b'n', b's', b't', b'u', b'{', b'}', 0x7f, 0x80,
+            0xff,
+        ];
+        for seed in EXHAUSTIVE_SEEDS {
             for index in 0..seed.len() {
-                assert_eq!(mock_syncing(&seed[..index]), parse_mock_syncing(&seed[..index]));
+                assert_eq!(
+                    mock_syncing(&seed[..index]),
+                    parse_mock_syncing(&seed[..index])
+                );
                 let mut mutated = seed.to_vec();
-                for byte in 0..=u8::MAX {
+                for &byte in BOUNDARY_BYTES {
                     mutated[index] = byte;
-                    assert_eq!(mock_syncing(&mutated), parse_mock_syncing(&mutated), "seed={seed:?}, index={index}, byte={byte}");
+                    assert_eq!(
+                        mock_syncing(&mutated),
+                        parse_mock_syncing(&mutated),
+                        "seed={seed:?}, index={index}, byte={byte}"
+                    );
                 }
             }
         }

@@ -28,7 +28,7 @@ async fn el_upstream_h2c_is_auto_detected() {
     let el = MockServer::start_h2c(Arc::new(|_| {
         (
             StatusCode::OK,
-            br#"{"jsonrpc":"2.0","id":7,"result":"0xcafe"}"#.to_vec(),
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":7,"result":"0xcafe"}"#),
         )
     }))
     .await;
@@ -49,12 +49,16 @@ async fn el_upstream_h2c_is_auto_detected() {
     assert_eq!(v["result"], "0xcafe");
 
     // The EL upstream received the forwarded JSON-RPC over HTTP/2 (auto-detected).
-    let fwd = el
-        .received()
-        .into_iter()
+    let el_reqs = el.received();
+    let fwd = el_reqs
+        .iter()
         .find(|r| String::from_utf8_lossy(&r.body).contains("eth_blockNumber"))
         .expect("EL received the forwarded JSON-RPC");
     assert_eq!(fwd.version, Version::HTTP_2);
+    // Health probes reach the EL as JSON POSTs, like the forwarded call.
+    for req in &el_reqs {
+        assert_eq!(req.headers["content-type"], "application/json", "{req:?}");
+    }
 
     // CL is unaffected — its hop stays HTTP/1.1.
     let cl_req = cl
@@ -153,7 +157,7 @@ async fn health_probes_run_together_and_preserve_partial_failures() {
 async fn healthz_is_200_even_when_upstreams_fail() {
     // Both mocks return 404 for everything: every probe errors. /healthz reports
     // state, it does not judge it, so it still answers 200 with the errors inline.
-    let bad: MockHandler = Arc::new(|_| (StatusCode::NOT_FOUND, b"{}".to_vec()));
+    let bad: MockHandler = Arc::new(|_| (StatusCode::NOT_FOUND, Bytes::from_static(b"{}")));
     let el = MockServer::start(bad.clone()).await;
     let cl = MockServer::start(bad).await;
     let ethonyx =
@@ -260,38 +264,33 @@ async fn healthz_is_served_from_cache_not_per_request() {
 
 #[tokio::test]
 async fn healthz_cache_refreshes_in_background() {
-    // The poller must keep refreshing. net_peerCount returns 16 on the first
-    // (warm-seed) call and 32 after; with a 1s interval, a read taken past one
-    // interval must reflect the background poll, not the seed.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    let pc = Arc::new(AtomicU64::new(0));
-    let el = MockServer::start(Arc::new(move |req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let result = match body.get("method").and_then(Value::as_str).unwrap_or("") {
+    // The poller must keep refreshing. net_peerCount stays at 16 until we have observed
+    // the warm-seed value (avoiding a slow-runner race before the first read), then flips
+    // to 32 so the background poll must surface within POLL * 4.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let allow_refresh = Arc::new(AtomicBool::new(false));
+    let gate = allow_refresh.clone();
+    let el = MockServer::start(jsonrpc_mock(move |method| {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "net_peerCount" => {
-                if pc.fetch_add(1, Ordering::SeqCst) == 0 {
-                    json!("0x10") // 16, warm seed
-                } else {
+                if gate.load(Ordering::Acquire) {
                     json!("0x20") // 32, later background polls
+                } else {
+                    json!("0x10") // 16, warm seed
                 }
             }
             "eth_getBlockByNumber" => json!({"number": "0x1", "timestamp": "0x1"}),
             _ => json!(null),
-        };
-        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
-        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+        })
     }))
     .await;
     let cl = MockServer::start(ok_handler()).await;
-    let ethonyx = EthonyxHandle::start(&[
-        "--el-http-url",
-        &el.url,
-        "--cl-beacon-url",
-        &cl.url,
-        "--health-poll-interval",
-        "1",
-    ])
+    const POLL: Duration = Duration::from_millis(200);
+    let ethonyx = EthonyxHandle::start_tuned(
+        &["--el-http-url", &el.url, "--cl-beacon-url", &cl.url],
+        |cfg| cfg.health_poll_interval = POLL,
+    )
     .await;
 
     let c = client();
@@ -301,15 +300,19 @@ async fn healthz_cache_refreshes_in_background() {
         v1["el"]["peers"], 16,
         "first read is the warm-seed poll: {v1}"
     );
+    allow_refresh.store(true, Ordering::Release);
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-
-    let (_, b2) = get(&c, &ethonyx.url("/healthz")).await;
-    let v2: Value = serde_json::from_slice(&b2).unwrap();
-    assert_eq!(
-        v2["el"]["peers"], 32,
-        "background poll should have refreshed the cache: {v2}"
-    );
+    // Bounded by the configured poll interval so a sluggish poller fails this test.
+    wait_until(POLL * 4, || async {
+        let (_, b2) = get(&c, &ethonyx.url("/healthz")).await;
+        let v2: Value = serde_json::from_slice(&b2).unwrap();
+        if v2["el"]["peers"] == 32 {
+            Ok(())
+        } else {
+            Err(v2.to_string())
+        }
+    })
+    .await;
 
     ethonyx.shutdown().await;
 }
@@ -343,10 +346,8 @@ async fn healthz_reports_numeric_state() {
     let genesis = 1_606_824_023u64;
     let head_slot = (now.saturating_sub(genesis)) / 12;
 
-    let el = MockServer::start(Arc::new(move |req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let el = MockServer::start(jsonrpc_mock(move |method| {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "net_peerCount" => json!("0x10"), // 16 peers
             "eth_getBlockByNumber" => json!({
@@ -354,38 +355,18 @@ async fn healthz_reports_numeric_state() {
                 "timestamp": block_ts_hex,
             }),
             _ => json!(null),
-        };
-        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
-        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+        })
     }))
     .await;
 
-    let cl = MockServer::start(Arc::new(move |req| match req.path.as_str() {
-        "/eth/v1/node/syncing" => (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({
-                "data": {
-                    "head_slot": head_slot.to_string(),
-                    "sync_distance": "0",
-                    "is_syncing": false,
-                }
-            }))
-            .unwrap(),
-        ),
-        "/eth/v1/node/peer_count" => (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({
-                "data": {
-                    "disconnected": "0",
-                    "connecting": "0",
-                    "connected": "100",
-                    "disconnecting": "0",
-                }
-            }))
-            .unwrap(),
-        ),
-        _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
-    }))
+    let cl = MockServer::start(cl_sync_mock(
+        json!({
+            "head_slot": head_slot.to_string(),
+            "sync_distance": "0",
+            "is_syncing": false,
+        }),
+        Some(100),
+    ))
     .await;
 
     let ethonyx = EthonyxHandle::start(&[
@@ -428,33 +409,19 @@ async fn readyz_ready_when_synced_even_if_degraded() {
     // Synced EL + CL, but zero peers and a stale block. Default /readyz gates on
     // sync only, so the node stays ready; /healthz still surfaces the degraded
     // numbers. This is the whole point of the split.
-    let el = MockServer::start(Arc::new(|req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let el = MockServer::start(jsonrpc_mock(|method| {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "net_peerCount" => json!("0x0"),
             "eth_getBlockByNumber" => json!({"number": "0x1", "timestamp": "0x1"}),
             _ => json!(null),
-        };
-        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
-        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+        })
     }))
     .await;
-    let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
-        "/eth/v1/node/syncing" => (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({
-                "data": {"head_slot": "1", "sync_distance": "0", "is_syncing": false}
-            }))
-            .unwrap(),
-        ),
-        "/eth/v1/node/peer_count" => (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"data": {"connected": "0"}})).unwrap(),
-        ),
-        _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
-    }))
+    let cl = MockServer::start(cl_sync_mock(
+        json!({"head_slot": "1", "sync_distance": "0", "is_syncing": false}),
+        Some(0),
+    ))
     .await;
     let ethonyx =
         EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
@@ -483,27 +450,17 @@ async fn readyz_ready_when_synced_even_if_degraded() {
 
 #[tokio::test]
 async fn readyz_not_ready_when_el_syncing() {
-    let el = MockServer::start(Arc::new(|req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let el = MockServer::start(jsonrpc_mock(|method| {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!({"currentBlock": "0x10", "highestBlock": "0x20"}),
             _ => json!(null),
-        };
-        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
-        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+        })
     }))
     .await;
-    let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
-        "/eth/v1/node/syncing" => (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({
-                "data": {"head_slot": "100", "sync_distance": "0", "is_syncing": false}
-            }))
-            .unwrap(),
-        ),
-        _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
-    }))
+    let cl = MockServer::start(cl_sync_mock(
+        json!({"head_slot": "100", "sync_distance": "0", "is_syncing": false}),
+        None,
+    ))
     .await;
     let ethonyx =
         EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
@@ -523,28 +480,18 @@ async fn readyz_not_ready_when_el_syncing() {
 async fn readyz_strict_gates_on_freshness() {
     // Synced, but the latest block is ancient. Default /readyz would be ready;
     // --readyz-strict pulls it because freshness fails.
-    let el = MockServer::start(Arc::new(|req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let el = MockServer::start(jsonrpc_mock(|method| {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "eth_getBlockByNumber" => json!({"number": "0x5", "timestamp": "0x1"}),
             _ => json!(null),
-        };
-        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
-        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+        })
     }))
     .await;
-    let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
-        "/eth/v1/node/syncing" => (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({
-                "data": {"head_slot": "1", "sync_distance": "0", "is_syncing": false}
-            }))
-            .unwrap(),
-        ),
-        _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
-    }))
+    let cl = MockServer::start(cl_sync_mock(
+        json!({"head_slot": "1", "sync_distance": "0", "is_syncing": false}),
+        None,
+    ))
     .await;
     let ethonyx = EthonyxHandle::start(&[
         "--el-http-url",
@@ -571,40 +518,31 @@ async fn readyz_strict_gates_on_freshness() {
 async fn el_upstream_h2c_timeout_falls_back_to_h1() {
     // If the EL upstream hangs on h2c connection preface (causing a timeout)
     // rather than closing it, ethonyx should fallback to HTTP/1.1 if HTTP/1.1 works.
-    let el = MockServer::start_hanging_h2c(Arc::new(|req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let el = MockServer::start_hanging_h2c(jsonrpc_mock(|method| {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "net_peerCount" => json!("0x0"),
             "eth_getBlockByNumber" => json!({"number": "0x1", "timestamp": "0x1"}),
             _ => json!(null),
-        };
-        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
-        (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+        })
     }))
     .await;
 
-    let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
-        "/eth/v1/node/syncing" => (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({
-                "data": {"head_slot": "1", "sync_distance": "0", "is_syncing": false}
-            }))
-            .unwrap(),
-        ),
-        "/eth/v1/node/peer_count" => (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"data": {"connected": "0"}})).unwrap(),
-        ),
-        _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
-    }))
+    let cl = MockServer::start(cl_sync_mock(
+        json!({"head_slot": "1", "sync_distance": "0", "is_syncing": false}),
+        Some(0),
+    ))
     .await;
 
     // Start ethonyx. By default, it warms up cache on start.
     // If fallback works, starting will succeed because the warm-up succeeds.
-    let ethonyx =
-        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &cl.url]).await;
+    let ethonyx = EthonyxHandle::start_tuned(
+        &["--el-http-url", &el.url, "--cl-beacon-url", &cl.url],
+        // The h2c attempt burns one full timeout; the HTTP/1.1 retry then has to finish
+        // inside the next one, so leave it room on a loaded runner.
+        |cfg| cfg.health_timeout = Duration::from_millis(500),
+    )
+    .await;
 
     let c = client();
     let (status, body) = get(&c, &ethonyx.url("/readyz")).await;
@@ -661,13 +599,7 @@ async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
     ethonyx.shutdown().await;
 
     // A second server instance owns an isolated recorder (starts at 0 and omits unpolled gauges).
-    let second = EthonyxHandle::start(&[
-        "--el-http-url",
-        "http://127.0.0.1:8545",
-        "--trust-upstream",
-        "--mock-eth-syncing",
-    ])
-    .await;
+    let second = EthonyxHandle::start_trusted(&["--mock-eth-syncing"]).await;
     let (status, _) = post_json(
         &c,
         &second.url("/"),
@@ -684,18 +616,12 @@ async fn metrics_endpoint_returns_formatted_prometheus_metrics() {
 
 #[tokio::test]
 async fn test_cl_node_health_intercept_and_passthrough() {
-    let el = MockServer::start(Arc::new(|req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let el = MockServer::start(jsonrpc_mock(|method| {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "eth_getBlockByNumber" => json!({"number": "0x1", "timestamp": "0x1"}),
             _ => json!("0x1"),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
 
@@ -703,12 +629,14 @@ async fn test_cl_node_health_intercept_and_passthrough() {
         if req.path == "/eth/v1/node/syncing" {
             (
                 StatusCode::OK,
-                br#"{"data":{"is_syncing":false,"sync_distance":"0","head_slot":"100"}}"#.to_vec(),
+                Bytes::from_static(
+                    br#"{"data":{"is_syncing":false,"sync_distance":"0","head_slot":"100"}}"#,
+                ),
             )
         } else {
             (
                 StatusCode::BAD_REQUEST,
-                b"{\"error\": \"Unsupported method\"}".to_vec(),
+                Bytes::from_static(b"{\"error\": \"Unsupported method\"}"),
             )
         }
     }))
@@ -788,18 +716,25 @@ async fn health_timeout_includes_a_stalled_response_body() {
     });
     let el = MockServer::start_h2c(ok_handler()).await;
     let proxy = tokio::time::timeout(
-        Duration::from_secs(4),
-        EthonyxHandle::start(&["--el-http-url", &el.url, "--cl-beacon-url", &stalled_url]),
+        Duration::from_secs(1),
+        EthonyxHandle::start_tuned(
+            &["--el-http-url", &el.url, "--cl-beacon-url", &stalled_url],
+            |cfg| cfg.health_timeout = Duration::from_millis(150),
+        ),
     )
     .await
     .expect("body timeout must let startup finish");
     let (status, body) = get(&client(), &proxy.url("/healthz")).await;
     assert_eq!(status, StatusCode::OK);
     let value: Value = serde_json::from_slice(&body).unwrap();
+    let cl_errors = value["cl"]["errors"].as_array().unwrap();
+    assert_eq!(
+        cl_errors.len(),
+        2,
+        "expected syncing + peer_count errors: {value}"
+    );
     assert!(
-        value["cl"]["errors"]
-            .as_array()
-            .unwrap()
+        cl_errors
             .iter()
             .all(|v| v.as_str().unwrap().contains("timeout")),
         "{value}"
@@ -826,7 +761,7 @@ async fn health_rejects_array_envelopes_and_data_without_losing_partial_results(
         };
         (
             StatusCode::OK,
-            serde_json::to_vec(&json!({"result":result})).unwrap(),
+            Bytes::from(serde_json::to_vec(&json!({"result":result})).unwrap()),
         )
     }))
     .await;
@@ -847,13 +782,14 @@ async fn health_rejects_array_envelopes_and_data_without_losing_partial_results(
         let cl = MockServer::start(Arc::new(move |req| {
             (
                 StatusCode::OK,
-                if req.path == "/eth/v1/node/syncing" {
-                    syncing
-                } else {
-                    peer_count
-                }
-                .as_bytes()
-                .to_vec(),
+                Bytes::from_static(
+                    if req.path == "/eth/v1/node/syncing" {
+                        syncing
+                    } else {
+                        peer_count
+                    }
+                    .as_bytes(),
+                ),
             )
         }))
         .await;
@@ -891,33 +827,19 @@ async fn readyz_strict_rejects_malformed_hex_quantities_in_el_probes() {
     let now_hex = format!("0x{:x}", now_unix());
     for bad_hex in ["0x+10", "0x0x10", "0x00", "ff"] {
         let ts = now_hex.clone();
-        let el = MockServer::start(Arc::new(move |req| {
-            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-            let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-            let result = match method {
+        let el = MockServer::start(jsonrpc_mock(move |method| {
+            RpcMockReply::Result(match method {
                 "eth_syncing" => json!(false),
                 "net_peerCount" => json!("0x10"),
                 "eth_getBlockByNumber" => json!({"number": bad_hex, "timestamp": ts}),
                 _ => json!(null),
-            };
-            let resp = json!({"jsonrpc": "2.0", "id": 1, "result": result});
-            (StatusCode::OK, serde_json::to_vec(&resp).unwrap())
+            })
         }))
         .await;
-        let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
-            "/eth/v1/node/syncing" => (
-                StatusCode::OK,
-                serde_json::to_vec(&json!({
-                    "data": {"head_slot": "1", "sync_distance": "0", "is_syncing": false}
-                }))
-                .unwrap(),
-            ),
-            "/eth/v1/node/peer_count" => (
-                StatusCode::OK,
-                serde_json::to_vec(&json!({"data": {"connected": "8"}})).unwrap(),
-            ),
-            _ => (StatusCode::NOT_FOUND, b"{}".to_vec()),
-        }))
+        let cl = MockServer::start(cl_sync_mock(
+            json!({"head_slot": "1", "sync_distance": "0", "is_syncing": false}),
+            Some(8),
+        ))
         .await;
         let proxy = EthonyxHandle::start(&[
             "--el-http-url",
@@ -953,20 +875,13 @@ async fn node_health_returns_503_on_partial_outage_or_strict_staleness_and_206_w
     let dead_cl = dead.http_url();
 
     // 1. EL syncing + CL unreachable => 503 (never 206).
-    let ts1 = now_hex.clone();
-    let el_syncing = MockServer::start(Arc::new(move |req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let el_syncing = MockServer::start(jsonrpc_mock(move |method| {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!({"currentBlock": "0x10", "highestBlock": "0x20"}),
             "net_peerCount" => json!("0x5"),
-            "eth_getBlockByNumber" => json!({"number": "0x10", "timestamp": ts1}),
+            "eth_getBlockByNumber" => json!({"number": "0x10", "timestamp": now_hex}),
             _ => json!(null),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
     let p1 = EthonyxHandle::start(&[
@@ -985,14 +900,10 @@ async fn node_health_returns_503_on_partial_outage_or_strict_staleness_and_206_w
     p1.shutdown().await;
 
     // 2. EL syncing + CL synced (both reachable) => 206 Partial Content.
-    let cl_synced = MockServer::start(Arc::new(|req| match req.path.as_str() {
-        "/eth/v1/node/syncing" => (
-            StatusCode::OK,
-            br#"{"data":{"is_syncing":false,"sync_distance":"0","head_slot":"100"}}"#.to_vec(),
-        ),
-        "/eth/v1/node/peer_count" => (StatusCode::OK, br#"{"data":{"connected":"12"}}"#.to_vec()),
-        _ => (StatusCode::NOT_FOUND, Vec::new()),
-    }))
+    let cl_synced = MockServer::start(cl_sync_mock(
+        json!({"is_syncing": false, "sync_distance": "0", "head_slot": "100"}),
+        Some(12),
+    ))
     .await;
     let p2 = EthonyxHandle::start(&[
         "--mock-cl-node-health",
@@ -1009,19 +920,13 @@ async fn node_health_returns_503_on_partial_outage_or_strict_staleness_and_206_w
     p2.shutdown().await;
 
     // 3. Both synced, --readyz-strict enabled, stale EL block => 503 Service Unavailable.
-    let el_stale = MockServer::start(Arc::new(move |req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let el_stale = MockServer::start(jsonrpc_mock(move |method| {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "net_peerCount" => json!("0x5"),
             "eth_getBlockByNumber" => json!({"number": "0x20", "timestamp": stale_hex}),
             _ => json!(null),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
     let p3 = EthonyxHandle::start(&[
@@ -1047,8 +952,7 @@ async fn trust_upstream_reports_honest_healthz_mode_without_fabricated_fields() 
     let c = client();
 
     // 1. EL-only `--trust-upstream`: omits `cl` completely on both `/healthz` and `/readyz`.
-    let trusted_el =
-        EthonyxHandle::start(&["--el-http-url", "http://127.0.0.1:8545", "--trust-upstream"]).await;
+    let trusted_el = EthonyxHandle::start_trusted(&[]).await;
     let (status_el, body_el) = get(&c, &trusted_el.url("/healthz")).await;
     assert_eq!(status_el, StatusCode::OK);
     let snap_el: Value = serde_json::from_slice(&body_el).unwrap();
@@ -1063,14 +967,7 @@ async fn trust_upstream_reports_honest_healthz_mode_without_fabricated_fields() 
     trusted_el.shutdown().await;
 
     // 2. EL + CL `--trust-upstream`: includes both `el` and `cl` transports.
-    let trusted = EthonyxHandle::start(&[
-        "--el-http-url",
-        "http://127.0.0.1:8545",
-        "--trust-upstream",
-        "--cl-beacon-url",
-        "http://127.0.0.1:5052",
-    ])
-    .await;
+    let trusted = EthonyxHandle::start_trusted(&["--cl-beacon-url", "http://127.0.0.1:5052"]).await;
     let (status, body) = get(&c, &trusted.url("/healthz")).await;
     assert_eq!(status, StatusCode::OK);
     let snap: Value = serde_json::from_slice(&body).unwrap();
@@ -1082,40 +979,52 @@ async fn trust_upstream_reports_honest_healthz_mode_without_fabricated_fields() 
 
 #[tokio::test]
 async fn adaptive_el_h2c_recovers_after_transient_upstream_restart() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let el_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let el_addr = el_listener.local_addr().unwrap();
     let el_url = format!("http://{el_addr}");
-    let allow_h2c = Arc::new(AtomicBool::new(true));
+    // Number of upcoming connections forced to HTTP/1.1-only; the mock bounds the
+    // outage deterministically instead of racing the background poller's timer.
+    let h1_only = Arc::new(AtomicUsize::new(0));
+    let batch_versions: Arc<Mutex<Vec<Version>>> = Arc::new(Mutex::new(Vec::new()));
     let conn_handles: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let flag = allow_h2c.clone();
+    let budget = h1_only.clone();
+    let versions = batch_versions.clone();
     let handles = conn_handles.clone();
     let el_server = tokio::spawn(async move {
         while let Ok((stream, _)) = el_listener.accept().await {
-            let h2 = flag.load(Ordering::Acquire);
+            let h2 = budget
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_err();
+            let versions = versions.clone();
             let h = tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-                let svc = service_fn(|req: Request<Incoming>| async move {
-                    let bytes = req.into_body().collect().await.unwrap().to_bytes();
-                    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-                    let resp = if v.is_array() {
-                        json!([
-                            {"jsonrpc":"2.0","id":1,"result":false},
-                            {"jsonrpc":"2.0","id":2,"result":"0x4"},
-                            {"jsonrpc":"2.0","id":3,"result":{"number":"0x1","timestamp":"0x1"}}
-                        ])
-                    } else {
-                        json!({"jsonrpc":"2.0","id":1,"result":"0x1"})
-                    };
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .header("content-type", "application/json")
-                            .body(Full::new(Bytes::from(serde_json::to_vec(&resp).unwrap())))
-                            .unwrap(),
-                    )
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let versions = versions.clone();
+                    async move {
+                        let version = req.version();
+                        let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                        let resp = if v.is_array() {
+                            versions.lock().unwrap().push(version);
+                            json!([
+                                {"jsonrpc":"2.0","id":1,"result":false},
+                                {"jsonrpc":"2.0","id":2,"result":"0x4"},
+                                {"jsonrpc":"2.0","id":3,"result":{"number":"0x1","timestamp":"0x1"}}
+                            ])
+                        } else {
+                            json!({"jsonrpc":"2.0","id":1,"result":"0x1"})
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(serde_json::to_vec(&resp).unwrap())))
+                                .unwrap(),
+                        )
+                    }
                 });
                 if h2 {
                     let _ = auto::Builder::new(TokioExecutor::new())
@@ -1131,71 +1040,51 @@ async fn adaptive_el_h2c_recovers_after_transient_upstream_restart() {
         }
     });
 
-    let cl = MockServer::start(Arc::new(|req| match req.path.as_str() {
-        "/eth/v1/node/syncing" => (
-            StatusCode::OK,
-            br#"{"data":{"is_syncing":false,"sync_distance":"0","head_slot":"1"}}"#.to_vec(),
-        ),
-        "/eth/v1/node/peer_count" => (StatusCode::OK, br#"{"data":{"connected":"4"}}"#.to_vec()),
-        _ => (StatusCode::NOT_FOUND, Vec::new()),
-    }))
+    let cl = MockServer::start(cl_sync_mock(
+        json!({"is_syncing": false, "sync_distance": "0", "head_slot": "1"}),
+        Some(4),
+    ))
     .await;
 
-    let proxy = EthonyxHandle::start(&[
-        "--health-poll-interval",
-        "1",
-        "--el-http-url",
-        &el_url,
-        "--cl-beacon-url",
-        &cl.url,
-    ])
+    let proxy = EthonyxHandle::start_tuned(
+        &["--el-http-url", &el_url, "--cl-beacon-url", &cl.url],
+        |cfg| cfg.health_poll_interval = Duration::from_millis(60),
+    )
     .await;
     let c = client();
 
-    // 1. Initial poll confirms h2c (`H2C_CONFIRMED`).
+    // 1. Initial poll confirms h2c (`Confirmed`).
     let (_, hz1) = get(&c, &proxy.url("/healthz")).await;
     let v1: Value = serde_json::from_slice(&hz1).unwrap();
     assert_eq!(v1["el"]["transport"], "h2c");
 
-    // 2. Simulate transient h2c rejection (h1-only fallback -> `H1_VERIFY_ONCE`):
-    // flip `allow_h2c = false` and drop pooled server connections.
-    allow_h2c.store(false, Ordering::Release);
+    // 2. Reject h2c on the next connection and drop pooled server connections so one poll
+    //    falls back to HTTP/1.1 (`H1VerifyOnce`), then the following poll self-heals to h2c.
+    h1_only.store(1, Ordering::Release);
     for h in conn_handles.lock().unwrap().drain(..) {
         h.abort();
     }
 
-    let mut entered_fallback = false;
-    for _ in 0..30 {
-        let (_, hz) = get(&c, &proxy.url("/healthz")).await;
-        let v: Value = serde_json::from_slice(&hz).unwrap();
-        if v["el"]["transport"] == "http/1.1" {
-            // Restore h2c immediately so the `H1_VERIFY_ONCE` poll sees h2c back up!
-            allow_h2c.store(true, Ordering::Release);
-            entered_fallback = true;
-            break;
+    wait_for(|| async {
+        let seen = batch_versions.lock().unwrap();
+        match seen.iter().position(|&v| v == Version::HTTP_11) {
+            Some(at) if seen[at..].contains(&Version::HTTP_2) => Ok(()),
+            _ => Err(format!("{:?}", *seen)),
         }
-        tokio::time::sleep(Duration::from_millis(80)).await;
-    }
-    assert!(
-        entered_fallback,
-        "expected fallback to http/1.1 when h2c dropped"
-    );
+    })
+    .await;
 
-    // 3. `H1_VERIFY_ONCE` probes h2c once more and self-heals back to `H2C_CONFIRMED`.
-    let mut recovered_h2c = false;
-    for _ in 0..30 {
+    // 3. `/healthz` settles back to `"h2c"`.
+    wait_for(|| async {
         let (_, hz) = get(&c, &proxy.url("/healthz")).await;
         let v: Value = serde_json::from_slice(&hz).unwrap();
         if v["el"]["transport"] == "h2c" {
-            recovered_h2c = true;
-            break;
+            Ok(())
+        } else {
+            Err(v["el"]["transport"].to_string())
         }
-        tokio::time::sleep(Duration::from_millis(80)).await;
-    }
-    assert!(
-        recovered_h2c,
-        "confirmed h2c EL must self-heal back to h2c on the H1_VERIFY_ONCE poll"
-    );
+    })
+    .await;
 
     proxy.shutdown().await;
     el_server.abort();
@@ -1204,25 +1093,13 @@ async fn adaptive_el_h2c_recovers_after_transient_upstream_restart() {
 #[tokio::test]
 async fn el_only_mode_omits_cl_metrics_returns_404_on_cl_routes_and_tolerates_missing_net_peer_count()
  {
-    let el = MockServer::start(Arc::new(|req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        if method == "net_peerCount" {
-            return (
-                StatusCode::OK,
-                br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#
-                    .to_vec(),
-            );
+    let el = MockServer::start(jsonrpc_mock(|method| match method {
+        "net_peerCount" => RpcMockReply::Error(-32601, "Method not found"),
+        "eth_syncing" => RpcMockReply::Result(json!(false)),
+        "eth_getBlockByNumber" => {
+            RpcMockReply::Result(json!({"number": "0x2a", "timestamp": "0x67000000"}))
         }
-        let result = match method {
-            "eth_syncing" => json!(false),
-            "eth_getBlockByNumber" => json!({"number": "0x2a", "timestamp": "0x67000000"}),
-            _ => json!("0x2a"),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        _ => RpcMockReply::Result(json!("0x2a")),
     }))
     .await;
 
@@ -1266,29 +1143,11 @@ async fn el_only_mode_omits_cl_metrics_returns_404_on_cl_routes_and_tolerates_mi
     let ws_h1_resp = c.request(ws_h1_req).await.unwrap();
     assert_eq!(ws_h1_resp.status(), StatusCode::NOT_FOUND);
 
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
-        .await
-        .unwrap();
-    let (mut h2_sender, h2_conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, TestBody>(TokioIo::new(tcp))
-        .await
-        .unwrap();
-    let h2_driver = tokio::spawn(async move {
-        let _ = h2_conn.await;
-    });
-    let mut ws_h2_req = Request::builder()
-        .method(Method::CONNECT)
-        .uri(proxy.url("/"))
-        .header("sec-websocket-version", "13")
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-    ws_h2_req
-        .extensions_mut()
-        .insert(hyper::ext::Protocol::from_static("websocket"));
-    let ws_h2_resp = h2_sender.send_request(ws_h2_req).await.unwrap();
+    let mut h2 = proxy.open_h2().await;
+    let ws_h2_req = ext_connect(proxy.url("/"));
+    let ws_h2_resp = h2.send_request(ws_h2_req).await.unwrap();
     assert_eq!(ws_h2_resp.status(), StatusCode::NOT_FOUND);
-    drop(h2_sender);
-    h2_driver.abort();
+    drop(h2);
 
     let (el_st, _) = post_json(
         &c,
@@ -1324,19 +1183,13 @@ async fn cl_optimistic_and_el_offline_gate_readyz_and_node_health_while_queries_
     let mode = Arc::new(AtomicU8::new(1));
     let mode_cl = mode.clone();
 
-    let el = MockServer::start(Arc::new(|req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let el = MockServer::start(jsonrpc_mock(|method| {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "net_peerCount" => json!("0x8"),
             "eth_getBlockByNumber" => json!({"number": "0x64", "timestamp": "0x67000000"}),
             _ => json!("0x1234"),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
 
@@ -1347,22 +1200,26 @@ async fn cl_optimistic_and_el_offline_gate_readyz_and_node_health_while_queries_
                 1 => json!({"data":{"head_slot":"100","sync_distance":"0","is_syncing":false,"is_optimistic":true,"el_offline":false}}),
                 _ => json!({"data":{"head_slot":"100","sync_distance":"5","is_syncing":true,"is_optimistic":true,"el_offline":true}}),
             };
-            (StatusCode::OK, serde_json::to_vec(&payload).unwrap())
+            (StatusCode::OK, Bytes::from(serde_json::to_vec(&payload).unwrap()))
         }
-        "/eth/v1/node/peer_count" => (StatusCode::OK, br#"{"data":{"connected":"16"}}"#.to_vec()),
-        _ => (StatusCode::OK, br#"{"data":"ok"}"#.to_vec()),
+        "/eth/v1/node/peer_count" => (
+            StatusCode::OK,
+            Bytes::from_static(br#"{"data":{"connected":"16"}}"#),
+        ),
+        _ => (StatusCode::OK, Bytes::from_static(br#"{"data":"ok"}"#)),
     }))
     .await;
 
-    let proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        &el.url,
-        "--cl-beacon-url",
-        &cl.url,
-        "--mock-cl-node-health",
-        "--health-poll-interval",
-        "1",
-    ])
+    let proxy = EthonyxHandle::start_tuned(
+        &[
+            "--el-http-url",
+            &el.url,
+            "--cl-beacon-url",
+            &cl.url,
+            "--mock-cl-node-health",
+        ],
+        |cfg| cfg.health_poll_interval = Duration::from_millis(50),
+    )
     .await;
     let c = client();
 
@@ -1399,7 +1256,16 @@ async fn cl_optimistic_and_el_offline_gate_readyz_and_node_health_while_queries_
 
     // `el_offline: true` also returns 503 even when `is_syncing: true`.
     mode.store(2, Ordering::Release);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    wait_for(|| async {
+        let (_, hb) = get(&c, &proxy.url("/healthz")).await;
+        let hv: Value = serde_json::from_slice(&hb).unwrap();
+        if hv["cl"]["syncing"] == true {
+            Ok(())
+        } else {
+            Err(hv.to_string())
+        }
+    })
+    .await;
     assert_eq!(
         get(&c, &proxy.url("/eth/v1/node/health")).await.0,
         StatusCode::SERVICE_UNAVAILABLE
@@ -1407,8 +1273,15 @@ async fn cl_optimistic_and_el_offline_gate_readyz_and_node_health_while_queries_
 
     // Recovery (`is_optimistic: false`, `el_offline: false`) restores 200 on both endpoints.
     mode.store(0, Ordering::Release);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert_eq!(get(&c, &proxy.url("/readyz")).await.0, StatusCode::OK);
+    wait_for(|| async {
+        let (st, rb) = get(&c, &proxy.url("/readyz")).await;
+        if st == StatusCode::OK {
+            Ok(())
+        } else {
+            Err(format!("{st}: {}", String::from_utf8_lossy(&rb)))
+        }
+    })
+    .await;
     assert_eq!(
         get(&c, &proxy.url("/eth/v1/node/health")).await.0,
         StatusCode::OK
@@ -1427,43 +1300,31 @@ async fn multi_reference_rpc_gates_block_lag_passes_queries_and_handles_two_stri
     let ref_alive = Arc::new(AtomicBool::new(true));
 
     let lh = local_height.clone();
-    let local_el = MockServer::start(Arc::new(move |req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+    let local_el = MockServer::start(jsonrpc_mock(move |method| {
         let h = format!("0x{:x}", lh.load(Ordering::Acquire));
-        let result = match method {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "net_peerCount" => json!("0x4"),
             "eth_getBlockByNumber" => json!({"number": h, "timestamp": "0x67000000"}),
             "eth_chainId" => json!("0x1"),
             "eth_blockNumber" => json!(h),
             _ => json!("0xdeadbeef"),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
 
     let rh = ref_height.clone();
     let rcid = ref_chain_id.clone();
     let ralive = ref_alive.clone();
-    let peer_ref = MockServer::start(Arc::new(move |req| {
+    let peer_ref = MockServer::start(jsonrpc_mock(move |method| {
         if !ralive.load(Ordering::Acquire) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, b"down".to_vec());
+            return RpcMockReply::Http(StatusCode::INTERNAL_SERVER_ERROR, b"down");
         }
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+        RpcMockReply::Result(match method {
             "eth_chainId" => json!(format!("0x{:x}", rcid.load(Ordering::Acquire))),
             "eth_blockNumber" => json!(format!("0x{:x}", rh.load(Ordering::Acquire))),
             _ => json!(null),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
 
@@ -1474,18 +1335,20 @@ async fn multi_reference_rpc_gates_block_lag_passes_queries_and_handles_two_stri
         dead.http_url()
     );
 
-    let proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        &local_el.url,
-        "--el-reference-url",
-        &ref_arg,
-        "--el-max-reference-lag",
-        "1",
-        "--el-reference-poll-interval",
-        "1",
-        "--health-poll-interval",
-        "1",
-    ])
+    let proxy = EthonyxHandle::start_tuned(
+        &[
+            "--el-http-url",
+            &local_el.url,
+            "--el-reference-url",
+            &ref_arg,
+            "--el-max-reference-lag",
+            "1",
+        ],
+        |cfg| {
+            cfg.health_poll_interval = Duration::from_millis(60);
+            cfg.el_reference_poll_interval = Some(Duration::from_millis(60));
+        },
+    )
     .await;
     let c = client();
 
@@ -1522,37 +1385,37 @@ async fn multi_reference_rpc_gates_block_lag_passes_queries_and_handles_two_stri
     assert_eq!(hv1["reference"]["block_lag"], 2);
     assert_eq!(hv1["reference"]["errors"].as_array().unwrap().len(), 1);
 
-    let wait_readyz = |expected: StatusCode, limit: Duration| {
+    let wait_readyz = |expected: StatusCode| {
         let c = c.clone();
         let url = proxy.url("/readyz");
-        async move {
-            let deadline = tokio::time::Instant::now() + limit;
-            loop {
+        wait_for(move || {
+            let c = c.clone();
+            let url = url.clone();
+            async move {
                 let (st, body) = get(&c, &url).await;
                 if st == expected {
-                    return body;
+                    Ok(body)
+                } else {
+                    Err(format!(
+                        "expected {expected}, got {st}: {}",
+                        String::from_utf8_lossy(&body)
+                    ))
                 }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "timed out waiting for /readyz == {expected}, last={st}: {:?}",
-                    std::str::from_utf8(&body)
-                );
-                tokio::time::sleep(Duration::from_millis(80)).await;
             }
-        }
+        })
     };
 
     // 2. Partial-propagation Chain Halt (`local = 99`, `peer_ref = 100`, `lag = 1 <= 1`) -> `/readyz` recovers to 200!
     local_height.store(99, Ordering::Release);
-    let _ = wait_readyz(StatusCode::OK, Duration::from_secs(4)).await;
+    let _ = wait_readyz(StatusCode::OK).await;
 
     // 3. Lag again (`peer_ref = 105`, `lag = 6 > 1` -> 503), then test 2-strike failure (`Retained` -> `Unavailable` fail-open)!
     ref_height.store(105, Ordering::Release);
-    let _ = wait_readyz(StatusCode::SERVICE_UNAVAILABLE, Duration::from_secs(4)).await;
+    let _ = wait_readyz(StatusCode::SERVICE_UNAVAILABLE).await;
 
     // Kill `peer_ref`: 1st failed round enters `Retained` (still 503), 2nd consecutive failed round enters `Unavailable` (200 fail-open)!
     ref_alive.store(false, Ordering::Release);
-    let b_fo = wait_readyz(StatusCode::OK, Duration::from_secs(6)).await;
+    let b_fo = wait_readyz(StatusCode::OK).await;
     let r_fo: Value = serde_json::from_slice(&b_fo).unwrap();
     assert_eq!(
         r_fo["el_reference_lag"]["detail"],
@@ -1562,40 +1425,32 @@ async fn multi_reference_rpc_gates_block_lag_passes_queries_and_handles_two_stri
     // 4. `chain_id` mismatch is rejected as an error, then self-heals when matching `chain_id` returns!
     ref_chain_id.store(11155111, Ordering::Release);
     ref_alive.store(true, Ordering::Release);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-    loop {
+    wait_for(|| async {
         let (_, hb_mis) = get(&c, &proxy.url("/healthz")).await;
-        if std::str::from_utf8(&hb_mis)
-            .unwrap()
-            .contains("chain_id mismatch")
-        {
-            break;
+        let text = std::str::from_utf8(&hb_mis).unwrap();
+        if text.contains("chain_id mismatch") {
+            Ok(())
+        } else {
+            Err(text.to_owned())
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for chain_id mismatch in /healthz"
-        );
-        tokio::time::sleep(Duration::from_millis(80)).await;
-    }
+    })
+    .await;
 
     ref_chain_id.store(1, Ordering::Release);
     local_height.store(105, Ordering::Release);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-    loop {
+    wait_for(|| async {
         let (_, m_body) = get(&c, &proxy.url("/metrics")).await;
         let m_text = std::str::from_utf8(&m_body).unwrap();
         if m_text.contains("ethonyx_reference_health_status 1")
             && m_text.contains("ethonyx_reference_block_number 105")
             && m_text.contains("ethonyx_reference_block_lag 0")
         {
-            break;
+            Ok(())
+        } else {
+            Err(m_text.to_owned())
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for recovered reference metrics, last:\n{m_text}"
-        );
-        tokio::time::sleep(Duration::from_millis(80)).await;
-    }
+    })
+    .await;
     assert_eq!(get(&c, &proxy.url("/readyz")).await.0, StatusCode::OK);
 
     proxy.shutdown().await;
@@ -1606,63 +1461,78 @@ async fn shorter_reference_poll_interval_never_starves_longer_local_health_poll(
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let local_batches = Arc::new(AtomicUsize::new(0));
-    let lb = local_batches.clone();
-    let local_el = MockServer::start(Arc::new(move |req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+    let ref_polls = Arc::new(AtomicUsize::new(0));
+    // Reference polls already seen when the first background local poll arrives.
+    let ref_polls_at_local_poll = Arc::new(AtomicUsize::new(0));
+    let (lb, rp, seen) = (
+        local_batches.clone(),
+        ref_polls.clone(),
+        ref_polls_at_local_poll.clone(),
+    );
+    let local_el = MockServer::start(jsonrpc_mock(move |method| {
+        // Batch 1 is the warm-up poll; batch 2 is the first background local poll.
+        // Record `seen` BEFORE publishing `lb == 2` with Release so the waiter's Acquire
+        // load always observes the stored snapshot.
         if method == "eth_syncing" {
-            lb.fetch_add(1, Ordering::Relaxed);
+            if lb.load(Ordering::Relaxed) == 1 {
+                seen.store(rp.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            lb.fetch_add(1, Ordering::Release);
         }
-        let result = match method {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "net_peerCount" => json!("0x2"),
             "eth_getBlockByNumber" => json!({"number": "0x10", "timestamp": "0x67000000"}),
             _ => json!("0x10"),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
 
-    let ref_polls = Arc::new(AtomicUsize::new(0));
     let rp = ref_polls.clone();
-    let peer_ref = MockServer::start(Arc::new(move |req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+    let peer_ref = MockServer::start(jsonrpc_mock(move |method| {
         if method == "eth_blockNumber" {
             rp.fetch_add(1, Ordering::Relaxed);
         }
-        (
-            StatusCode::OK,
-            br#"{"jsonrpc":"2.0","id":1,"result":"0x10"}"#.to_vec(),
-        )
+        RpcMockReply::Result(json!("0x10"))
     }))
     .await;
 
-    // `--health-poll-interval 2` > `--el-reference-poll-interval 1`: the 1s reference
-    // updates must NOT reset or starve the 2s local poll timer!
-    let proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        &local_el.url,
-        "--el-reference-url",
-        &peer_ref.url,
-        "--health-poll-interval",
-        "2",
-        "--el-reference-poll-interval",
-        "1",
-    ])
+    // `health_poll_interval` (1200ms) > `el_reference_poll_interval` (40ms): faster reference
+    // updates must NOT reset or starve the longer local poll timer, and the reference
+    // cadence must follow its own interval instead of the local one.
+    let proxy = EthonyxHandle::start_tuned(
+        &[
+            "--el-http-url",
+            &local_el.url,
+            "--el-reference-url",
+            &peer_ref.url,
+        ],
+        |cfg| {
+            cfg.health_poll_interval = Duration::from_millis(1200);
+            cfg.el_reference_poll_interval = Some(Duration::from_millis(40));
+        },
+    )
     .await;
 
-    tokio::time::sleep(Duration::from_millis(2400)).await;
+    wait_until(Duration::from_secs(4), || {
+        let lb_val = local_batches.load(Ordering::Acquire);
+        let rp_val = ref_polls.load(Ordering::Relaxed);
+        async move {
+            if lb_val >= 2 && rp_val >= 3 {
+                Ok(())
+            } else {
+                Err(format!("local_batches={lb_val}, ref_polls={rp_val}"))
+            }
+        }
+    })
+    .await;
+    // Thirty reference intervals fit into one local interval, so even a heavily loaded
+    // runner completes two background rounds; a reference cadence that followed the
+    // local interval would have polled once or twice by then, warm-up included.
+    let seen = ref_polls_at_local_poll.load(Ordering::Relaxed);
     assert!(
-        local_batches.load(Ordering::Relaxed) >= 2,
-        "local 2s poll was starved by 1s reference updates"
-    );
-    assert!(
-        ref_polls.load(Ordering::Relaxed) >= 3,
-        "expected warm + >=2 background reference polls"
+        seen >= 3,
+        "only {seen} reference polls before the first background local poll"
     );
 
     proxy.shutdown().await;
@@ -1673,70 +1543,64 @@ async fn reference_gate_handles_local_rpc_glitches_via_unified_two_strike_withou
 {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // 1. Sub-second chain (200ms blocks) with `--health-poll-interval 2` > `--el-reference-poll-interval 1`:
+    // 1. Sub-second chain (40ms blocks) with `health_poll_interval` (240ms) > `el_reference_poll_interval` (90ms):
     //    when local `eth_blockNumber` fails, the reference gate must NOT subtract a stale `local.el_block`
     //    and fabricate false 503s; instead it retains `200` on strike 1 and fails open `200` on strike 2.
     let t0 = std::time::Instant::now();
-    let head = move || 1_000 + (t0.elapsed().as_millis() / 200) as u64;
+    let head = move || 1_000 + (t0.elapsed().as_millis() / 40) as u64;
     let fail_local_block_num = Arc::new(AtomicBool::new(false));
     let fail_bn = fail_local_block_num.clone();
 
-    let fast_el = MockServer::start(Arc::new(move |req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+    let fast_el = MockServer::start(jsonrpc_mock(move |method| {
         if method == "eth_blockNumber" && fail_bn.load(Ordering::Acquire) {
-            return (
-                StatusCode::OK,
-                br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"busy"}}"#.to_vec(),
-            );
+            return RpcMockReply::Error(-32000, "busy");
         }
         let h = format!("0x{:x}", head());
-        let result = match method {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "net_peerCount" => json!("0x4"),
             "eth_getBlockByNumber" => json!({"number": h, "timestamp": "0x67000000"}),
             "eth_chainId" => json!("0x1"),
             _ => json!(h),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
 
-    let fast_ref = MockServer::start(Arc::new(move |req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let fast_ref = MockServer::start(jsonrpc_mock(move |method| {
+        RpcMockReply::Result(match method {
             "eth_chainId" => json!("0x1"),
             _ => json!(format!("0x{:x}", head())),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
 
-    let fast_proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        &fast_el.url,
-        "--el-reference-url",
-        &fast_ref.url,
-        "--el-reference-poll-interval",
-        "1",
-        "--health-poll-interval",
-        "2",
-    ])
+    let fast_proxy = EthonyxHandle::start_tuned(
+        &[
+            "--el-http-url",
+            &fast_el.url,
+            "--el-reference-url",
+            &fast_ref.url,
+        ],
+        |cfg| {
+            cfg.health_poll_interval = Duration::from_millis(240);
+            cfg.el_reference_poll_interval = Some(Duration::from_millis(90));
+        },
+    )
     .await;
     let c = client();
 
     fail_local_block_num.store(true, Ordering::Release);
+    // Continuous invariant-hold loop: `/readyz` must remain 200 OK on EVERY sample
+    // across both strike 1 (`Retained`) and strike 2 (`Unavailable` fail-open).
     let mut saw_local_bn_err = false;
     let mut saw_fail_open = false;
-    let end = tokio::time::Instant::now() + Duration::from_millis(2600);
-    while tokio::time::Instant::now() < end {
+    let mut post_fail_open_checks = 0u32;
+    let hold_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while post_fail_open_checks < 5 {
+        assert!(
+            tokio::time::Instant::now() < hold_deadline,
+            "timed out waiting for glitch hold checks (bn_err={saw_local_bn_err}, fail_open={saw_fail_open})"
+        );
         let (st, r_body) = get(&c, &fast_proxy.url("/readyz")).await;
         assert_eq!(
             st,
@@ -1755,12 +1619,11 @@ async fn reference_gate_handles_local_rpc_glitches_via_unified_two_strike_withou
         {
             saw_local_bn_err = true;
         }
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        if saw_local_bn_err && saw_fail_open {
+            post_fail_open_checks += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(12)).await;
     }
-    assert!(
-        saw_local_bn_err && saw_fail_open,
-        "expected /healthz local eth_blockNumber error ({saw_local_bn_err}) and strike-2 fail-open ({saw_fail_open})"
-    );
     fast_proxy.shutdown().await;
 
     // 2. Local `eth_chainId` failure while lagging (50 vs 100):
@@ -1768,56 +1631,43 @@ async fn reference_gate_handles_local_rpc_glitches_via_unified_two_strike_withou
     //    then fail open (`200`) on strike 2 (`Unavailable`).
     let fail_local_chain = Arc::new(AtomicBool::new(false));
     let fail_cid = fail_local_chain.clone();
-    let lag_el = MockServer::start(Arc::new(move |req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+    let lag_el = MockServer::start(jsonrpc_mock(move |method| {
         if method == "eth_chainId" && fail_cid.load(Ordering::Acquire) {
-            return (
-                StatusCode::OK,
-                br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"chainId blocked"}}"#
-                    .to_vec(),
-            );
+            return RpcMockReply::Error(-32000, "chainId blocked");
         }
-        let result = match method {
+        RpcMockReply::Result(match method {
             "eth_syncing" => json!(false),
             "net_peerCount" => json!("0x4"),
             "eth_getBlockByNumber" => json!({"number": "0x32", "timestamp": "0x67000000"}),
             "eth_chainId" => json!("0x1"),
             _ => json!("0x32"),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
 
-    let ahead_ref = MockServer::start(Arc::new(|req| {
-        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-        let result = match method {
+    let ahead_ref = MockServer::start(jsonrpc_mock(|method| {
+        RpcMockReply::Result(match method {
             "eth_chainId" => json!("0x1"),
             _ => json!("0x64"),
-        };
-        (
-            StatusCode::OK,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap(),
-        )
+        })
     }))
     .await;
 
-    // Use a 2s reference poll interval so Strike 1 (`Retained`) stays active for a full
-    // 2000ms window before Strike 2 (`Unavailable`), avoiding timing races on loaded CI VMs.
-    let lag_proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        &lag_el.url,
-        "--el-reference-url",
-        &ahead_ref.url,
-        "--el-reference-poll-interval",
-        "2",
-        "--health-poll-interval",
-        "2",
-    ])
+    // Use a 500ms reference poll interval (~33x the 15ms check interval) so Strike 1
+    // (`Retained`, which still reports `block_lag == 50` alongside `local eth_chainId:`)
+    // is observed cleanly before Strike 2 (`Unavailable`, where `block_lag` clears).
+    let lag_proxy = EthonyxHandle::start_tuned(
+        &[
+            "--el-http-url",
+            &lag_el.url,
+            "--el-reference-url",
+            &ahead_ref.url,
+        ],
+        |cfg| {
+            cfg.health_poll_interval = Duration::from_millis(500);
+            cfg.el_reference_poll_interval = Some(Duration::from_millis(500));
+        },
+    )
     .await;
     assert_eq!(
         get(&c, &lag_proxy.url("/readyz")).await.0,
@@ -1826,21 +1676,20 @@ async fn reference_gate_handles_local_rpc_glitches_via_unified_two_strike_withou
 
     fail_local_chain.store(true, Ordering::Release);
     // Catch strike 1 (`Retained`) as soon as `local eth_chainId:` appears in `/healthz`.
-    let strike1_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-    loop {
+    wait_for(|| async {
         let (_, hb) = get(&c, &lag_proxy.url("/healthz")).await;
-        if std::str::from_utf8(&hb)
-            .unwrap()
-            .contains("local eth_chainId:")
-        {
-            break;
+        let val: Value = serde_json::from_slice(&hb).unwrap();
+        let has_err = val["reference"]["errors"].as_array().is_some_and(|errs| {
+            errs.iter()
+                .any(|e| e.as_str().is_some_and(|s| s.contains("local eth_chainId:")))
+        });
+        if has_err && val["reference"]["block_lag"] == 50 {
+            Ok(())
+        } else {
+            Err(val.to_string())
         }
-        assert!(
-            tokio::time::Instant::now() < strike1_deadline,
-            "timed out waiting for strike 1 local eth_chainId error"
-        );
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    }
+    })
+    .await;
     // On strike 1, `Retained` MUST still hold 503 while reporting `reference_health_status 0`!
     assert_eq!(
         get(&c, &lag_proxy.url("/readyz")).await.0,
@@ -1855,8 +1704,7 @@ async fn reference_gate_handles_local_rpc_glitches_via_unified_two_strike_withou
     );
 
     // On strike 2 (`Unavailable`), `/readyz` fails open (`200`) while keeping the error visible.
-    let strike2_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-    loop {
+    wait_for(|| async {
         let (st, body) = get(&c, &lag_proxy.url("/readyz")).await;
         if st == StatusCode::OK {
             let r_val: Value = serde_json::from_slice(&body).unwrap();
@@ -1864,14 +1712,12 @@ async fn reference_gate_handles_local_rpc_glitches_via_unified_two_strike_withou
                 r_val["el_reference_lag"]["detail"],
                 "reference unavailable (fail-open)"
             );
-            break;
+            Ok(())
+        } else {
+            Err(format!("{st}: {}", String::from_utf8_lossy(&body)))
         }
-        assert!(
-            tokio::time::Instant::now() < strike2_deadline,
-            "timed out waiting for strike 2 fail-open"
-        );
-        tokio::time::sleep(Duration::from_millis(60)).await;
-    }
+    })
+    .await;
     let (_, hb2) = get(&c, &lag_proxy.url("/healthz")).await;
     assert!(
         std::str::from_utf8(&hb2)
