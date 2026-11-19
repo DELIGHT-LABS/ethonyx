@@ -23,7 +23,6 @@ pub(crate) struct AppState {
     pub(crate) el: HttpTarget,
     pub(crate) el_ws: Option<WsTarget>,
     pub(crate) cl: Option<ClState>,
-    pub(crate) otel_enabled: bool,
     pub(crate) conn_limit: Arc<Semaphore>,
     pub(crate) health: HealthSource,
     pub(crate) metrics: ServerMetrics,
@@ -33,7 +32,6 @@ impl AppState {
     pub(crate) fn new(
         opts: ProxyOpts,
         upstreams: ValidatedUpstreams,
-        otel_enabled: bool,
         health: HealthSource,
         metrics: ServerMetrics,
     ) -> Self {
@@ -66,7 +64,6 @@ impl AppState {
             el,
             el_ws,
             cl,
-            otel_enabled,
             conn_limit,
             health,
             metrics,

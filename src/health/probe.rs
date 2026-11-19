@@ -283,7 +283,7 @@ mod tests {
             }),
             reference: None,
         };
-        let metrics = ServerMetrics::new(None);
+        let metrics = ServerMetrics::default();
         // A transient outage before/around `-32601` must never register or pin `ElPeers` at 0.
         let outage = Probe {
             local: Arc::new(LocalProbe {
@@ -384,7 +384,7 @@ mod tests {
             }),
             reference: None,
         };
-        let metrics = ServerMetrics::new(None);
+        let metrics = ServerMetrics::default();
 
         tracing::subscriber::with_default(subscriber, || {
             let mut healthy_start = poller();

@@ -470,7 +470,7 @@ pub(crate) struct ParsedConfig {
     pub(crate) opts: ProxyOpts,
     pub(crate) upstreams: ValidatedUpstreams,
     pub(crate) health: HealthMode,
-    pub(crate) otel_endpoint: Option<HttpUpstream>,
+    pub(crate) otel_endpoint: Option<crate::otel::OtelEndpoints>,
 }
 
 fn reject_flags_when(cond: bool, flags: &[(&str, bool)], reason: &str) -> Result<(), BoxError> {

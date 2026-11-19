@@ -17,7 +17,7 @@ use tracing::{Instrument, debug, info, trace, warn};
 use crate::BoxError;
 use crate::headers::{sanitize_response_headers, strip_hop_by_hop};
 use crate::health;
-use crate::metrics::{UpstreamLayer, classify_method};
+use crate::metrics::{MethodBucket, UpstreamLayer};
 use crate::response::{
     ResBody, empty_body, full_body, raw_json_response, text_response, uri_too_long_response,
 };
@@ -120,13 +120,14 @@ impl Connection {
         };
         let (layer, upstream_proto) = forward.layer_and_proto();
         let upstream_type = layer.as_str();
-        let (method_idx, method_label) = classify_method(req.method());
+        let method_bucket = MethodBucket::classify(req.method());
         let version = req.version();
         let access_ctx = tracing::enabled!(target: "access_log", tracing::Level::INFO)
             .then(|| (req.method().clone(), req.uri().clone()));
-        let otel_enabled = self.state.otel_enabled;
+        let otel_enabled = self.state.metrics.otel_enabled();
         let span = if otel_enabled || tracing::enabled!(tracing::Level::DEBUG) {
             let span = tracing::info_span!(
+                parent: None,
                 "request",
                 method = %req.method(),
                 path = req.uri().path(),
@@ -168,7 +169,7 @@ impl Connection {
         }
         self.state
             .metrics
-            .record_request(layer, method_idx, method_label, status, elapsed);
+            .record_request(layer, method_bucket, status, elapsed);
         Ok(response)
     }
 }
@@ -455,7 +456,7 @@ async fn execute_upstream(
     // Strip hop-by-hop and Connection-nominated headers BEFORE injecting OTel
     // trace context so `Connection: traceparent` cannot strip outgoing spans.
     strip_hop_by_hop(&mut parts.headers);
-    if state.otel_enabled {
+    if state.metrics.otel_enabled() {
         crate::otel::propagate_context(&mut parts.headers);
     }
     parts.extensions.clear();
@@ -902,9 +903,8 @@ mod tests {
         let state = Arc::new(AppState::new(
             parsed.opts,
             parsed.upstreams,
-            false,
             health::HealthSource::Trusted,
-            crate::metrics::ServerMetrics::new(None),
+            crate::metrics::ServerMetrics::default(),
         ));
         let sem = Arc::clone(&state.conn_limit);
         let tcp_permit = Arc::new(sem.clone().try_acquire_owned().unwrap());

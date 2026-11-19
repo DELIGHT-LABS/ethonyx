@@ -46,18 +46,30 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[must_use = "Prepared does nothing unless `.bind().await` or `.run(shutdown).await` is called"]
 pub struct Prepared {
     cfg: Config,
-    parsed: config::ParsedConfig,
+    listen: Vec<config::ListenAddr>,
+    opts: config::ProxyOpts,
+    upstreams: config::ValidatedUpstreams,
+    health: config::HealthMode,
     telemetry: otel::Telemetry,
 }
 
 impl Prepared {
     /// Validate `cfg` and start the OTLP providers when an endpoint is configured.
     pub async fn new(cfg: Config) -> Result<Self, BoxError> {
-        let mut parsed = cfg.parse_validated()?;
-        let telemetry = otel::start(parsed.otel_endpoint.take()).await?;
+        let config::ParsedConfig {
+            listen,
+            opts,
+            upstreams,
+            health,
+            otel_endpoint,
+        } = cfg.parse_validated()?;
+        let telemetry = otel::start(otel_endpoint).await?;
         Ok(Self {
             cfg,
-            parsed,
+            listen,
+            opts,
+            upstreams,
+            health,
             telemetry,
         })
     }
@@ -82,14 +94,10 @@ impl Prepared {
     pub async fn bind(self) -> Result<Bound, BoxError> {
         let Self {
             cfg,
-            parsed:
-                config::ParsedConfig {
-                    listen,
-                    opts,
-                    upstreams,
-                    health,
-                    otel_endpoint: _,
-                },
+            listen,
+            opts,
+            upstreams,
+            health,
             telemetry,
         } = self;
         let shutdown_grace = cfg.shutdown_grace;
@@ -98,9 +106,8 @@ impl Prepared {
         let state = Arc::new(AppState::new(
             opts,
             upstreams,
-            telemetry.is_enabled(),
             health,
-            metrics::ServerMetrics::new(telemetry.metric_sink()),
+            metrics::ServerMetrics::new(telemetry.metrics()),
         ));
 
         info!(
