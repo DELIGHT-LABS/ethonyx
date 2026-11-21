@@ -9,21 +9,11 @@ use tokio_tungstenite::{
 
 #[tokio::test]
 async fn ws_handshake_fails_with_502_when_upstream_down() {
-    // Nothing listens on the WS upstream. ethonyx dials upstream *before*
-    // completing the client handshake, so the client gets a 502 on the handshake
-    // rather than a 101 followed by an immediate abnormal close.
-    let el = MockServer::start(ok_handler()).await;
-    let cl = MockServer::start(ok_handler()).await;
+    // DeadPort accepts TCP and immediately resets with SO_LINGER(0). ethonyx dials
+    // upstream *before* completing the client handshake, so the client gets a 502 on
+    // the handshake rather than a 101 followed by an immediate abnormal close.
     let dead = DeadPort::new();
-    let ethonyx = EthonyxHandle::start(&[
-        "--el-http-url",
-        &el.url,
-        "--cl-beacon-url",
-        &cl.url,
-        "--el-ws-url",
-        &dead.ws_url(),
-    ])
-    .await;
+    let ethonyx = EthonyxHandle::start_trusted_ws(&dead.ws_url()).await;
 
     let url = format!("ws://127.0.0.1:{}/", ethonyx.port);
     match connect_async(&url).await {
@@ -35,81 +25,57 @@ async fn ws_handshake_fails_with_502_when_upstream_down() {
 }
 
 #[tokio::test]
-async fn ws_bridge_echoes_through_upstream() {
-    // With the upstream up, the reordered handshake still establishes and the
-    // bidirectional bridge forwards frames.
-    let el = MockServer::start(ok_handler()).await;
-    let cl = MockServer::start(ok_handler()).await;
-    let ws_upstream = ws_echo_upstream().await;
-    let ethonyx = EthonyxHandle::start(&[
-        "--el-http-url",
-        &el.url,
-        "--cl-beacon-url",
-        &cl.url,
-        "--el-ws-url",
-        &ws_upstream,
-    ])
-    .await;
-
-    let url = format!("ws://127.0.0.1:{}/", ethonyx.port);
-    let (mut ws, _resp) = connect_async(&url).await.expect("handshake should succeed");
-    ws.send(Message::Text("ping".into())).await.unwrap();
-    let echoed = loop {
-        match ws.next().await.expect("a reply").expect("ok frame") {
-            Message::Text(t) => break t,
-            _ => continue,
-        }
-    };
-    assert_eq!(echoed.as_str(), "ping");
-
-    ethonyx.shutdown().await;
-}
-
-#[tokio::test]
 async fn http2_extended_connect_ws_502_when_upstream_down() {
     // The h2 path dials the upstream first too: a dead upstream surfaces as a 502
     // on the CONNECT response, not an accepted-then-dropped tunnel.
-    let el = MockServer::start(ok_handler()).await;
-    let cl = MockServer::start(ok_handler()).await;
     let dead = DeadPort::new();
-    let ethonyx = EthonyxHandle::start(&[
-        "--el-http-url",
-        &el.url,
-        "--cl-beacon-url",
-        &cl.url,
-        "--el-ws-url",
-        &dead.ws_url(),
-    ])
-    .await;
+    let ethonyx = EthonyxHandle::start_trusted_ws(&dead.ws_url()).await;
+    let mut h2 = ethonyx.open_h2().await;
 
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ethonyx.port))
-        .await
-        .unwrap();
-    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, TestBody>(TokioIo::new(tcp))
-        .await
-        .expect("h2 handshake");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let req = ext_connect(format!("http://127.0.0.1:{}/", ethonyx.port));
 
-    let mut req = Request::builder()
-        .method(Method::CONNECT)
-        .header("sec-websocket-version", "13")
-        .uri(format!("http://127.0.0.1:{}/", ethonyx.port))
-        .body(Full::<Bytes>::new(Bytes::new()))
-        .unwrap();
-    req.extensions_mut()
-        .insert(hyper::ext::Protocol::from_static("websocket"));
-
-    let resp = sender.send_request(req).await.expect("extended CONNECT");
+    let resp = h2.send_request(req).await.expect("extended CONNECT");
     assert_eq!(
         resp.status(),
         StatusCode::BAD_GATEWAY,
         "dead upstream → 502"
     );
 
+    drop(h2);
     ethonyx.shutdown().await;
+}
+
+#[tokio::test]
+async fn ws_upstream_that_never_answers_is_a_502_after_proxy_timeout() {
+    // Accepts TCP and stays silent so only `--proxy-timeout` can end the upstream handshake;
+    // `DeadPort` resets immediately and never reaches the dial-timeout branch.
+    let silent = SilentPort::new().await;
+    let ws_url = silent.ws_url();
+    let proxy = EthonyxHandle::start_trusted_tuned(&["--el-ws-url", &ws_url], |cfg| {
+        cfg.proxy_timeout = Duration::from_millis(200);
+    })
+    .await;
+    let started = tokio::time::Instant::now();
+    let handshake = connect_async(format!("ws://127.0.0.1:{}/", proxy.port));
+    match tokio::time::timeout(Duration::from_secs(5), handshake)
+        .await
+        .expect("--proxy-timeout must end the upstream dial")
+    {
+        Err(WsError::Http(resp)) => {
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                resp.body().as_deref(),
+                Some(&b"upstream ws connect timed out"[..])
+            );
+        }
+        other => panic!("expected a 502 handshake error, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the 502 must come from --proxy-timeout (took {:?})",
+        started.elapsed()
+    );
+    proxy.shutdown().await;
 }
 
 #[tokio::test]
@@ -118,43 +84,15 @@ async fn http2_extended_connect_ws_bridges_to_upstream() {
     // `:method=CONNECT, :protocol=websocket`. ethonyx terminates the h2 stream and
     // bridges the RFC 6455 frames to the upstream h1 WebSocket (h2 ws → h1 ws).
     // Driven by a hand-rolled h2 client because tokio/hyper-tungstenite are h1-only.
-    let el = MockServer::start(ok_handler()).await;
-    let cl = MockServer::start(ok_handler()).await;
     let ws_upstream = ws_echo_upstream().await;
-    let ethonyx = EthonyxHandle::start(&[
-        "--el-http-url",
-        &el.url,
-        "--cl-beacon-url",
-        &cl.url,
-        "--el-ws-url",
-        &ws_upstream,
-    ])
-    .await;
-
-    // Cleartext h2 (prior-knowledge) connection to ethonyx.
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ethonyx.port))
-        .await
-        .unwrap();
-    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, TestBody>(TokioIo::new(tcp))
-        .await
-        .expect("h2 handshake");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let ethonyx = EthonyxHandle::start_trusted_ws(&ws_upstream.url).await;
+    let mut h2 = ethonyx.open_h2().await;
 
     let mut sockets = Vec::new();
     for path in ["/", "/healthz", "/readyz", "/livez", "/metrics"] {
-        let mut req = Request::builder()
-            .method(Method::CONNECT)
-            .header("sec-websocket-version", "13")
-            .uri(format!("http://127.0.0.1:{}{path}", ethonyx.port))
-            .body(Full::<Bytes>::new(Bytes::new()))
-            .unwrap();
-        req.extensions_mut()
-            .insert(hyper::ext::Protocol::from_static("websocket"));
+        let req = ext_connect(format!("http://127.0.0.1:{}{path}", ethonyx.port));
 
-        let resp = sender.send_request(req).await.expect("extended CONNECT");
+        let resp = h2.send_request(req).await.expect("extended CONNECT");
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -162,13 +100,7 @@ async fn http2_extended_connect_ws_bridges_to_upstream() {
         );
         assert_eq!(resp.version(), Version::HTTP_2);
 
-        let upgraded = hyper::upgrade::on(resp).await.expect("upgrade");
-        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-            TokioIo::new(upgraded),
-            tokio_tungstenite::tungstenite::protocol::Role::Client,
-            None,
-        )
-        .await;
+        let mut ws = upgrade_ws(resp).await;
         ws.send(Message::Text("ping".into())).await.unwrap();
         let echoed = loop {
             match ws.next().await.expect("a reply").expect("ok frame") {
@@ -205,7 +137,6 @@ async fn ws_verifying_upstream(
     tokio::spawn(async move {
         // We only expect one connection in this test.
         if let Ok((stream, _)) = listener.accept().await {
-            let expected_headers = expected_headers.clone();
             let verified = Arc::new(std::sync::atomic::AtomicBool::new(true));
             let verified_cb = Arc::clone(&verified);
 
@@ -246,9 +177,6 @@ async fn ws_verifying_upstream(
 async fn ws_forwarding_preserves_path_query_and_headers() {
     // Tests that WebSocket proxy relays custom headers (like authorization)
     // and path/queries from client request to the upstream WebSocket correctly.
-    let el = MockServer::start(ok_handler()).await;
-    let cl = MockServer::start(ok_handler()).await;
-
     let (tx_verified, rx_verified) = oneshot::channel::<bool>();
 
     let ws_upstream = ws_verifying_upstream(
@@ -264,15 +192,7 @@ async fn ws_forwarding_preserves_path_query_and_headers() {
     )
     .await;
 
-    let ethonyx = EthonyxHandle::start(&[
-        "--el-http-url",
-        &el.url,
-        "--cl-beacon-url",
-        &cl.url,
-        "--el-ws-url",
-        &ws_upstream,
-    ])
-    .await;
+    let ethonyx = EthonyxHandle::start_trusted_ws(&ws_upstream).await;
 
     // Connect using tungstenite Request with custom path/query and headers.
     let target_url = format!("ws://127.0.0.1:{}/foo/bar?baz=qux", ethonyx.port);
@@ -305,33 +225,27 @@ async fn ws_forwarding_preserves_path_query_and_headers() {
         is_verified,
         "Upstream did not receive the expected path, query, or headers"
     );
-
     ethonyx.shutdown().await;
-}
 
-#[tokio::test]
-#[allow(clippy::result_large_err)]
-async fn test_ws_handshake_preserves_upstream_path_without_trailing_slash() {
-    let captured_uri = Arc::new(std::sync::Mutex::new(String::new()));
-    let captured_uri_clone = captured_uri.clone();
-
-    let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = server.local_addr().unwrap().port();
-
+    // 2. Scoped upstream path without trailing slash (`/v2/testkey` + inbound `/`)
+    //    must preserve `/v2/testkey` without appending `/` and bridge frames cleanly.
+    let (uri_tx, uri_rx) = oneshot::channel::<String>();
+    let scoped_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let scoped_port = scoped_server.local_addr().unwrap().port();
     tokio::spawn(async move {
-        if let Ok((stream, _)) = server.accept().await {
-            let captured_uri_clone2 = captured_uri_clone.clone();
+        if let Ok((stream, _)) = scoped_server.accept().await {
+            let mut tx = Some(uri_tx);
+            #[allow(clippy::result_large_err)]
             let ws_stream = tokio_tungstenite::accept_hdr_async(
                 stream,
                 move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, res| {
-                    if let Ok(mut guard) = captured_uri_clone2.lock() {
-                        *guard = req.uri().to_string();
+                    if let Some(tx) = tx.take() {
+                        let _ = tx.send(req.uri().to_string());
                     }
                     Ok(res)
                 },
             )
             .await;
-
             if let Ok(mut ws) = ws_stream {
                 while let Some(Ok(msg)) = ws.next().await {
                     if msg.is_text() || msg.is_binary() {
@@ -342,74 +256,18 @@ async fn test_ws_handshake_preserves_upstream_path_without_trailing_slash() {
         }
     });
 
-    let upstream_url = format!("ws://127.0.0.1:{port}/v2/testkey");
-    let ethonyx = EthonyxHandle::start(&[
-        "--el-http-url",
-        "http://127.0.0.1:8545",
-        "--el-ws-url",
-        &upstream_url,
-        "--trust-upstream",
-    ])
-    .await;
-
-    let ws_url = ethonyx.url("/").replace("http://", "ws://");
-    let (ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
-
-    let _ = ws;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let final_uri = captured_uri.lock().unwrap().clone();
-    assert_eq!(final_uri, "/v2/testkey");
-
-    ethonyx.shutdown().await;
-}
-
-#[tokio::test]
-#[allow(clippy::result_large_err)] // Tungstenite fixes the callback error type.
-async fn websocket_subprotocol_is_negotiated_end_to_end() {
-    use tokio_tungstenite::tungstenite::{
-        client::IntoClientRequest,
-        handshake::server::{Request as WsRequest, Response as WsResponse},
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut ws =
-            tokio_tungstenite::accept_hdr_async(socket, |req: &WsRequest, mut res: WsResponse| {
-                assert_eq!(req.headers()["sec-websocket-protocol"], "jsonrpc");
-                res.headers_mut()
-                    .insert("sec-websocket-protocol", "jsonrpc".parse().unwrap());
-                Ok(res)
-            })
-            .await
-            .unwrap();
-        if let Some(Ok(message)) = ws.next().await {
-            ws.send(message).await.unwrap();
-        }
-    });
-    let proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        "http://127.0.0.1:8545",
-        "--trust-upstream",
-        "--el-ws-url",
-        &format!("ws://{addr}"),
-    ])
-    .await;
-    let mut req = format!("ws://127.0.0.1:{}/", proxy.port)
-        .into_client_request()
+    let scoped_proxy =
+        EthonyxHandle::start_trusted_ws(&format!("ws://127.0.0.1:{scoped_port}/v2/testkey")).await;
+    let (mut scoped_ws, _) = connect_async(scoped_proxy.url("/").replace("http://", "ws://"))
+        .await
         .unwrap();
-    req.headers_mut()
-        .insert("sec-websocket-protocol", "jsonrpc".parse().unwrap());
-    let (mut ws, response) = connect_async(req).await.unwrap();
-    assert_eq!(response.headers()["sec-websocket-protocol"], "jsonrpc");
-    ws.send(Message::Text("hello".into())).await.unwrap();
+    assert_eq!(uri_rx.await.unwrap(), "/v2/testkey");
+    scoped_ws.send(Message::Text("echo".into())).await.unwrap();
     assert_eq!(
-        ws.next().await.unwrap().unwrap(),
-        Message::Text("hello".into())
+        scoped_ws.next().await.unwrap().unwrap(),
+        Message::Text("echo".into())
     );
-    server.await.unwrap();
-    proxy.shutdown().await;
+    scoped_proxy.shutdown().await;
 }
 
 #[tokio::test]
@@ -421,14 +279,11 @@ async fn websocket_fragmented_utf8_ping_close_and_mock_batch() {
     let upstream = ws_echo_upstream().await;
     for mocking in [false, true] {
         let mock_arg = if mocking { "true" } else { "false" };
-        let proxy = EthonyxHandle::start(&[
-            "--el-http-url",
-            "http://127.0.0.1:8545",
-            "--trust-upstream",
+        let proxy = EthonyxHandle::start_trusted(&[
             "--mock-eth-syncing",
             mock_arg,
             "--el-ws-url",
-            &upstream,
+            &upstream.url,
         ])
         .await;
         let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
@@ -473,7 +328,7 @@ async fn websocket_fragmented_utf8_ping_close_and_mock_batch() {
                 json!([{"jsonrpc":"2.0","id":7,"result":false}])
             );
         }
-        ws.send(Message::Ping(b"ping".to_vec().into()))
+        ws.send(Message::Ping(Bytes::from_static(b"ping")))
             .await
             .unwrap();
         assert!(matches!(
@@ -507,14 +362,7 @@ async fn websocket_fragmented_utf8_ping_close_and_mock_batch() {
 async fn websocket_rejects_invalid_and_oversized_frames() {
     use tokio::io::AsyncWriteExt;
     let upstream = ws_echo_upstream().await;
-    let proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        "http://127.0.0.1:8545",
-        "--trust-upstream",
-        "--el-ws-url",
-        &upstream,
-    ])
-    .await;
+    let proxy = EthonyxHandle::start_trusted_ws(&upstream.url).await;
     let mut oversized_pong = vec![0x8a, 0xfe, 0, 126, 0, 0, 0, 0];
     oversized_pong.extend_from_slice(&[0; 126]);
     let mut oversized_frame = vec![0x82, 0xff];
@@ -550,14 +398,7 @@ async fn websocket_rejects_invalid_handshakes_on_both_hops() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dead = DeadPort::new();
     let dead_url = dead.ws_url();
-    let proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        "http://127.0.0.1:8545",
-        "--trust-upstream",
-        "--el-ws-url",
-        &dead_url,
-    ])
-    .await;
+    let proxy = EthonyxHandle::start_trusted_ws(&dead_url).await;
     for headers in [
         "Sec-WebSocket-Version: 12\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
         "Sec-WebSocket-Version: 13\r\n", // missing key
@@ -590,14 +431,7 @@ async fn websocket_rejects_invalid_handshakes_on_both_hops() {
         }
         socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: invalid-signature\r\n\r\n").await.unwrap();
     });
-    let proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        "http://127.0.0.1:8545",
-        "--trust-upstream",
-        "--el-ws-url",
-        &url,
-    ])
-    .await;
+    let proxy = EthonyxHandle::start_trusted_ws(&url).await;
     let err = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
         .await
         .unwrap_err();
@@ -644,10 +478,7 @@ async fn websocket_sustained_churn_preserves_replies_and_releases_upstreams() {
                 });
             }
         });
-        let proxy = EthonyxHandle::start(&[
-            "--el-http-url",
-            "http://127.0.0.1:8545",
-            "--trust-upstream",
+        let proxy = EthonyxHandle::start_trusted(&[
             "--mock-eth-syncing",
             if mocking { "true" } else { "false" },
             "--el-ws-url",
@@ -746,10 +577,7 @@ async fn websocket_header_lists_and_http1_connect_are_validated_before_dialing()
     let key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
     let canonical = "Connection: Upgrade\r\nUpgrade: websocket\r\n";
     for mocking in [false, true] {
-        let proxy = EthonyxHandle::start(&[
-            "--el-http-url",
-            "http://127.0.0.1:8545",
-            "--trust-upstream",
+        let proxy = EthonyxHandle::start_trusted(&[
             "--el-ws-url",
             &upstream,
             "--mock-eth-syncing",
@@ -877,24 +705,8 @@ async fn websocket_header_lists_and_http1_connect_are_validated_before_dialing()
 async fn http2_websocket_rejects_missing_invalid_and_duplicate_versions_without_dialing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("ws://{}", listener.local_addr().unwrap());
-    let proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        "http://127.0.0.1:8545",
-        "--trust-upstream",
-        "--el-ws-url",
-        &upstream,
-    ])
-    .await;
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
-        .await
-        .unwrap();
-    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, TestBody>(TokioIo::new(tcp))
-        .await
-        .unwrap();
-    let connection = tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let proxy = EthonyxHandle::start_trusted_ws(&upstream).await;
+    let mut h2 = proxy.open_h2().await;
     for versions in [
         vec![],
         vec!["12"],
@@ -913,7 +725,7 @@ async fn http2_websocket_rejects_missing_invalid_and_duplicate_versions_without_
             req.headers_mut()
                 .append("sec-websocket-version", version.parse().unwrap());
         }
-        let response = tokio::time::timeout(Duration::from_secs(2), sender.send_request(req))
+        let response = tokio::time::timeout(Duration::from_secs(2), h2.send_request(req))
             .await
             .unwrap()
             .unwrap();
@@ -925,17 +737,13 @@ async fn http2_websocket_rejects_missing_invalid_and_duplicate_versions_without_
             .is_err()
     );
     proxy.shutdown().await;
-    connection.abort();
 }
 
 async fn ws_handshake_response(
     proxy: &EthonyxHandle,
     h2: bool,
     headers: &[(&str, &str)],
-) -> (Response<Incoming>, JoinHandle<()>) {
-    let socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
-        .await
-        .unwrap();
+) -> (Response<Incoming>, AbortOnDrop) {
     let mut req = Request::builder()
         .method(if h2 { Method::CONNECT } else { Method::GET })
         .uri(proxy.url("/"))
@@ -951,15 +759,15 @@ async fn ws_handshake_response(
     if h2 {
         req.extensions_mut()
             .insert(hyper::ext::Protocol::from_static("websocket"));
-        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-            .handshake::<_, TestBody>(TokioIo::new(socket))
+        let H2Client {
+            mut sender,
+            _driver,
+        } = proxy.open_h2().await;
+        (sender.send_request(req).await.unwrap(), _driver)
+    } else {
+        let socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
             .await
             .unwrap();
-        let driver = tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        (sender.send_request(req).await.unwrap(), driver)
-    } else {
         req.headers_mut()
             .insert("host", "localhost".parse().unwrap());
         req.headers_mut()
@@ -976,7 +784,7 @@ async fn ws_handshake_response(
         let driver = tokio::spawn(async move {
             let _ = conn.with_upgrades().await;
         });
-        (sender.send_request(req).await.unwrap(), driver)
+        (sender.send_request(req).await.unwrap(), AbortOnDrop(driver))
     }
 }
 
@@ -985,22 +793,11 @@ async fn websocket_negotiates_split_protocols_without_forwarding_extensions() {
     use tokio_tungstenite::tungstenite::handshake::server::{
         Request as WsRequest, Response as WsResponse,
     };
-    for (h2, large) in [(false, false), (true, false), (false, true), (true, true)] {
-        // Keep the wire case within HTTP/2's header-list limit. Unit tests also
-        // exercise 32K tokens near the larger HTTP/1 header buffer limit.
-        let first_line = if large {
-            (0..1024)
-                .rev()
-                .map(|i| format!("p{i:04}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            "first".into()
-        };
-        let expected = format!("{first_line}, Second, second, Third");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
+    let (plan_tx, mut plan_rx) = tokio::sync::mpsc::unbounded_channel::<(String, &'static str)>();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        while let Some((expected, selected)) = plan_rx.recv().await {
             let (socket, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_hdr_async(
                 socket,
@@ -1018,7 +815,7 @@ async fn websocket_negotiates_split_protocols_without_forwarding_extensions() {
                     assert_eq!(request.headers()["sec-websocket-protocol"], expected);
                     response
                         .headers_mut()
-                        .insert("sec-websocket-protocol", "second".parse().unwrap());
+                        .insert("sec-websocket-protocol", selected.parse().unwrap());
                     Ok(response)
                 },
             )
@@ -1027,73 +824,83 @@ async fn websocket_negotiates_split_protocols_without_forwarding_extensions() {
             let message = ws.next().await.unwrap().unwrap();
             ws.send(message).await.unwrap();
             let _ = ws.next().await;
-        });
-        let proxy = EthonyxHandle::start(&[
-            "--el-http-url",
-            "http://127.0.0.1:8545",
-            "--trust-upstream",
-            "--el-ws-url",
-            &url,
-        ])
-        .await;
-        let (response, driver) = ws_handshake_response(
-            &proxy,
-            h2,
-            &[
-                ("sec-websocket-protocol", &first_line),
-                ("sec-websocket-protocol", " Second\t, second, Third "),
-                (
-                    "sec-websocket-extensions",
-                    "permessage-deflate; client_max_window_bits",
-                ),
-                ("sec-websocket-extensions", "unknown-extension"),
-            ],
-        )
-        .await;
-        assert_eq!(
-            response.status(),
-            if h2 {
-                StatusCode::OK
-            } else {
-                StatusCode::SWITCHING_PROTOCOLS
-            }
-        );
-        assert_eq!(response.headers()["sec-websocket-protocol"], "second");
-        assert!(!response.headers().contains_key("sec-websocket-extensions"));
-        let upgraded = hyper::upgrade::on(response).await.unwrap();
-        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-            TokioIo::new(upgraded),
-            tokio_tungstenite::tungstenite::protocol::Role::Client,
-            None,
-        )
-        .await;
-        ws.send(Message::Text("uncompressed round trip".into()))
-            .await
-            .unwrap();
-        assert_eq!(
-            ws.next().await.unwrap().unwrap(),
-            Message::Text("uncompressed round trip".into())
-        );
-        ws.close(None).await.unwrap();
-        proxy.shutdown().await;
-        server.await.unwrap();
-        driver.abort();
-        let _ = driver.await;
+        }
+    });
+    let proxy = EthonyxHandle::start_trusted_ws(&url).await;
+
+    let large_line = (0..1024)
+        .rev()
+        .map(|i| format!("p{i:04}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Covers both the single-token zero-allocation fast path (`" jsonrpc\t "` -> `"jsonrpc"`)
+    // and multi-line split / 1024-token slow paths across HTTP/1.1 and HTTP/2 Extended CONNECT.
+    for h2 in [false, true] {
+        for (offer_lines, expected, selected) in [
+            (vec![" jsonrpc\t "], "jsonrpc".to_owned(), "jsonrpc"),
+            (
+                vec!["first", " Second\t, second, Third "],
+                "first, Second, second, Third".to_owned(),
+                "second",
+            ),
+            (
+                vec![large_line.as_str(), " Second\t, second, Third "],
+                format!("{large_line}, Second, second, Third"),
+                "second",
+            ),
+        ] {
+            plan_tx.send((expected, selected)).unwrap();
+            let mut headers: Vec<(&str, &str)> = offer_lines
+                .into_iter()
+                .map(|v| ("sec-websocket-protocol", v))
+                .collect();
+            headers.push((
+                "sec-websocket-extensions",
+                "permessage-deflate; client_max_window_bits",
+            ));
+            headers.push(("sec-websocket-extensions", "unknown-extension"));
+
+            let (response, _driver) = ws_handshake_response(&proxy, h2, &headers).await;
+            assert_eq!(
+                response.status(),
+                if h2 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SWITCHING_PROTOCOLS
+                },
+                "h2={h2}, selected={selected}"
+            );
+            assert_eq!(
+                response.headers()["sec-websocket-protocol"],
+                selected,
+                "h2={h2}, selected={selected}"
+            );
+            assert!(
+                !response.headers().contains_key("sec-websocket-extensions"),
+                "h2={h2}, selected={selected}"
+            );
+            let mut ws = upgrade_ws(response).await;
+            ws.send(Message::Text("uncompressed round trip".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                ws.next().await.unwrap().unwrap(),
+                Message::Text("uncompressed round trip".into()),
+                "h2={h2}, selected={selected}"
+            );
+            ws.close(None).await.unwrap();
+        }
     }
+    drop(plan_tx);
+    proxy.shutdown().await;
+    server.await.unwrap();
 }
 
 #[tokio::test]
 async fn websocket_rejects_split_protocol_duplicates_before_dialing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
-    let proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        "http://127.0.0.1:8545",
-        "--trust-upstream",
-        "--el-ws-url",
-        &url,
-    ])
-    .await;
+    let proxy = EthonyxHandle::start_trusted_ws(&url).await;
     for h2 in [false, true] {
         let count = if h2 { 1024 } else { 32_768 };
         let large = (0..count)
@@ -1109,7 +916,7 @@ async fn websocket_rejects_split_protocol_duplicates_before_dialing() {
                 .iter()
                 .map(|&value| ("sec-websocket-protocol", value))
                 .collect();
-            let (response, driver) = tokio::time::timeout(
+            let (response, _driver) = tokio::time::timeout(
                 Duration::from_secs(10),
                 ws_handshake_response(&proxy, h2, &headers),
             )
@@ -1117,8 +924,6 @@ async fn websocket_rejects_split_protocol_duplicates_before_dialing() {
             .expect("invalid subprotocol offers must be rejected promptly");
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "h2={h2}");
             drop(response);
-            driver.abort();
-            let _ = driver.await;
         }
     }
     assert!(
@@ -1135,54 +940,57 @@ async fn websocket_rejects_unsolicited_extensions_and_invalid_protocol_selection
     use tokio_tungstenite::tungstenite::handshake::server::{
         Request as WsRequest, Response as WsResponse,
     };
-    for h2 in [false, true] {
-        for selection in ["extension", "duplicate", "unoffered", "wrong-case", "list"] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("ws://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                let (socket, _) = listener.accept().await.unwrap();
-                let mut ws = tokio_tungstenite::accept_hdr_async(
-                    socket,
-                    #[allow(clippy::result_large_err)]
-                    // Tungstenite fixes the callback error type.
-                    move |request: &WsRequest, mut response: WsResponse| {
-                        assert!(!request.headers().contains_key("sec-websocket-extensions"));
-                        let protocol = match selection {
-                            "unoffered" => "other",
-                            "wrong-case" => "Second",
-                            "list" => "first, second",
-                            _ => "second",
-                        };
+    let (sel_tx, mut sel_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        while let Some(selection) = sel_rx.recv().await {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                socket,
+                #[allow(clippy::result_large_err)] // Tungstenite fixes the callback error type.
+                move |request: &WsRequest, mut response: WsResponse| {
+                    assert!(!request.headers().contains_key("sec-websocket-extensions"));
+                    let protocol = match selection {
+                        "unoffered" => "other",
+                        "wrong-case" => "Second",
+                        "list" => "first, second",
+                        _ => "second",
+                    };
+                    response
+                        .headers_mut()
+                        .insert("sec-websocket-protocol", protocol.parse().unwrap());
+                    if selection == "extension" {
+                        response.headers_mut().insert(
+                            "sec-websocket-extensions",
+                            "permessage-deflate".parse().unwrap(),
+                        );
+                    }
+                    if selection == "duplicate" {
                         response
                             .headers_mut()
-                            .insert("sec-websocket-protocol", protocol.parse().unwrap());
-                        if selection == "extension" {
-                            response.headers_mut().insert(
-                                "sec-websocket-extensions",
-                                "permessage-deflate".parse().unwrap(),
-                            );
-                        }
-                        if selection == "duplicate" {
-                            response
-                                .headers_mut()
-                                .append("sec-websocket-protocol", "second".parse().unwrap());
-                        }
-                        Ok(response)
-                    },
-                )
-                .await
-                .unwrap();
-                let _ = ws.next().await;
-            });
-            let proxy = EthonyxHandle::start(&[
-                "--el-http-url",
-                "http://127.0.0.1:8545",
-                "--trust-upstream",
-                "--el-ws-url",
-                &url,
-            ])
-            .await;
-            let (response, driver) = ws_handshake_response(
+                            .append("sec-websocket-protocol", "second".parse().unwrap());
+                    }
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let _ = ws.next().await;
+        }
+    });
+    let proxy = EthonyxHandle::start_trusted_ws(&url).await;
+
+    for h2 in [false, true] {
+        for (selection, expected_body) in [
+            ("extension", &b"invalid upstream websocket negotiation"[..]),
+            ("duplicate", b"invalid upstream websocket negotiation"),
+            ("unoffered", b"upstream ws connect failed"),
+            ("wrong-case", b"upstream ws connect failed"),
+            ("list", b"upstream ws connect failed"),
+        ] {
+            sel_tx.send(selection).unwrap();
+            let (response, _driver) = ws_handshake_response(
                 &proxy,
                 h2,
                 &[
@@ -1196,15 +1004,16 @@ async fn websocket_rejects_unsolicited_extensions_and_invalid_protocol_selection
                 StatusCode::BAD_GATEWAY,
                 "{selection}, h2={h2}"
             );
-            proxy.shutdown().await;
-            tokio::time::timeout(Duration::from_secs(1), server)
-                .await
-                .unwrap()
-                .unwrap();
-            driver.abort();
-            let _ = driver.await;
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], expected_body, "{selection}, h2={h2}");
         }
     }
+    drop(sel_tx);
+    proxy.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1245,14 +1054,7 @@ async fn websocket_strips_hop_by_hop_and_connection_nominated_headers_on_upstrea
         .unwrap();
         let _ = ws.next().await;
     });
-    let proxy = EthonyxHandle::start(&[
-        "--el-http-url",
-        "http://127.0.0.1:8545",
-        "--trust-upstream",
-        "--el-ws-url",
-        &url,
-    ])
-    .await;
+    let proxy = EthonyxHandle::start_trusted_ws(&url).await;
     let socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
         .await
         .unwrap();
@@ -1278,16 +1080,14 @@ async fn websocket_strips_hop_by_hop_and_connection_nominated_headers_on_upstrea
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(socket))
         .await
         .unwrap();
-    let driver = tokio::spawn(async move {
+    let _driver = AbortOnDrop(tokio::spawn(async move {
         let _ = conn.with_upgrades().await;
-    });
+    }));
     let response = sender.send_request(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
     assert_eq!(response.headers()["sec-websocket-protocol"], "jsonrpc");
     proxy.shutdown().await;
     server.await.unwrap();
-    driver.abort();
-    let _ = driver.await;
 }
 
 #[tokio::test]
@@ -1310,16 +1110,9 @@ async fn websocket_mock_mode_bounds_post_close_drain_when_upstream_keeps_tcp_ope
             }
             let _ = released_tx.send(());
         });
-        let proxy = EthonyxHandle::start(&[
-            "--el-http-url",
-            "http://127.0.0.1:8545",
-            "--trust-upstream",
-            "--mock-eth-syncing",
-            mocking,
-            "--el-ws-url",
-            &url,
-        ])
-        .await;
+        let proxy =
+            EthonyxHandle::start_trusted(&["--mock-eth-syncing", mocking, "--el-ws-url", &url])
+                .await;
         let (ws, _) = connect_async(format!("ws://127.0.0.1:{}/", proxy.port))
             .await
             .unwrap();
@@ -1464,7 +1257,7 @@ async fn http2_extended_connect_large_frame_slow_reader_completes_past_proxy_tim
         }
     }
 
-    let payload_len = 1536 * 1024; // 1.5 MiB (24x H2 default 65_535-byte window & 24x 64 KiB cap)
+    let payload_len = 768 * 1024; // 768 KiB (12x H2 default 65_535-byte window & 12x 64 KiB cap)
     let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws_url = format!("ws://{}", ws_listener.local_addr().unwrap());
     let ws_server = tokio::spawn(async move {
@@ -1483,14 +1276,9 @@ async fn http2_extended_connect_large_frame_slow_reader_completes_past_proxy_tim
         }
     });
 
-    let el = MockServer::start(ok_handler()).await;
-    let proxy = EthonyxHandle::start(&[
-        "--trust-upstream",
-        "--el-http-url",
-        &el.url,
-        "--el-ws-url",
-        &ws_url,
-    ])
+    let proxy = EthonyxHandle::start_trusted_tuned(&["--el-ws-url", &ws_url], |cfg| {
+        cfg.proxy_timeout = Duration::from_secs(1);
+    })
     .await;
 
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
@@ -1502,24 +1290,21 @@ async fn http2_extended_connect_large_frame_slow_reader_completes_past_proxy_tim
         .handshake::<_, TestBody>(TokioIo::new(tcp))
         .await
         .unwrap();
-    let h2_conn = tokio::spawn(async move {
+    let h2_conn = AbortOnDrop(tokio::spawn(async move {
         let _ = conn.await;
-    });
+    }));
 
-    let mut req = Request::builder()
-        .method(Method::CONNECT)
-        .uri(format!("http://127.0.0.1:{}/", proxy.port))
-        .header("sec-websocket-version", "13")
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-    req.extensions_mut()
-        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let req = ext_connect(format!("http://127.0.0.1:{}/", proxy.port));
 
     let resp = sender.send_request(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let upgraded = hyper::upgrade::on(resp).await.unwrap();
 
-    // Throttle reads to 32 KiB every 80ms (~400 KiB/s): 1.5 MiB takes ~3.8s (> 2s --proxy-timeout).
+    // Throttle reads to 32 KiB every 80ms (~400 KiB/s): 768 KiB takes ~1.8s. The proxy's
+    // writes back up from the first 64 KiB window, so it stays write-blocked for ~1.7s, well
+    // past the 1s proxy_timeout: a stall timer that did not restart on progress would cut the
+    // frame. The relay only gives up on a reader that makes no progress for the full second,
+    // so a loaded runner that pauses this task for a few hundred milliseconds does not fail it.
     let throttled = ThrottledRead {
         inner: TokioIo::new(upgraded),
         chunk_limit: 32 * 1024,
@@ -1551,8 +1336,8 @@ async fn http2_extended_connect_large_frame_slow_reader_completes_past_proxy_tim
         .expect("tail frame ok");
     assert_eq!(second, Message::Text("tail-after-large-h2-frame".into()));
     assert!(
-        started.elapsed() > Duration::from_millis(2500),
-        "transfer must span past --proxy-timeout 2s (took {:?})",
+        started.elapsed() > Duration::from_millis(1600),
+        "transfer must span well past proxy_timeout 1s (took {:?})",
         started.elapsed()
     );
 
@@ -1563,8 +1348,6 @@ async fn http2_extended_connect_large_frame_slow_reader_completes_past_proxy_tim
         }
     }
     ws_server.await.unwrap();
-    drop((ws, sender));
-    h2_conn.abort();
-    let _ = h2_conn.await;
+    drop((ws, sender, h2_conn));
     proxy.shutdown().await;
 }

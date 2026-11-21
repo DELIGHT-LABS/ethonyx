@@ -5,11 +5,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::future::join_all;
-use http::Uri;
 use tracing::{info, warn};
 
 use crate::config::ValidatedReference;
-use crate::transport::{HttpTarget, ProxyClient};
 use crate::upstream::HttpUpstream;
 
 use super::el::{el_block_number, el_chain_id};
@@ -75,38 +73,41 @@ impl ReferenceProbe {
     }
 }
 
-/// One reference's contribution to a round: its `(chain_id, head)` and, when it was
-/// the first to raise the round's highest verified head, the local head read right
-/// after it.
-type Answer = Result<(u64, u64, Option<Result<u64, HealthError>>), HealthError>;
+/// One reference's outcome in a round: an error or chain mismatch, a lower/equal
+/// head coalesced behind a faster peer, or the local head paired with a new highest head.
+enum Answer {
+    RefErr(HealthError),
+    ChainMismatch(u64),
+    Coalesced,
+    Paired(ReferenceSample),
+    LocalHeadErr(HealthError),
+}
 
 struct ReferenceEndpoint {
-    target: HttpTarget,
+    upstream: HttpUpstream,
     /// `None` while matching (or never mismatched); `Some(got)` while mismatching.
     mismatched_chain_id: Option<u64>,
 }
 
 impl ReferenceEndpoint {
-    fn record_chain_id(&mut self, expected: u64, got: u64) -> bool {
-        if got == expected {
-            if self.mismatched_chain_id.take().is_some() {
-                info!(
-                    reference = %self.target.upstream.redacted(),
-                    chain_id = expected,
-                    "reference chain_id recovered"
-                );
-            }
-            true
-        } else {
-            if self.mismatched_chain_id.replace(got) != Some(got) {
-                warn!(
-                    reference = %self.target.upstream.redacted(),
-                    expected,
-                    got,
-                    "reference chain_id mismatch"
-                );
-            }
-            false
+    fn record_chain_match(&mut self, expected: u64) {
+        if self.mismatched_chain_id.take().is_some() {
+            info!(
+                reference = %self.upstream.redacted(),
+                chain_id = expected,
+                "reference chain_id recovered"
+            );
+        }
+    }
+
+    fn record_chain_mismatch(&mut self, expected: u64, got: u64) {
+        if self.mismatched_chain_id.replace(got) != Some(got) {
+            warn!(
+                reference = %self.upstream.redacted(),
+                expected,
+                got,
+                "reference chain_id mismatch"
+            );
         }
     }
 }
@@ -123,7 +124,7 @@ impl ReferencePoller {
             .upstreams
             .into_iter()
             .map(|upstream| ReferenceEndpoint {
-                target: HttpTarget::new_standard(upstream),
+                upstream,
                 mismatched_chain_id: None,
             })
             .collect::<Box<[_]>>();
@@ -140,24 +141,15 @@ impl ReferencePoller {
 
     /// One round: learn the local `chain_id`, gather every reference's answer, and
     /// judge the round into a lag sample or a missed round.
-    pub(super) async fn poll_once(
-        &mut self,
-        client: &ProxyClient,
-        local_el: &HttpTarget,
-        timeout: Duration,
-    ) -> Arc<ReferenceProbe> {
-        let local = ProbeTarget::from_target(client, local_el, timeout);
-        let local_uri = local_el.upstream.uri();
-        let (sample, errors) = match el_chain_id(local, local_uri).await {
+    pub(super) async fn poll_once(&mut self, local: ProbeTarget<'_>) -> Arc<ReferenceProbe> {
+        let (sample, errors) = match el_chain_id(local).await {
             // No reference answer can be verified without the local chain id, so none is requested.
             Err(err) => (
                 None,
                 vec![format!("local eth_chainId: {err}").into_boxed_str()],
             ),
             Ok(expected) => {
-                let answers = self
-                    .gather(client, local, local_uri, timeout, expected)
-                    .await;
+                let answers = self.gather(local, expected).await;
                 self.judge(expected, answers)
             }
         };
@@ -177,27 +169,23 @@ impl ReferencePoller {
     /// to raise the round's highest verified head reads the local head, right after its
     /// own answer (`t_local >= t_ref`, so local progress can only shrink lag). Equal or
     /// lower heads arriving later could only pair with a later local read and never win.
-    async fn gather(
-        &self,
-        client: &ProxyClient,
-        local: ProbeTarget<'_>,
-        local_uri: &Uri,
-        timeout: Duration,
-        expected: u64,
-    ) -> Vec<Answer> {
+    async fn gather(&self, local: ProbeTarget<'_>, expected: u64) -> Vec<Answer> {
         // The round's futures run cooperatively on one task; the inline `Mutex` is never
         // held across `.await` and covers the full `0..=u64::MAX` range.
         let highest = Mutex::new(None::<u64>);
         join_all(self.endpoints.iter().map(|endpoint| {
-            let reference = ProbeTarget::from_target(client, &endpoint.target, timeout);
-            let uri = endpoint.target.upstream.uri();
+            let reference = local.with_upstream(&endpoint.upstream);
             let highest = &highest;
             async move {
-                let (chain_id, head) = tokio::try_join!(
-                    el_chain_id(reference, uri),
-                    el_block_number(reference, uri),
-                )?;
-                let raised = chain_id == expected && {
+                let (chain_id, head) =
+                    match tokio::try_join!(el_chain_id(reference), el_block_number(reference)) {
+                        Ok(pair) => pair,
+                        Err(err) => return Answer::RefErr(err),
+                    };
+                if chain_id != expected {
+                    return Answer::ChainMismatch(chain_id);
+                }
+                let raised = {
                     let mut max_seen = highest.lock().unwrap_or_else(PoisonError::into_inner);
                     let is_higher = max_seen.is_none_or(|prev| head > prev);
                     if is_higher {
@@ -205,12 +193,16 @@ impl ReferencePoller {
                     }
                     is_higher
                 };
-                let local_head = if raised {
-                    Some(el_block_number(local, local_uri).await)
-                } else {
-                    None
-                };
-                Ok((chain_id, head, local_head))
+                if !raised {
+                    return Answer::Coalesced;
+                }
+                match el_block_number(local).await {
+                    Ok(local_head) => Answer::Paired(ReferenceSample {
+                        block_number: head,
+                        block_lag: head.saturating_sub(local_head),
+                    }),
+                    Err(err) => Answer::LocalHeadErr(err),
+                }
             }
         }))
         .await
@@ -226,51 +218,39 @@ impl ReferencePoller {
     ) -> (Option<ReferenceSample>, Vec<Box<str>>) {
         let total = self.endpoints.len();
         let mut errors = Vec::new();
-        let mut best: Option<(u64, u64)> = None;
+        let mut best: Option<ReferenceSample> = None;
         let mut local_head_err = None;
         for (idx, (endpoint, answer)) in self.endpoints.iter_mut().zip(answers).enumerate() {
-            let (chain_id, head, local_head) = match answer {
-                Ok(answer) => answer,
-                Err(err) => {
+            match answer {
+                Answer::RefErr(err) => {
+                    errors.push(format_ref_error(idx, total, &endpoint.upstream, &err));
+                }
+                Answer::ChainMismatch(got) => {
+                    endpoint.record_chain_mismatch(expected, got);
                     errors.push(format_ref_error(
                         idx,
                         total,
-                        &endpoint.target.upstream,
-                        &err,
+                        &endpoint.upstream,
+                        &format_args!("chain_id mismatch (expected 0x{expected:x}, got 0x{got:x})"),
                     ));
-                    continue;
                 }
-            };
-            if !endpoint.record_chain_id(expected, chain_id) {
-                errors.push(format_ref_error(
-                    idx,
-                    total,
-                    &endpoint.target.upstream,
-                    &format_args!(
-                        "chain_id mismatch (expected 0x{expected:x}, got 0x{chain_id:x})"
-                    ),
-                ));
-                continue;
-            }
-            match local_head {
-                // Paired heads are distinct; highest completed head wins.
-                Some(Ok(local_head)) => {
-                    best = best.max(Some((head, head.saturating_sub(local_head))));
+                Answer::Paired(sample) => {
+                    endpoint.record_chain_match(expected);
+                    if best.is_none_or(|prev| sample.block_number > prev.block_number) {
+                        best = Some(sample);
+                    }
                 }
-                Some(Err(err)) => {
+                Answer::LocalHeadErr(err) => {
+                    endpoint.record_chain_match(expected);
                     local_head_err.get_or_insert(err);
                 }
-                None => {}
+                Answer::Coalesced => endpoint.record_chain_match(expected),
             }
         }
         if let Some(err) = local_head_err {
             errors.push(format!("local eth_blockNumber: {err}").into_boxed_str());
         }
-        let sample = best.map(|(block_number, block_lag)| ReferenceSample {
-            block_number,
-            block_lag,
-        });
-        (sample, errors)
+        (best, errors)
     }
 }
 
@@ -315,22 +295,20 @@ mod tests {
     #[test]
     fn chain_id_mismatch_tracks_both_remote_and_local_chain_switches() {
         let mut ep = ReferenceEndpoint {
-            target: HttpTarget::new_standard(
-                HttpUpstream::parse("--el-reference-url", "http://127.0.0.1:8545").unwrap(),
-            ),
+            upstream: HttpUpstream::parse("--el-reference-url", "http://127.0.0.1:8545").unwrap(),
             mismatched_chain_id: None,
         };
 
         // Initially matches chain 1.
-        assert!(ep.record_chain_id(1, 1));
+        ep.record_chain_match(1);
         assert_eq!(ep.mismatched_chain_id, None);
 
         // Local restarts onto chain 2 while remote still serves chain 1: must enter mismatch!
-        assert!(!ep.record_chain_id(2, 1));
+        ep.record_chain_mismatch(2, 1);
         assert_eq!(ep.mismatched_chain_id, Some(1));
 
         // Remote switches to chain 2: recovers cleanly back to None.
-        assert!(ep.record_chain_id(2, 2));
+        ep.record_chain_match(2);
         assert_eq!(ep.mismatched_chain_id, None);
     }
 
@@ -347,10 +325,16 @@ mod tests {
         let (sample, errors) = poller.judge(
             1,
             vec![
-                Ok((1, 1000, Some(Ok(997)))),
-                Ok((5, 2000, None)),
-                Err(HealthError::Timeout),
-                Ok((1, 1001, Some(Ok(1000)))),
+                Answer::Paired(ReferenceSample {
+                    block_number: 1000,
+                    block_lag: 3,
+                }),
+                Answer::ChainMismatch(5),
+                Answer::RefErr(HealthError::Timeout),
+                Answer::Paired(ReferenceSample {
+                    block_number: 1001,
+                    block_lag: 1,
+                }),
             ],
         );
         assert_eq!(
@@ -369,14 +353,15 @@ mod tests {
         );
         assert_eq!(poller.endpoints[1].mismatched_chain_id, Some(5));
 
-        // A failed local head read leaves no sample and is reported once, after the references.
+        // A failed local head read leaves no sample and is reported once, after the references;
+        // a coalesced matching answer still clears a prior chain_id mismatch.
         let (sample, errors) = poller.judge(
             1,
             vec![
-                Ok((1, 1000, Some(Err(HealthError::Timeout)))),
-                Ok((1, 1000, None)),
-                Ok((1, 999, None)),
-                Ok((1, 1000, None)),
+                Answer::LocalHeadErr(HealthError::Timeout),
+                Answer::Coalesced,
+                Answer::Coalesced,
+                Answer::Coalesced,
             ],
         );
         assert_eq!(sample, None);
@@ -388,10 +373,13 @@ mod tests {
         let (sample, errors) = poller.judge(
             1,
             vec![
-                Ok((1, 1000, Some(Ok(999)))),
-                Ok((1, 1005, Some(Err(HealthError::Timeout)))),
-                Ok((1, 1005, None)),
-                Err(HealthError::Timeout),
+                Answer::Paired(ReferenceSample {
+                    block_number: 1000,
+                    block_lag: 1,
+                }),
+                Answer::LocalHeadErr(HealthError::Timeout),
+                Answer::Coalesced,
+                Answer::RefErr(HealthError::Timeout),
             ],
         );
         assert_eq!(
@@ -425,6 +413,13 @@ mod tests {
         use crate::response::full_body;
         use crate::transport::{build_client, build_connectors};
 
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
         // Local node starts at 997 (`lag = 3` behind head 1000) and would advance to 999
         // if queried a second time when the slow peer arrives.
         let local_head = Arc::new(AtomicU64::new(997));
@@ -435,7 +430,7 @@ mod tests {
         let fcid = Arc::clone(&fail_local_cid);
         let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = local_listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        let _local_srv = AbortOnDrop(tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = local_listener.accept().await else {
                     break;
@@ -471,7 +466,7 @@ mod tests {
                         .await;
                 });
             }
-        });
+        }));
 
         let ref_head = Arc::new(AtomicU64::new(1000));
         let ref_calls = Arc::new(AtomicUsize::new(0));
@@ -481,7 +476,7 @@ mod tests {
             async move {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
-                tokio::spawn(async move {
+                let srv = AbortOnDrop(tokio::spawn(async move {
                     loop {
                         let Ok((stream, _)) = listener.accept().await else {
                             break;
@@ -518,26 +513,28 @@ mod tests {
                                 .await;
                         });
                     }
-                });
-                HttpUpstream::parse("--el-reference-url", &format!("http://{addr}")).unwrap()
+                }));
+                (
+                    HttpUpstream::parse("--el-reference-url", &format!("http://{addr}")).unwrap(),
+                    srv,
+                )
             }
         };
 
-        let ep_fast = spawn_ref(Duration::ZERO).await;
-        let ep_slow = spawn_ref(Duration::from_millis(80)).await;
+        let (ep_fast, _ref_fast_srv) = spawn_ref(Duration::ZERO).await;
+        let (ep_slow, _ref_slow_srv) = spawn_ref(Duration::from_millis(80)).await;
         let mut poller = ReferencePoller::new(ValidatedReference {
             upstreams: Box::new([ep_fast, ep_slow]),
             poll_interval: Duration::from_secs(3),
         });
         let (https, _) = build_connectors(false);
         let client = build_client(https);
-        let local_target = HttpTarget::new_standard(
+        let local_target = crate::transport::HttpTarget::new_standard(
             HttpUpstream::parse("--el-http-url", &format!("http://{local_addr}")).unwrap(),
         );
 
-        let probe = poller
-            .poll_once(&client, &local_target, Duration::from_secs(2))
-            .await;
+        let local = ProbeTarget::from_target(&client, &local_target, Duration::from_secs(2));
+        let probe = poller.poll_once(local).await;
         assert_eq!(
             probe.state,
             ReferenceState::Active(ReferenceSample {
@@ -554,18 +551,14 @@ mod tests {
 
         // `u64::MAX` from both peers still coalesces to a single local `eth_blockNumber` read.
         ref_head.store(u64::MAX, Ordering::SeqCst);
-        let max_probe = poller
-            .poll_once(&client, &local_target, Duration::from_secs(2))
-            .await;
+        let max_probe = poller.poll_once(local).await;
         assert!(max_probe.state.is_healthy());
         assert_eq!(local_block_calls.load(Ordering::SeqCst), 2);
 
         // Failing local `eth_chainId` skips querying remote references altogether.
         let calls_before = ref_calls.load(Ordering::SeqCst);
         fail_local_cid.store(true, Ordering::SeqCst);
-        let err_probe = poller
-            .poll_once(&client, &local_target, Duration::from_secs(2))
-            .await;
+        let err_probe = poller.poll_once(local).await;
         assert!(!err_probe.state.is_healthy());
         assert_eq!(ref_calls.load(Ordering::SeqCst), calls_before);
     }

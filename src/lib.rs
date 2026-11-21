@@ -94,7 +94,7 @@ impl Prepared {
         } = self;
         let shutdown_grace = cfg.shutdown_grace;
         let el_references = health.reference_count();
-        let (health, mut poller) = health::channel(health, upstreams.cl.is_some());
+        let (health, mut poller) = health::channel(health);
         let state = Arc::new(AppState::new(
             opts,
             upstreams,

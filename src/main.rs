@@ -32,18 +32,16 @@ async fn main() -> Result<(), BoxError> {
     let registry = registry.with(otel_layer);
     registry.with(fmt_layer).init();
 
-    let shutdown = async {
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let shutdown = async move {
         #[cfg(unix)]
-        {
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("install SIGTERM handler");
-            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
         }
         #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+        let _ = tokio::signal::ctrl_c().await;
     };
     app.run(shutdown).await
 }

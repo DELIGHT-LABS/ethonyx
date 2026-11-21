@@ -1,10 +1,8 @@
 //! Consensus Layer Beacon API health probes (`/eth/v1/node/syncing`, `/eth/v1/node/peer_count`).
 
-use http::{Method, Request, Uri};
+use crate::rpc::JsonObject;
 
-use crate::response::empty_body;
-
-use super::fetch::{HealthError, JsonObject, ProbeError, ProbeTarget};
+use super::fetch::{HealthError, ProbeTarget};
 
 #[derive(Clone, Copy, serde::Deserialize)]
 pub(super) struct ClStatus {
@@ -24,41 +22,31 @@ struct ClEnvelope<T> {
     data: JsonObject<T>,
 }
 
-pub(super) async fn cl_syncing_status(
-    cl: ProbeTarget<'_>,
-    uri: &Uri,
-) -> Result<ClStatus, ProbeError> {
-    cl_get_json(cl, uri, "node/syncing").await
+pub(super) async fn cl_syncing_status(cl: ProbeTarget<'_>) -> Result<ClStatus, HealthError> {
+    cl_get_json(cl).await
 }
 
-pub(super) async fn cl_peer_count(cl: ProbeTarget<'_>, uri: &Uri) -> Result<u64, ProbeError> {
+pub(super) async fn cl_peer_count(cl: ProbeTarget<'_>) -> Result<u64, HealthError> {
     #[derive(serde::Deserialize)]
     struct Peers {
         #[serde(deserialize_with = "decimal_string")]
         connected: u64,
     }
-    let peers: Peers = cl_get_json(cl, uri, "node/peer_count").await?;
+    let peers: Peers = cl_get_json(cl).await?;
     Ok(peers.connected)
 }
 
 async fn cl_get_json<T: serde::de::DeserializeOwned>(
     cl: ProbeTarget<'_>,
-    uri: &Uri,
-    method: &str,
-) -> Result<T, ProbeError> {
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(uri.clone())
-        .body(empty_body())
-        .map_err(|e| format!("{method}: {e}").into_boxed_str())?;
-    let body = cl.fetch_bytes(req).await.map_err(|e| e.during(method))?;
-    parse_cl_response(&body).map_err(|e| e.during(method))
+) -> Result<T, HealthError> {
+    let body = cl.get_bytes().await?;
+    parse_cl_response(&body)
 }
 
 fn parse_cl_response<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, HealthError> {
     serde_json::from_slice::<JsonObject<ClEnvelope<T>>>(body)
         .map(|JsonObject(envelope)| envelope.data.0)
-        .map_err(|e| HealthError::Decode(e.to_string().into_boxed_str()))
+        .map_err(HealthError::decode)
 }
 
 fn decimal_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
