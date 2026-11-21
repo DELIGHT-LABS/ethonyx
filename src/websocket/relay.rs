@@ -114,13 +114,23 @@ impl<T> RelayIo for T where
 enum OutboundState {
     Idle,
     ControlFlush,
-    DataActive { queued: Option<Message> },
+    DataFlush,
+    DataQueued(Message),
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Side {
-    Client,
+#[derive(Clone, Copy)]
+enum EndpointRole {
+    Client { mock_syncing: bool },
     Upstream,
+}
+
+impl EndpointRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Client { .. } => "client",
+            Self::Upstream => "upstream",
+        }
+    }
 }
 
 struct Abort;
@@ -143,7 +153,8 @@ impl From<Abort> for PumpStop {
 }
 
 enum CloseReason {
-    Peer(Side, PeerStop),
+    Client(PeerStop),
+    Upstream(PeerStop),
     Shutdown,
 }
 
@@ -151,8 +162,7 @@ enum CloseReason {
 /// backpressure queue, 1-slot local mock-reply buffer, and progress-based stall timer.
 struct WsEndpoint<S> {
     ws: WebSocketStream<S>,
-    side: Side,
-    intercept_mock: bool,
+    role: EndpointRole,
     outbound: OutboundState,
     local_reply: Option<Message>,
     deadline: LazyDeadline,
@@ -160,11 +170,10 @@ struct WsEndpoint<S> {
 }
 
 impl<S: RelayIo> WsEndpoint<S> {
-    const fn new(ws: WebSocketStream<S>, side: Side, io_timeout: Duration) -> Self {
+    const fn new(ws: WebSocketStream<S>, role: EndpointRole, io_timeout: Duration) -> Self {
         Self {
             ws,
-            side,
-            intercept_mock: false,
+            role,
             outbound: OutboundState::Idle,
             local_reply: None,
             deadline: LazyDeadline::new(),
@@ -172,13 +181,8 @@ impl<S: RelayIo> WsEndpoint<S> {
         }
     }
 
-    const fn with_mock_syncing(mut self, enabled: bool) -> Self {
-        self.intercept_mock = enabled;
-        self
-    }
-
     const fn can_accept(&self) -> bool {
-        !matches!(self.outbound, OutboundState::DataActive { queued: Some(_) })
+        !matches!(self.outbound, OutboundState::DataQueued(_))
     }
 
     fn enqueue_data(&mut self, msg: Message) {
@@ -187,7 +191,7 @@ impl<S: RelayIo> WsEndpoint<S> {
             // Upgrade from 5s control flush to full data `io_timeout`.
             self.deadline.disarm();
         }
-        self.outbound = OutboundState::DataActive { queued: Some(msg) };
+        self.outbound = OutboundState::DataQueued(msg);
     }
 
     fn request_control_flush(&mut self) {
@@ -236,7 +240,7 @@ impl<S: RelayIo> WsEndpoint<S> {
         }
         if self.deadline.poll_expired(cx, timeout) {
             debug!(
-                side = ?self.side,
+                side = self.role.as_str(),
                 timeout_secs = timeout.as_secs(),
                 "ws write stalled; aborting relay"
             );
@@ -247,16 +251,17 @@ impl<S: RelayIo> WsEndpoint<S> {
     }
 
     fn poll_send_queued(&mut self, cx: &mut Context<'_>) -> Result<(), Abort> {
-        let OutboundState::DataActive { queued } = &mut self.outbound else {
-            return Ok(());
-        };
-        if queued.is_none() {
+        if !matches!(self.outbound, OutboundState::DataQueued(_)) {
             return Ok(());
         }
         match Pin::new(&mut self.ws).poll_ready(cx) {
             Poll::Ready(Ok(())) => {
-                let msg = queued.take().expect("queued checked");
-                Pin::new(&mut self.ws).start_send(msg).map_err(|_| Abort)
+                if let OutboundState::DataQueued(msg) =
+                    std::mem::replace(&mut self.outbound, OutboundState::DataFlush)
+                {
+                    Pin::new(&mut self.ws).start_send(msg).map_err(|_| Abort)?;
+                }
+                Ok(())
             }
             Poll::Ready(Err(_)) => Err(Abort),
             // Defer stall-timer evaluation to Step 4 (`poll_flush_and_timer`),
@@ -279,10 +284,10 @@ impl<S: RelayIo> WsEndpoint<S> {
     fn poll_flush_and_timer(&mut self, cx: &mut Context<'_>) -> Result<(), Abort> {
         let timeout = match self.outbound {
             OutboundState::Idle => return Ok(()),
-            OutboundState::DataActive { queued: Some(_) } => {
+            OutboundState::DataQueued(_) => {
                 return self.check_stall_deadline(cx, self.io_timeout);
             }
-            OutboundState::DataActive { queued: None } => self.io_timeout,
+            OutboundState::DataFlush => self.io_timeout,
             OutboundState::ControlFlush => WS_CONTROL_FLUSH_TIMEOUT,
         };
         match Pin::new(&mut self.ws).poll_flush(cx) {
@@ -302,8 +307,8 @@ impl<S: RelayIo> WsEndpoint<S> {
             return true;
         }
         let queued = match std::mem::replace(&mut self.outbound, OutboundState::Idle) {
-            OutboundState::DataActive { queued } => queued,
-            OutboundState::Idle | OutboundState::ControlFlush => None,
+            OutboundState::DataQueued(msg) => Some(msg),
+            OutboundState::Idle | OutboundState::ControlFlush | OutboundState::DataFlush => None,
         };
         let reply = self.local_reply.take();
         for msg in queued.into_iter().chain(reply) {
@@ -353,7 +358,7 @@ where
                 count += 1;
                 match msg {
                     Message::Text(text) => {
-                        if src.intercept_mock {
+                        if matches!(src.role, EndpointRole::Client { mock_syncing: true }) {
                             match mock_syncing(text.as_bytes()) {
                                 MockResult::Silent => continue,
                                 MockResult::Reply(reply) => {
@@ -384,7 +389,7 @@ where
                         // L7 load balancers / NATs in front of ethonyx observe traffic
                         // without adding per-connection proxy timers. Client's Pong is
                         // absorbed locally when it arrives.
-                        if matches!(src.side, Side::Upstream) {
+                        if matches!(src.role, EndpointRole::Upstream) {
                             dst.try_queue_idle_ping(cx, payload)?;
                         }
                     }
@@ -451,9 +456,14 @@ pub(super) async fn bridge_ws<C, U>(
     C: RelayIo,
     U: RelayIo,
 {
-    let mut client =
-        WsEndpoint::new(client_ws, Side::Client, io_timeout).with_mock_syncing(mock_enabled);
-    let mut upstream = WsEndpoint::new(upstream_ws, Side::Upstream, io_timeout);
+    let mut client = WsEndpoint::new(
+        client_ws,
+        EndpointRole::Client {
+            mock_syncing: mock_enabled,
+        },
+        io_timeout,
+    );
+    let mut upstream = WsEndpoint::new(upstream_ws, EndpointRole::Upstream, io_timeout);
 
     // Phase 1: full-duplex relay with a single steady-state `Notify` registration.
     let Some(reason) = ({
@@ -476,7 +486,7 @@ pub(super) async fn bridge_ws<C, U>(
                 Ok(full) => full,
                 Err(PumpStop::Abort) => return Poll::Ready(None),
                 Err(PumpStop::Peer(stop)) => {
-                    return Poll::Ready(Some(CloseReason::Peer(Side::Client, stop)));
+                    return Poll::Ready(Some(CloseReason::Client(stop)));
                 }
             };
 
@@ -485,7 +495,7 @@ pub(super) async fn bridge_ws<C, U>(
                 Ok(full) => full,
                 Err(PumpStop::Abort) => return Poll::Ready(None),
                 Err(PumpStop::Peer(stop)) => {
-                    return Poll::Ready(Some(CloseReason::Peer(Side::Upstream, stop)));
+                    return Poll::Ready(Some(CloseReason::Upstream(stop)));
                 }
             };
 
@@ -507,8 +517,8 @@ pub(super) async fn bridge_ws<C, U>(
     };
 
     match &reason {
-        CloseReason::Peer(Side::Client, PeerStop::Eof) if !upstream.has_pending() => return,
-        CloseReason::Peer(Side::Upstream, PeerStop::Eof) if !client.has_pending() => return,
+        CloseReason::Client(PeerStop::Eof) if !upstream.has_pending() => return,
+        CloseReason::Upstream(PeerStop::Eof) if !client.has_pending() => return,
         _ => {}
     }
 
@@ -517,8 +527,8 @@ pub(super) async fn bridge_ws<C, U>(
     let _ = shutdown
         .bound(async {
             match reason {
-                CloseReason::Peer(Side::Client, stop) => finish(client, upstream, stop).await,
-                CloseReason::Peer(Side::Upstream, stop) => finish(upstream, client, stop).await,
+                CloseReason::Client(stop) => finish(client, upstream, stop).await,
+                CloseReason::Upstream(stop) => finish(upstream, client, stop).await,
                 CloseReason::Shutdown => {
                     tokio::join!(
                         client.close_handshake(Some(GOING_AWAY_FRAME)),
@@ -547,7 +557,8 @@ mod tests {
         U: RelayIo + Send + 'static,
     {
         tokio::spawn(async move {
-            let (_tx, shutdown) = crate::lifecycle::channel();
+            let (_tx, lifecycle, _drain) = crate::lifecycle::channel();
+            let shutdown = lifecycle.shutdown();
             bridge_ws(
                 proxy_client,
                 proxy_upstream,
@@ -806,7 +817,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         // At t = 1s, send a client Ping while `proxy_client` is already blocked in
-        // `DataActive` (writing 64 KiB through a 4 KiB socket). The 5s control-flush
+        // `DataQueued`/`DataFlush` (writing 64 KiB through a 4 KiB socket). The 5s control-flush
         // timeout must NOT overwrite the active 10s data deadline!
         tokio::time::advance(Duration::from_secs(1)).await;
         client
@@ -905,7 +916,7 @@ mod tests {
         let _ = upstream.next().await;
         relay.await.unwrap();
 
-        // 2. Busy client (`DataActive`): upstream Ping is still answered to upstream,
+        // 2. Busy client (`DataFlush`/`DataQueued`): upstream Ping is still answered to upstream,
         // but NOT injected onto the already-active client stream.
         let (mut client, mut upstream, relay) =
             duplex_bridge(512, 64 * 1024, false, Duration::from_secs(5)).await;
@@ -936,11 +947,11 @@ mod tests {
             assert_eq!(msg, Message::Binary(bytes::Bytes::from(vec![i; 4096])));
         }
         client.close(None).await.unwrap();
-        while let Some(Ok(msg)) = client.next().await {
-            if msg.is_close() {
-                break;
-            }
-        }
+        let close_msg = client.next().await.expect("expected Close frame").unwrap();
+        assert!(
+            close_msg.is_close(),
+            "busy client must not receive injected upstream Ping before Close, got: {close_msg:?}"
+        );
         let _ = upstream.next().await;
         relay.await.unwrap();
     }
@@ -1043,7 +1054,7 @@ mod tests {
         let (mut client, mut upstream, relay) =
             duplex_bridge(512, 64 * 1024, false, Duration::from_secs(5)).await;
 
-        // Fill `proxy_client`'s 16 KiB write buffer + 1-slot `queued` (`DataActive { queued: Some(_) }`).
+        // Fill `proxy_client`'s 16 KiB write buffer + 1-slot `DataQueued`.
         for _ in 0..3 {
             upstream
                 .send(Message::Binary(bytes::Bytes::from(vec![b'p'; 12 * 1024])))
@@ -1122,7 +1133,8 @@ mod tests {
         .await;
         let mut upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
 
-        let (tx, rx) = crate::lifecycle::channel();
+        let (tx, lifecycle, _drain) = crate::lifecycle::channel();
+        let rx = lifecycle.shutdown();
         let relay = tokio::spawn(async move {
             bridge_ws(
                 proxy_client,
@@ -1176,7 +1188,8 @@ mod tests {
         )
         .await;
 
-        let (tx, rx) = crate::lifecycle::channel();
+        let (tx, lifecycle, _drain) = crate::lifecycle::channel();
+        let rx = lifecycle.shutdown();
         let relay = tokio::spawn(async move {
             bridge_ws(
                 proxy_client,
@@ -1218,7 +1231,8 @@ mod tests {
         )
         .await;
 
-        let (tx, rx) = crate::lifecycle::channel();
+        let (tx, lifecycle, _drain) = crate::lifecycle::channel();
+        let rx = lifecycle.shutdown();
         tx.send(tokio::time::Instant::now());
         let started = tokio::time::Instant::now();
         bridge_ws(
@@ -1250,7 +1264,8 @@ mod tests {
         )
         .await;
 
-        let (tx, rx) = crate::lifecycle::channel();
+        let (tx, lifecycle, _drain) = crate::lifecycle::channel();
+        let rx = lifecycle.shutdown();
         let relay = tokio::spawn(async move {
             bridge_ws(
                 proxy_client,

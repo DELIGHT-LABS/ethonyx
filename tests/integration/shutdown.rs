@@ -407,3 +407,61 @@ async fn shutdown_sends_going_away_close_frame_to_active_h1_and_h2_websockets() 
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn shutdown_waits_for_an_in_flight_http_request_without_websocket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // No `--el-ws-url`: the connection holds no drain token of its own, only the
+    // server-wide `ServerBuilders` token, so plain HTTP alone delays `serve()`.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let (seen_tx, seen_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let mut server = AbortOnDrop(tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buffer = [0; 1024];
+        while !head.windows(4).any(|part| part == b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(count, 0);
+            head.extend_from_slice(&buffer[..count]);
+        }
+        seen_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let _ = socket.shutdown().await;
+    }));
+    let mut proxy =
+        EthonyxHandle::start_tuned(&["--trust-upstream", "--el-http-url", &upstream], |cfg| {
+            cfg.shutdown_grace = Duration::from_secs(3);
+        })
+        .await;
+    let url = proxy.url("/");
+    let request = tokio::spawn(async move { get(&client(), &url).await });
+    tokio::time::timeout(Duration::from_secs(5), seen_rx)
+        .await
+        .expect("proxied request must reach the upstream")
+        .unwrap();
+    proxy.trigger_shutdown();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !proxy.task.as_ref().unwrap().is_finished(),
+        "an in-flight request must remain tracked while draining"
+    );
+    release_tx.send(()).unwrap();
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("released request must finish")
+        .unwrap();
+    assert_eq!((status, body.as_ref()), (StatusCode::OK, &b"ok"[..]));
+    tokio::time::timeout(Duration::from_secs(2), proxy.shutdown())
+        .await
+        .expect("the finished request should release the drain barrier before its deadline");
+    tokio::time::timeout(Duration::from_secs(2), &mut server.0)
+        .await
+        .expect("upstream task should exit after replying")
+        .unwrap();
+}

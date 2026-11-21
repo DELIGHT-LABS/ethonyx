@@ -6,12 +6,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Uri, header::CONTENT_TYPE};
-use http_body_util::BodyExt;
-use hyper::body::Body as _;
 
 const MAX_HEALTH_BODY_BYTES: usize = 10 * 1024 * 1024;
 
-use crate::response::{ResBody, empty_body, full_body};
+use crate::response::{BodyReadError, ResBody, collect_limited_body_until, empty_body, full_body};
 use crate::transport::{HttpTarget, HttpTransport, ProxyClient};
 use crate::upstream::HttpUpstream;
 
@@ -216,21 +214,15 @@ impl<'a> ProbeTarget<'a> {
         if !resp.status().is_success() {
             return Err(HealthError::HttpStatus(resp.status()));
         }
-        let body = resp.into_body();
-        if body.size_hint().lower() > MAX_HEALTH_BODY_BYTES as u64 {
-            return Err(HealthError::Decode(Cow::Borrowed("length limit exceeded")));
-        }
-        if body.is_end_stream() {
-            return Ok(Bytes::new());
-        }
-        tokio::time::timeout_at(
-            deadline,
-            http_body_util::Limited::new(body, MAX_HEALTH_BODY_BYTES).collect(),
-        )
-        .await
-        .map_err(|_| HealthError::BodyTimeout)?
-        .map(|c| c.to_bytes())
-        .map_err(HealthError::decode)
+        collect_limited_body_until(resp.into_body(), MAX_HEALTH_BODY_BYTES, deadline)
+            .await
+            .map_err(|err| match err {
+                BodyReadError::TooLarge => {
+                    HealthError::Decode(Cow::Borrowed("length limit exceeded"))
+                }
+                BodyReadError::TimedOut => HealthError::BodyTimeout,
+                BodyReadError::Body(e) => HealthError::decode(e),
+            })
     }
 }
 
@@ -239,7 +231,7 @@ mod tests {
     use super::*;
     use crate::transport::{build_client, build_connectors};
     use http::{Response, StatusCode};
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use hyper::body::Incoming;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;

@@ -1,25 +1,22 @@
 use std::convert::Infallible;
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use http::uri::PathAndQuery;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
-use http_body_util::BodyExt;
-use hyper::body::{Body, Frame, Incoming, SizeHint};
+use hyper::body::{Body as _, Incoming};
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{Instrument, debug, info, trace, warn};
 
-use crate::BoxError;
 use crate::headers::{sanitize_response_headers, strip_hop_by_hop};
 use crate::health;
-use crate::metrics::{UpstreamLayer, classify_method};
+use crate::metrics::{MethodBucket, UpstreamLayer};
 use crate::response::{
-    ResBody, empty_body, full_body, raw_json_response, text_response, uri_too_long_response,
+    BodyReadError, ResBody, collect_limited_body, drain_limited_body, empty_body, full_body,
+    prometheus_response, raw_json_response, status_response, text_response, uri_too_long_response,
 };
 use crate::state::{AppState, ClState};
 use crate::transport::{HttpTarget, WsTarget};
@@ -27,72 +24,106 @@ use crate::websocket::WsMode;
 
 const MAX_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
-/// Permit bounding concurrent WebSocket relays across both HTTP/1.1 `Upgrade`
-/// and HTTP/2 Extended `CONNECT` streams under `--max-connections`.
-enum WsPermit {
-    Upgraded { _permit: Arc<OwnedSemaphorePermit> },
-    IncludedH2(Arc<Connection>),
-    DedicatedH2 { _permit: OwnedSemaphorePermit },
-}
-
-impl Drop for WsPermit {
-    fn drop(&mut self) {
-        if let Self::IncludedH2(conn) = self {
-            conn.h2_ws_slot_in_use.store(false, Ordering::Release);
-        }
-    }
-}
-
-/// Connection-owned state. Requests clone one Arc; detached WebSocket relays
-/// and HTTP/2 request tasks also retain the shared lifecycle and connection permit.
-pub(crate) struct Connection {
-    state: Arc<AppState>,
-    lifecycle: crate::lifecycle::Lifecycle,
-    peer: SocketAddr,
-    permit: Arc<OwnedSemaphorePermit>,
+/// Shared TCP permit + H2 WebSocket reuse slot, allocated only for WS-enabled
+/// servers after protocol preface succeeds so detached WS relays never retain
+/// `Arc<Connection>` / `Arc<AppState>`.
+struct SharedPermit {
+    _permit: OwnedSemaphorePermit,
     h2_ws_slot_in_use: AtomicBool,
 }
 
-impl Connection {
-    pub(crate) const fn new(
-        state: Arc<AppState>,
-        lifecycle: crate::lifecycle::Lifecycle,
-        peer: SocketAddr,
-        permit: Arc<OwnedSemaphorePermit>,
-    ) -> Self {
-        Self {
-            state,
-            lifecycle,
-            peer,
-            permit,
-            h2_ws_slot_in_use: AtomicBool::new(false),
-        }
-    }
+/// Connection-scoped WebSocket state for WS-enabled servers.
+/// `permit` is declared before `lifecycle` so the semaphore permit drops before
+/// releasing the drain token if `Connection` drops standalone.
+struct WsConn {
+    permit: Arc<SharedPermit>,
+    lifecycle: crate::lifecycle::Lifecycle,
+}
 
+impl WsConn {
     /// Claim a WebSocket concurrency slot:
     /// - HTTP/1.1 `Upgrade` shares the TCP connection's existing permit.
     /// - HTTP/2 Extended `CONNECT` reuses the H2 connection's own permit for its
     ///   first active WS stream, and acquires dedicated permits from `--max-connections`
     ///   for additional concurrent WS streams so multiplex amplification is bounded.
-    fn acquire_ws_permit(self: &Arc<Self>, mode: WsMode) -> Option<WsPermit> {
+    fn acquire_permit(&self, mode: WsMode, state: &AppState) -> Option<WsPermit> {
         match mode {
-            WsMode::Upgrade => Some(WsPermit::Upgraded {
+            WsMode::Upgrade => Some(WsPermit::SharedUpgrade {
                 _permit: Arc::clone(&self.permit),
             }),
             WsMode::ExtendedConnect => {
                 if self
+                    .permit
                     .h2_ws_slot_in_use
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    Some(WsPermit::IncludedH2(Arc::clone(self)))
-                } else if let Ok(_permit) = Arc::clone(&self.state.conn_limit).try_acquire_owned() {
-                    Some(WsPermit::DedicatedH2 { _permit })
+                    Some(WsPermit::SharedH2Slot(Arc::clone(&self.permit)))
                 } else {
-                    self.state.metrics.inc_saturated();
-                    None
+                    state
+                        .try_acquire_permit()
+                        .ok()
+                        .map(|permit| WsPermit::Dedicated { _permit: permit })
                 }
             }
+        }
+    }
+}
+
+enum ConnPermit {
+    /// HTTP-only server (`--el-ws-url` omitted): zero heap allocation and zero
+    /// `Lifecycle` refcount churn per connection.
+    Owned { _permit: OwnedSemaphorePermit },
+    /// WS-enabled server: shared by H1 `Upgrade` and the first H2 Extended `CONNECT` stream.
+    Shared(WsConn),
+}
+
+/// Permit bounding concurrent WebSocket relays across both HTTP/1.1 `Upgrade`
+/// and HTTP/2 Extended `CONNECT` streams under `--max-connections`.
+enum WsPermit {
+    SharedUpgrade { _permit: Arc<SharedPermit> },
+    SharedH2Slot(Arc<SharedPermit>),
+    Dedicated { _permit: OwnedSemaphorePermit },
+}
+
+impl Drop for WsPermit {
+    fn drop(&mut self) {
+        if let Self::SharedH2Slot(permit) = self {
+            permit.h2_ws_slot_in_use.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Connection-owned state. Requests clone one Arc; detached WebSocket relays
+/// retain only the shared lifecycle token and permit (never `Arc<AppState>`).
+pub(crate) struct Connection {
+    state: Arc<AppState>,
+    peer: SocketAddr,
+    permit: ConnPermit,
+}
+
+impl Connection {
+    pub(crate) fn new(
+        state: Arc<AppState>,
+        lifecycle: &crate::lifecycle::Lifecycle,
+        peer: SocketAddr,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let permit = if state.el_ws.is_some() {
+            ConnPermit::Shared(WsConn {
+                permit: Arc::new(SharedPermit {
+                    _permit: permit,
+                    h2_ws_slot_in_use: AtomicBool::new(false),
+                }),
+                lifecycle: lifecycle.clone(),
+            })
+        } else {
+            ConnPermit::Owned { _permit: permit }
+        };
+        Self {
+            state,
+            peer,
+            permit,
         }
     }
 
@@ -112,25 +143,29 @@ impl Connection {
                 ));
             }
             Route::Proxy(target) => {
-                let Some(forward) = Forward::resolve(target, &self.state) else {
+                let Some(forward) = Forward::resolve(target, &self) else {
                     return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
                 };
                 forward
             }
         };
         let (layer, upstream_proto) = forward.layer_and_proto();
-        let upstream_type = layer.as_str();
-        let (method_idx, method_label) = classify_method(req.method());
-        let version = req.version();
-        let access_ctx = tracing::enabled!(target: "access_log", tracing::Level::INFO)
-            .then(|| (req.method().clone(), req.uri().clone()));
-        let otel_enabled = self.state.otel_enabled;
+        let method_bucket = MethodBucket::classify(req.method());
+        let access_ctx = tracing::enabled!(target: "access_log", tracing::Level::INFO).then(|| {
+            (
+                req.version(),
+                req.method().clone(),
+                req.uri().path_and_query().cloned(),
+            )
+        });
+        let otel_enabled = self.state.metrics.otel_enabled();
         let span = if otel_enabled || tracing::enabled!(tracing::Level::DEBUG) {
             let span = tracing::info_span!(
+                parent: None,
                 "request",
                 method = %req.method(),
                 path = req.uri().path(),
-                upstream = upstream_type,
+                upstream = layer.as_str(),
             );
             if otel_enabled {
                 crate::otel::attach_parent_context(&span, req.headers());
@@ -140,27 +175,18 @@ impl Connection {
             tracing::Span::none()
         };
         let start = std::time::Instant::now();
-        let res = route(req, &self, forward).instrument(span).await;
-        let response = res.unwrap_or_else(|e| {
-            warn!(
-                upstream = upstream_type,
-                proto = upstream_proto,
-                error = %e,
-                "upstream proxy error"
-            );
-            text_response(StatusCode::BAD_GATEWAY, "bad gateway")
-        });
+        let response = route(req, &self.state, forward).instrument(span).await;
         let elapsed = start.elapsed();
         let status = response.status().as_u16();
-        if let Some((method, uri)) = access_ctx {
+        if let Some((version, method, pq)) = access_ctx {
             info!(
                 target: "access_log",
                 peer = %self.peer,
                 ?version,
                 %method,
-                path = uri.path(),
-                upstream = upstream_type,
-                proto = upstream_proto,
+                path = pq.as_ref().map_or("/", PathAndQuery::path),
+                upstream = layer.as_str(),
+                proto = upstream_proto.as_str(),
                 status,
                 latency_ms = elapsed.as_secs_f64() * 1000.0,
                 "request"
@@ -168,7 +194,7 @@ impl Connection {
         }
         self.state
             .metrics
-            .record_request(layer, method_idx, method_label, status, elapsed);
+            .record_request(layer, method_bucket, status, elapsed);
         Ok(response)
     }
 }
@@ -202,18 +228,11 @@ impl Probe {
             Self::Health => health::report(state, head),
             Self::Ready => health::ready(state, head),
             Self::Live => text_response(StatusCode::OK, if head { "" } else { "ok" }),
-            Self::Metrics => {
-                let body = if head {
-                    empty_body()
-                } else {
-                    full_body(Bytes::from(state.metrics.render_prometheus()))
-                };
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                    .body(body)
-                    .expect("response builder")
-            }
+            Self::Metrics => prometheus_response(if head {
+                Bytes::new()
+            } else {
+                Bytes::from(state.metrics.render_prometheus())
+            }),
         }
     }
 }
@@ -235,14 +254,18 @@ fn classify_request<B>(req: &Request<B>) -> Route {
             return Route::Probe(probe);
         }
     }
-    // CL routes take precedence over upgrade headers, as in the forwarding path.
-    let is_cl = is_cl_path(path);
-    if !is_cl && let Some(mode) = WsMode::classify(req) {
-        Route::Proxy(Target::WebSocket(mode))
-    } else if req.method() == Method::CONNECT {
-        Route::Reject
-    } else if is_cl {
+    if req.method() == Method::CONNECT {
+        return if !is_cl_path(path) && WsMode::is_extended_connect(req) {
+            Route::Proxy(Target::WebSocket(WsMode::ExtendedConnect))
+        } else {
+            Route::Reject
+        };
+    }
+    // CL routes take precedence over upgrade headers.
+    if is_cl_path(path) {
         Route::Proxy(Target::Cl)
+    } else if WsMode::is_upgrade(req) {
+        Route::Proxy(Target::WebSocket(WsMode::Upgrade))
     } else {
         Route::Proxy(Target::El)
     }
@@ -259,64 +282,82 @@ fn is_cl_path(path: &str) -> bool {
     )
 }
 
-/// A [`Target`] bound to the configured upstream it requires.
+#[derive(Clone, Copy)]
+enum UpstreamProto {
+    Http,
+    Ws,
+}
+
+impl UpstreamProto {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "HTTP",
+            Self::Ws => "WS",
+        }
+    }
+}
+
+/// A [`Target`] bound to the configured upstream and connection resources it requires.
 #[derive(Clone, Copy)]
 enum Forward<'a> {
     Cl(&'a ClState),
     El,
-    WebSocket(WsMode, &'a WsTarget),
+    WebSocket(WsMode, &'a WsTarget, &'a WsConn),
 }
 
 impl<'a> Forward<'a> {
-    fn resolve(target: Target, state: &'a AppState) -> Option<Self> {
+    fn resolve(target: Target, conn: &'a Connection) -> Option<Self> {
         Some(match target {
-            Target::Cl => Self::Cl(state.cl.as_ref()?),
+            Target::Cl => Self::Cl(conn.state.cl.as_ref()?),
             Target::El => Self::El,
-            Target::WebSocket(mode) => Self::WebSocket(mode, state.el_ws.as_ref()?),
+            Target::WebSocket(mode) => match (&conn.state.el_ws, &conn.permit) {
+                (Some(ws), ConnPermit::Shared(ws_conn)) => Self::WebSocket(mode, ws, ws_conn),
+                _ => return None,
+            },
         })
     }
 
-    const fn layer_and_proto(self) -> (UpstreamLayer, &'static str) {
+    const fn layer_and_proto(self) -> (UpstreamLayer, UpstreamProto) {
         match self {
-            Self::Cl(_) => (UpstreamLayer::Cl, "HTTP"),
-            Self::El => (UpstreamLayer::El, "HTTP"),
-            Self::WebSocket(..) => (UpstreamLayer::El, "WS"),
+            Self::Cl(_) => (UpstreamLayer::Cl, UpstreamProto::Http),
+            Self::El => (UpstreamLayer::El, UpstreamProto::Http),
+            Self::WebSocket(..) => (UpstreamLayer::El, UpstreamProto::Ws),
         }
     }
 }
 
 async fn route(
     req: Request<Incoming>,
-    connection: &Arc<Connection>,
+    state: &AppState,
     forward: Forward<'_>,
-) -> Result<Response<ResBody>, BoxError> {
-    let state = &connection.state;
+) -> Response<ResBody> {
     trace!(method = %req.method(), path = req.uri().path(), "routing request");
     match forward {
         Forward::Cl(cl) => proxy_cl(req, state, cl).await,
-        Forward::WebSocket(mode, ws) => {
-            crate::websocket::upgrade(req, mode, ws, state, &connection.lifecycle, || {
-                connection.acquire_ws_permit(mode)
-            })
+        Forward::WebSocket(mode, ws, ws_conn) => {
+            Box::pin(crate::websocket::upgrade(
+                req,
+                mode,
+                ws,
+                state,
+                &ws_conn.lifecycle,
+                || ws_conn.acquire_permit(mode, state),
+            ))
             .await
         }
         Forward::El => proxy_el(req, state).await,
     }
 }
 
-async fn proxy_cl(
-    req: Request<Incoming>,
-    state: &AppState,
-    cl: &ClState,
-) -> Result<Response<ResBody>, BoxError> {
-    if (req.method() == Method::GET || req.method() == Method::HEAD)
+async fn proxy_cl(req: Request<Incoming>, state: &AppState, cl: &ClState) -> Response<ResBody> {
+    if cl.mock_node_health
+        && (req.method() == Method::GET || req.method() == Method::HEAD)
         && req.uri().path() == "/eth/v1/node/health"
-        && cl.mock_node_health
     {
-        return Ok(health::node_health(state));
+        return health::node_health(state);
     }
-    if req.method() == Method::POST
-        && cl.mock_subscriptions
+    if cl.mock_subscriptions
+        && req.method() == Method::POST
         && matches!(
             req.uri().path(),
             "/eth/v1/validator/prepare_beacon_proposer"
@@ -324,118 +365,82 @@ async fn proxy_cl(
                 | "/eth/v1/validator/sync_committee_subscriptions"
         )
     {
-        if let Err(err) = drain_limited(req.into_body(), state.opts.proxy_timeout).await {
-            return Ok(err.into_response());
+        if let Err(err) = drain_limited_body(
+            req.into_body(),
+            MAX_BUFFERED_REQUEST_BYTES,
+            state.opts.proxy_timeout,
+        )
+        .await
+        {
+            return body_read_error_response(err);
         }
-        return Ok(raw_json_response(
+        return raw_json_response(
             StatusCode::OK,
             Bytes::from_static(b"{\"code\":200,\"message\":\"success\"}"),
-        ));
+        );
     }
-    let (mut parts, body) = req.into_parts();
-    let target = if parts.method == Method::POST
+    let (parts, body) = req.into_parts();
+    let (target, path_override) = if let Some(ref mev) = cl.mev_relay
+        && parts.method == Method::POST
         && parts.uri.path() == "/eth/v1/validator/register_validator"
-        && let Some(ref mev) = cl.mev_relay
     {
-        let Ok(replaced) =
-            crate::upstream::replace_uri_path(parts.uri, "/eth/v1/builder/validators")
-        else {
-            return Ok(uri_too_long_response());
-        };
-        parts.uri = replaced;
-        mev
+        (mev, Some("/eth/v1/builder/validators"))
     } else {
-        &cl.beacon
+        (&cl.beacon, None)
     };
-    execute_upstream(parts, box_incoming(body), state, target).await
+    execute_upstream(
+        parts,
+        ResBody::incoming(body),
+        state,
+        target,
+        UpstreamLayer::Cl,
+        path_override,
+    )
+    .await
 }
 
-async fn proxy_el(req: Request<Incoming>, state: &AppState) -> Result<Response<ResBody>, BoxError> {
-    let (parts, body) = if req.method() == Method::POST && state.opts.mock_eth_syncing {
+async fn proxy_el(req: Request<Incoming>, state: &AppState) -> Response<ResBody> {
+    let (parts, body) = if state.opts.mock_eth_syncing && req.method() == Method::POST {
         let (parts, body) = req.into_parts();
-        let bytes = match collect_limited(body, state.opts.proxy_timeout).await {
-            Ok(bytes) => bytes,
-            Err(err) => return Ok(err.into_response()),
-        };
+        let bytes =
+            match collect_limited_body(body, MAX_BUFFERED_REQUEST_BYTES, state.opts.proxy_timeout)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(err) => return body_read_error_response(err),
+            };
         if let Some(mock_res) = try_mock_eth_syncing(&bytes) {
-            return Ok(mock_res);
+            return mock_res;
         }
         (parts, full_body(bytes))
     } else {
         let (parts, body) = req.into_parts();
-        (parts, box_incoming(body))
+        (parts, ResBody::incoming(body))
     };
     // Select at dispatch, after any mock body inspection: local replies need
     // no transport lookup, and forwarded requests follow the latest verdict.
-    execute_upstream(parts, body, state, &state.el).await
+    execute_upstream(parts, body, state, &state.el, UpstreamLayer::El, None).await
 }
 
-#[derive(Clone, Copy)]
-struct BodyReadError {
-    status: StatusCode,
-    message: &'static str,
-}
-
-impl BodyReadError {
-    fn into_response(self) -> Response<ResBody> {
-        text_response(self.status, self.message)
-    }
-}
-
-fn map_limited_body_error(err: BoxError) -> BodyReadError {
-    if err.is::<http_body_util::LengthLimitError>() {
-        BodyReadError {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: "request body exceeds limit",
+fn body_read_error_response(err: BodyReadError<hyper::Error>) -> Response<ResBody> {
+    match err {
+        BodyReadError::TooLarge => {
+            text_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds limit")
         }
-    } else {
-        debug!(error = %err, "failed to read request body");
-        BodyReadError {
-            status: StatusCode::BAD_REQUEST,
-            message: "failed to read request body",
+        BodyReadError::TimedOut => {
+            text_response(StatusCode::REQUEST_TIMEOUT, "request body timed out")
+        }
+        BodyReadError::Body(err) => {
+            debug!(error = %err, "failed to read request body");
+            text_response(StatusCode::BAD_REQUEST, "failed to read request body")
         }
     }
-}
-
-async fn run_limited_body<T, F>(timeout: Duration, fut: F) -> Result<T, BodyReadError>
-where
-    F: Future<Output = Result<T, BoxError>>,
-{
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(val)) => Ok(val),
-        Ok(Err(err)) => Err(map_limited_body_error(err)),
-        Err(_) => Err(BodyReadError {
-            status: StatusCode::REQUEST_TIMEOUT,
-            message: "request body timed out",
-        }),
-    }
-}
-
-async fn drain_limited(body: Incoming, timeout: Duration) -> Result<(), BodyReadError> {
-    run_limited_body(timeout, async move {
-        let mut limited = http_body_util::Limited::new(body, MAX_BUFFERED_REQUEST_BYTES);
-        while let Some(frame) = limited.frame().await {
-            let _ = frame?;
-        }
-        Ok(())
-    })
-    .await
-}
-
-async fn collect_limited(body: Incoming, timeout: Duration) -> Result<Bytes, BodyReadError> {
-    run_limited_body(timeout, async move {
-        let collected = http_body_util::Limited::new(body, MAX_BUFFERED_REQUEST_BYTES)
-            .collect()
-            .await?;
-        Ok(collected.to_bytes())
-    })
-    .await
 }
 
 fn try_mock_eth_syncing(bytes: &[u8]) -> Option<Response<ResBody>> {
     match crate::rpc::mock_syncing(bytes) {
         crate::rpc::MockResult::Forward => None,
-        crate::rpc::MockResult::Silent => Some(text_response(StatusCode::NO_CONTENT, "")),
+        crate::rpc::MockResult::Silent => Some(status_response(StatusCode::NO_CONTENT)),
         crate::rpc::MockResult::Reply(body) => {
             Some(raw_json_response(StatusCode::OK, Bytes::from(body)))
         }
@@ -447,15 +452,20 @@ async fn execute_upstream(
     body: ResBody,
     state: &AppState,
     target: &HttpTarget,
-) -> Result<Response<ResBody>, BoxError> {
-    let Ok(rewritten) = target.upstream.rewrite_uri(parts.uri) else {
-        return Ok(uri_too_long_response());
+    layer: UpstreamLayer,
+    path_override: Option<&'static str>,
+) -> Response<ResBody> {
+    let Ok(rewritten) = target
+        .upstream
+        .rewrite_uri_with_path(parts.uri, path_override)
+    else {
+        return uri_too_long_response();
     };
     parts.uri = rewritten;
     // Strip hop-by-hop and Connection-nominated headers BEFORE injecting OTel
     // trace context so `Connection: traceparent` cannot strip outgoing spans.
     strip_hop_by_hop(&mut parts.headers);
-    if state.otel_enabled {
+    if state.metrics.otel_enabled() {
         crate::otel::propagate_context(&mut parts.headers);
     }
     parts.extensions.clear();
@@ -465,22 +475,50 @@ async fn execute_upstream(
     parts.version = Version::HTTP_11;
     let upstream_req = Request::from_parts(parts, body);
 
-    let resp = tokio::time::timeout(
+    let resp = match tokio::time::timeout(
         state.opts.proxy_timeout,
         target.transport.request(&state.client, upstream_req),
     )
     .await
-    .map_err(|_| -> BoxError { "upstream timeout".into() })??;
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(err)) => return bad_gateway(layer, &err),
+        Err(_) => return bad_gateway(layer, &"upstream timeout"),
+    };
 
     let (mut resp_parts, resp_body) = resp.into_parts();
+    if resp_parts.status.is_informational() {
+        return bad_gateway(layer, &"unexpected 1xx upstream response");
+    }
+    // Normalize the upstream hop's version and clear client-side extensions
+    // (`ReasonPhrase`, `OnUpgrade`) so HTTP/2 upstreams keep Hyper's HTTP/1.1
+    // fast path and HTTP/1.0 upstreams cannot downgrade downstream keep-alive.
+    resp_parts.version = Version::HTTP_11;
+    resp_parts.extensions.clear();
     sanitize_response_headers(resp_parts.status, &mut resp_parts.headers);
-    let idle_timeout = response_idle_timeout(
-        &resp_parts.headers,
-        state.opts.proxy_timeout,
-        state.opts.sse_idle_timeout,
+    let body = if resp_body.is_end_stream() {
+        empty_body()
+    } else {
+        ResBody::streaming(
+            resp_body,
+            response_idle_timeout(
+                &resp_parts.headers,
+                state.opts.proxy_timeout,
+                state.opts.sse_idle_timeout,
+            ),
+        )
+    };
+    Response::from_parts(resp_parts, body)
+}
+
+fn bad_gateway(layer: UpstreamLayer, error: &dyn std::fmt::Display) -> Response<ResBody> {
+    warn!(
+        upstream = layer.as_str(),
+        proto = UpstreamProto::Http.as_str(),
+        %error,
+        "upstream proxy error"
     );
-    let body = IdleTimeoutBody::new(resp_body, idle_timeout).boxed_unsync();
-    Ok(Response::from_parts(resp_parts, body))
+    text_response(StatusCode::BAD_GATEWAY, "bad gateway")
 }
 
 fn is_event_stream(headers: &HeaderMap) -> bool {
@@ -494,102 +532,18 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
 fn response_idle_timeout(
     headers: &HeaderMap,
     proxy_timeout: Duration,
-    sse_idle_timeout: Duration,
+    sse_idle_timeout: Option<Duration>,
 ) -> Option<Duration> {
     if is_event_stream(headers) {
-        (!sse_idle_timeout.is_zero()).then_some(sse_idle_timeout)
+        sse_idle_timeout
     } else {
         Some(proxy_timeout)
     }
 }
 
-/// Streaming response body wrapper that enforces a per-frame idle timeout while
-/// preserving `Body::size_hint` and `Body::is_end_stream` (keeping `Content-Length`
-/// intact on HTTP/1.1 responses) and allocating `Sleep` lazily only if `Pending`.
-struct IdleTimeoutBody<B> {
-    inner: B,
-    timeout: Option<Duration>,
-    deadline: crate::lifecycle::LazyDeadline,
-    done: bool,
-}
-
-impl<B> IdleTimeoutBody<B> {
-    const fn new(inner: B, timeout: Option<Duration>) -> Self {
-        Self {
-            inner,
-            timeout,
-            deadline: crate::lifecycle::LazyDeadline::new(),
-            done: false,
-        }
-    }
-}
-
-impl<B> Body for IdleTimeoutBody<B>
-where
-    B: Body<Data = Bytes> + Unpin,
-    B::Error: Into<BoxError>,
-{
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = &mut *self;
-        if this.done {
-            return Poll::Ready(None);
-        }
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                this.deadline.disarm();
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(Some(Err(err))) => {
-                this.deadline.disarm();
-                this.done = true;
-                Poll::Ready(Some(Err(err.into())))
-            }
-            Poll::Ready(None) => {
-                this.deadline.disarm();
-                this.done = true;
-                Poll::Ready(None)
-            }
-            Poll::Pending => {
-                let Some(duration) = this.timeout else {
-                    return Poll::Pending;
-                };
-                if this.deadline.poll_expired(cx, duration) {
-                    this.done = true;
-                    Poll::Ready(Some(Err("response body idle timeout".into())))
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.done || self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-fn box_incoming<B>(body: B) -> ResBody
-where
-    B: Body<Data = Bytes> + Send + 'static,
-    B::Error: Into<BoxError>,
-{
-    body.map_err(Into::into).boxed_unsync()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::Full;
 
     #[test]
     fn test_is_cl_path() {
@@ -667,7 +621,7 @@ mod tests {
                     assert_eq!(
                         classify_request(&req),
                         if method == Method::POST {
-                            // Malformed H1 upgrades still reach Tungstenite's validator.
+                            // Non-GET H1 upgrades are rejected early in `WsMode::response`.
                             Route::Proxy(Target::WebSocket(WsMode::Upgrade))
                         } else {
                             expected
@@ -699,15 +653,24 @@ mod tests {
                 .insert(hyper::ext::Protocol::from_static("websocket"));
             assert_eq!(classify_request(&connect_req), Route::Reject);
         }
-        let mut req = Request::builder()
-            .version(Version::HTTP_2)
-            .method(Method::CONNECT)
-            .uri("/")
-            .body(())
-            .unwrap();
-        req.extensions_mut()
-            .insert(hyper::ext::Protocol::from_static("other"));
-        assert_eq!(classify_request(&req), Route::Reject);
+        // Origin-form `CONNECT /` with HTTP/1.1 Upgrade headers (and non-websocket
+        // HTTP/2 CONNECT + Upgrade headers) must still be rejected as `Route::Reject`.
+        for version in [Version::HTTP_10, Version::HTTP_11, Version::HTTP_2] {
+            let mut bad_connect = Request::builder()
+                .version(version)
+                .method(Method::CONNECT)
+                .uri("/")
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .body(())
+                .unwrap();
+            if version == Version::HTTP_2 {
+                bad_connect
+                    .extensions_mut()
+                    .insert(hyper::ext::Protocol::from_static("other"));
+            }
+            assert_eq!(classify_request(&bad_connect), Route::Reject);
+        }
 
         let root_get = Request::builder()
             .method(Method::GET)
@@ -752,11 +715,16 @@ mod tests {
         let req = r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":101}"#;
         assert!(try_mock_eth_syncing(req.as_bytes()).is_none());
 
-        // Notification eth_syncing returns 204 No Content with an empty body
-        let notif = r#"{"jsonrpc":"2.0","method":"eth_syncing"}"#;
-        let res = try_mock_eth_syncing(notif.as_bytes()).unwrap();
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
-        assert!(res.body().is_end_stream());
+        // Notification eth_syncing returns 204 No Content with an empty body and no headers
+        for notif in [
+            r#"{"jsonrpc":"2.0","method":"eth_syncing"}"#,
+            r#"[{"jsonrpc":"2.0","method":"eth_syncing"}]"#,
+        ] {
+            let res = try_mock_eth_syncing(notif.as_bytes()).unwrap();
+            assert_eq!(res.status(), StatusCode::NO_CONTENT);
+            assert!(res.body().is_end_stream());
+            assert!(res.headers().is_empty());
+        }
 
         // Batch eth_syncing request
         let batch = r#"[{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}]"#;
@@ -769,9 +737,9 @@ mod tests {
     }
 
     #[test]
-    fn response_idle_timeout_distinguishes_event_streams_and_zero_disable() {
+    fn response_idle_timeout_distinguishes_event_streams_and_disabled() {
         let proxy_timeout = Duration::from_secs(60);
-        let sse_timeout = Duration::from_secs(900);
+        let sse_timeout = Some(Duration::from_secs(900));
 
         let mut plain = HeaderMap::new();
         assert_eq!(
@@ -793,84 +761,15 @@ mod tests {
             sse.insert("content-type", ct.parse().unwrap());
             assert_eq!(
                 response_idle_timeout(&sse, proxy_timeout, sse_timeout),
-                Some(sse_timeout),
+                sse_timeout,
                 "ct={ct}"
             );
             assert_eq!(
-                response_idle_timeout(&sse, proxy_timeout, Duration::ZERO),
+                response_idle_timeout(&sse, proxy_timeout, None),
                 None,
                 "ct={ct} disabled"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn idle_timeout_body_preserves_size_hint_and_avoids_timer_when_immediately_ready() {
-        let payload = Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x1\"}");
-        let mut body =
-            IdleTimeoutBody::new(Full::new(payload.clone()), Some(Duration::from_secs(5)));
-        assert!(!body.is_end_stream());
-        assert_eq!(body.size_hint().exact(), Some(payload.len() as u64));
-
-        let collected = (&mut body).collect().await.unwrap().to_bytes();
-        assert_eq!(collected, payload);
-        assert!(
-            !body.deadline.is_allocated(),
-            "immediate bodies must not allocate Sleep"
-        );
-        assert!(body.is_end_stream());
-
-        let empty = IdleTimeoutBody::new(Full::new(Bytes::new()), Some(Duration::from_secs(5)));
-        assert!(empty.is_end_stream());
-        assert_eq!(empty.size_hint().exact(), Some(0));
-    }
-
-    struct ChannelBody(tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, Infallible>>);
-
-    impl Body for ChannelBody {
-        type Data = Bytes;
-        type Error = Infallible;
-
-        fn poll_frame(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            self.0.poll_recv(cx)
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_timeout_body_resets_between_chunks_and_aborts_when_stalled() {
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let mut body = IdleTimeoutBody::new(ChannelBody(rx), Some(Duration::from_secs(10)));
-
-        let reader = tokio::spawn(async move {
-            let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
-            assert_eq!(first, Bytes::from_static(b"chunk-1"));
-            let second = body.frame().await.unwrap().unwrap().into_data().unwrap();
-            assert_eq!(second, Bytes::from_static(b"chunk-2"));
-            let err = body.frame().await.unwrap().unwrap_err();
-            assert_eq!(err.to_string(), "response body idle timeout");
-            assert!(body.frame().await.is_none(), "body must fuse after timeout");
-        });
-
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(7)).await;
-        tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-1"))))
-            .await
-            .unwrap();
-        tokio::task::yield_now().await;
-
-        // Another 7s (14s total > 10s, but < 10s since chunk-1) must succeed.
-        tokio::time::advance(Duration::from_secs(7)).await;
-        tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-2"))))
-            .await
-            .unwrap();
-        tokio::task::yield_now().await;
-
-        // Stalling > 10s with tx still open triggers the idle timeout.
-        tokio::time::advance(Duration::from_secs(11)).await;
-        reader.await.unwrap();
     }
 
     #[test]
@@ -880,7 +779,11 @@ mod tests {
         headers.insert("content-type", "text/event-stream".parse().unwrap());
         sanitize_response_headers(StatusCode::OK, &mut headers);
         assert_eq!(
-            response_idle_timeout(&headers, Duration::from_secs(60), Duration::from_secs(900)),
+            response_idle_timeout(
+                &headers,
+                Duration::from_secs(60),
+                Some(Duration::from_secs(900)),
+            ),
             Some(Duration::from_secs(60))
         );
     }
@@ -888,12 +791,13 @@ mod tests {
     #[tokio::test]
     async fn h2_extended_connect_permit_reuses_first_slot_and_caps_concurrent_amplification() {
         use clap::Parser;
-        use tokio::sync::mpsc;
 
         let cfg = crate::Config::parse_from([
             "ethonyx",
             "--el-http-url",
             "http://127.0.0.1:8545",
+            "--el-ws-url",
+            "ws://127.0.0.1:8546",
             "--trust-upstream",
             "--max-connections",
             "2",
@@ -902,40 +806,137 @@ mod tests {
         let state = Arc::new(AppState::new(
             parsed.opts,
             parsed.upstreams,
-            false,
             health::HealthSource::Trusted,
-            crate::metrics::ServerMetrics::new(None),
+            crate::metrics::ServerMetrics::default(),
         ));
         let sem = Arc::clone(&state.conn_limit);
-        let tcp_permit = Arc::new(sem.clone().try_acquire_owned().unwrap());
-        let (_shutdown_tx, shutdown_rx) = crate::lifecycle::channel();
-        let (conn_tx, _conn_rx) = mpsc::channel(1);
-        let lifecycle = crate::lifecycle::Lifecycle::new(shutdown_rx, conn_tx);
+        let tcp_permit = sem.clone().try_acquire_owned().unwrap();
+        let (_shutdown_tx, lifecycle, _drain) = crate::lifecycle::channel();
         let conn = Arc::new(Connection::new(
-            state,
-            lifecycle,
+            Arc::clone(&state),
+            &lifecycle,
             "127.0.0.1:12345".parse().unwrap(),
             tcp_permit,
         ));
+        let state_refs_before = Arc::strong_count(&state);
 
-        // 1st H2 Extended CONNECT stream reuses the connection's own permit (1 left in sem).
-        let p1 = conn.acquire_ws_permit(WsMode::ExtendedConnect);
+        let Forward::WebSocket(_, _, ws_conn) =
+            Forward::resolve(Target::WebSocket(WsMode::ExtendedConnect), &conn)
+                .expect("WS-enabled Connection must resolve WebSocket target")
+        else {
+            panic!("expected Forward::WebSocket");
+        };
+
+        // 1st H2 Extended CONNECT stream reuses the connection's own permit (1 left in sem)
+        // without retaining `Arc<Connection>` / `Arc<AppState>`.
+        let p1 = ws_conn.acquire_permit(WsMode::ExtendedConnect, &state);
         assert!(p1.is_some());
         assert_eq!(sem.available_permits(), 1);
+        assert_eq!(Arc::strong_count(&state), state_refs_before);
 
         // 2nd concurrent H2 Extended CONNECT stream claims the remaining semaphore permit.
-        let p2 = conn.acquire_ws_permit(WsMode::ExtendedConnect);
+        let p2 = ws_conn.acquire_permit(WsMode::ExtendedConnect, &state);
         assert!(p2.is_some());
         assert_eq!(sem.available_permits(), 0);
 
         // 3rd concurrent stream is rejected instead of amplifying beyond max_connections=2.
-        assert!(conn.acquire_ws_permit(WsMode::ExtendedConnect).is_none());
+        assert!(
+            ws_conn
+                .acquire_permit(WsMode::ExtendedConnect, &state)
+                .is_none()
+        );
 
         // Dropping p1 releases the connection's included H2 WS slot for reuse.
         drop(p1);
-        let p1_reused = conn.acquire_ws_permit(WsMode::ExtendedConnect);
+        let p1_reused = ws_conn.acquire_permit(WsMode::ExtendedConnect, &state);
         assert!(p1_reused.is_some());
         drop((p2, p1_reused));
         assert_eq!(sem.available_permits(), 1);
+
+        // A detached relay holding the connection's H2 slot keeps the permit alive after
+        // `Connection` drops while releasing `Arc<AppState>` immediately.
+        let detached = ws_conn
+            .acquire_permit(WsMode::ExtendedConnect, &state)
+            .unwrap();
+        assert!(matches!(detached, WsPermit::SharedH2Slot(_)));
+        drop(conn);
+        assert_eq!(Arc::strong_count(&state), 1);
+        assert_eq!(sem.available_permits(), 1);
+        drop(detached);
+        assert_eq!(sem.available_permits(), 2);
+
+        // HTTP-only server (`--el-ws-url` omitted) keeps `ConnPermit::Owned` without
+        // cloning `Lifecycle` per connection.
+        let http_only = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+            "--max-connections",
+            "1",
+        ])
+        .parse_validated()
+        .unwrap();
+        let http_state = Arc::new(AppState::new(
+            http_only.opts,
+            http_only.upstreams,
+            health::HealthSource::Trusted,
+            crate::metrics::ServerMetrics::default(),
+        ));
+        let http_permit = Arc::clone(&http_state.conn_limit)
+            .try_acquire_owned()
+            .unwrap();
+        let (_tx2, lc2, drain2) = crate::lifecycle::channel();
+        let http_conn = Connection::new(
+            http_state,
+            &lc2,
+            "127.0.0.1:12346".parse().unwrap(),
+            http_permit,
+        );
+        drop(lc2);
+        tokio::time::timeout(Duration::from_millis(100), drain2.wait())
+            .await
+            .expect("HTTP-only Connection must not retain a Lifecycle token");
+        assert!(Forward::resolve(Target::WebSocket(WsMode::Upgrade), &http_conn).is_none());
+    }
+
+    #[test]
+    fn probes_match_head_headers_and_skip_bodies() {
+        use clap::Parser;
+
+        let cfg = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+        ]);
+        let parsed = cfg.parse_validated().unwrap();
+        let state = AppState::new(
+            parsed.opts,
+            parsed.upstreams,
+            health::HealthSource::Trusted,
+            crate::metrics::ServerMetrics::default(),
+        );
+        state.metrics.inc_saturated();
+
+        for (method, has_body) in [(Method::GET, true), (Method::HEAD, false)] {
+            let res = Probe::Metrics.response(&method, &state);
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(
+                res.headers()[http::header::CONTENT_TYPE],
+                "text/plain; version=0.0.4; charset=utf-8"
+            );
+            assert_eq!(res.body().is_end_stream(), !has_body, "{method}");
+        }
+
+        // Every probe answers `HEAD` with the status and headers of its `GET` and no body.
+        for probe in [Probe::Health, Probe::Ready, Probe::Live, Probe::Metrics] {
+            let get = probe.response(&Method::GET, &state);
+            let head = probe.response(&Method::HEAD, &state);
+            assert_eq!(head.status(), get.status(), "{probe:?}");
+            assert_eq!(head.headers(), get.headers(), "{probe:?}");
+            assert!(!get.body().is_end_stream(), "{probe:?}");
+            assert!(head.body().is_end_stream(), "{probe:?}");
+        }
     }
 }

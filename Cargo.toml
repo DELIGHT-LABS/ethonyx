@@ -17,7 +17,6 @@ hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "http2"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "aws-lc-rs", "webpki-tokio", "tls12"] }
 http = "1.5"
-http-body-util = "0.1.5"
 bytes = "1.12"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
@@ -39,6 +38,7 @@ tracing-opentelemetry = { version = "0.34", optional = true, default-features = 
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [dev-dependencies]
+http-body-util = "0.1.5"
 hyper-util = { version = "0.1.21", features = ["server-auto"] }
 tokio = { version = "1.54.1", features = ["test-util"] }
 
