@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, trace, warn};
 
-use crate::state::{AppState, ConnPermitGuard};
+use crate::state::{AppState, ConnLimit, ConnPermitGuard};
 use crate::{BoxError, lifecycle, proxy, transport};
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -23,6 +23,15 @@ const PREFACE_BUF_LEN: usize = 64;
 const _: () = assert!(H2_PREFACE.len() <= PREFACE_BUF_LEN && PREFACE_BUF_LEN <= u8::MAX as usize);
 const INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(65);
+const ADMIN_MAX_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(64) {
+    Some(n) => n,
+    None => unreachable!(),
+};
+const ADMIN_INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const ADMIN_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const ADMIN_MAX_CONN_LIFETIME: Duration = Duration::from_secs(10);
+const ADMIN_CLOSE_GRACE: Duration = Duration::from_secs(1);
+const _: () = assert!(ADMIN_CLOSE_GRACE.as_nanos() < ADMIN_MAX_CONN_LIFETIME.as_nanos());
 
 async fn accept_round_robin(
     listeners: &[TcpListener],
@@ -172,7 +181,7 @@ struct ServerBuilders {
 }
 
 impl ServerBuilders {
-    fn new(lifecycle: lifecycle::Lifecycle, enable_ws: bool) -> Self {
+    fn new_data(lifecycle: lifecycle::Lifecycle, enable_ws: bool) -> Self {
         let mut http1 = http1::Builder::new();
         http1
             .timer(TokioTimer::new())
@@ -194,6 +203,54 @@ impl ServerBuilders {
             lifecycle,
         }
     }
+
+    /// Dedicated builders for `--admin-listen`: short header timeout, immediate
+    /// HTTP/1.1 connection close (`keep_alive(false)`), and a conservative HTTP/2
+    /// stream cap without background PING keepalive.
+    fn new_admin(lifecycle: lifecycle::Lifecycle) -> Self {
+        let mut http1 = http1::Builder::new();
+        http1
+            .timer(TokioTimer::new())
+            .keep_alive(false)
+            .header_read_timeout(Some(ADMIN_HEADER_READ_TIMEOUT));
+        let mut http2 = http2::Builder::new(lifecycle.clone());
+        http2.max_concurrent_streams(32);
+        Self {
+            http1,
+            http2,
+            lifecycle,
+        }
+    }
+}
+
+/// Bounded connection lifetime for `--admin-listen`: sends a graceful shutdown
+/// signal (`GOAWAY` on HTTP/2) at `graceful` and hard-evicts at `hard` so idle
+/// clients cannot wedge the 64-slot admin pool.
+#[derive(Clone, Copy, Debug)]
+struct AdminLifetime {
+    graceful: tokio::time::Instant,
+    hard: tokio::time::Instant,
+}
+
+impl AdminLifetime {
+    fn from_start(started: tokio::time::Instant) -> Self {
+        Self {
+            graceful: started + (ADMIN_MAX_CONN_LIFETIME - ADMIN_CLOSE_GRACE),
+            hard: started + ADMIN_MAX_CONN_LIFETIME,
+        }
+    }
+
+    fn shutdown_deadline(self, sd: tokio::time::Instant) -> tokio::time::Instant {
+        sd.min(tokio::time::Instant::now() + ADMIN_CLOSE_GRACE)
+            .min(self.hard)
+    }
+}
+
+fn log_conn_closed(res: hyper::Result<()>, peer: std::net::SocketAddr, msg: &'static str) {
+    match res {
+        Ok(()) => trace!(%peer, "{msg}"),
+        Err(error) => debug!(%error, %peer, "{msg}"),
+    }
 }
 
 async fn drive_graceful<C>(
@@ -214,10 +271,7 @@ async fn drive_graceful<C>(
         tokio::select! {
             biased;
             res = conn.as_mut() => {
-                match res {
-                    Ok(()) => trace!(%peer, "connection closed"),
-                    Err(e) => debug!(error = %e, %peer, "connection closed"),
-                }
+                log_conn_closed(res, peer, "connection closed");
                 return;
             }
             deadline = lifecycle.deadline() => deadline,
@@ -225,9 +279,70 @@ async fn drive_graceful<C>(
     };
     graceful_shutdown(conn.as_mut());
     match tokio::time::timeout_at(deadline, conn).await {
-        Ok(Ok(())) => trace!(%peer, "connection closed after shutdown"),
-        Ok(Err(e)) => debug!(error = %e, %peer, "connection closed after shutdown"),
+        Ok(res) => log_conn_closed(res, peer, "connection closed after shutdown"),
         Err(_) => trace!(%peer, "connection drain deadline reached"),
+    }
+}
+
+/// Admin-plane connection driver: enforces [`AdminLifetime`] (`9s` graceful
+/// shutdown -> `10s` hard eviction) and bounds global-shutdown drain to
+/// [`ADMIN_CLOSE_GRACE`] (`1s`) using a single stack-pinned `Sleep` (zero heap
+/// allocations; skips timer-wheel registration when an HTTP/1.1 reply completes
+/// on its first poll).
+async fn drive_admin_graceful<C>(
+    conn: C,
+    graceful_shutdown: impl FnOnce(Pin<&mut C>),
+    lifecycle: &lifecycle::Lifecycle,
+    peer: std::net::SocketAddr,
+    lifetime: AdminLifetime,
+) where
+    C: Future<Output = hyper::Result<()>>,
+{
+    tokio::pin!(conn);
+    let sleep = tokio::time::sleep_until(lifetime.graceful);
+    tokio::pin!(sleep);
+
+    let (drain_deadline, from_lifetime) = if let Some(sd) = lifecycle.current_deadline() {
+        (lifetime.shutdown_deadline(sd), false)
+    } else {
+        tokio::select! {
+            biased;
+            res = conn.as_mut() => {
+                log_conn_closed(res, peer, "admin connection closed");
+                return;
+            }
+            sd = lifecycle.deadline() => (lifetime.shutdown_deadline(sd), false),
+            () = sleep.as_mut() => (lifetime.hard, true),
+        }
+    };
+
+    graceful_shutdown(conn.as_mut());
+    sleep.as_mut().reset(drain_deadline);
+
+    if from_lifetime {
+        let sd = tokio::select! {
+            biased;
+            res = conn.as_mut() => {
+                log_conn_closed(res, peer, "admin connection closed after lifetime GOAWAY");
+                return;
+            }
+            () = sleep.as_mut() => {
+                trace!(%peer, "admin connection max lifetime reached");
+                return;
+            }
+            sd = lifecycle.deadline() => sd,
+        };
+        if sd < drain_deadline {
+            sleep.as_mut().reset(sd);
+        }
+    }
+
+    tokio::select! {
+        biased;
+        res = conn.as_mut() => log_conn_closed(res, peer, "admin connection closed after shutdown"),
+        () = sleep.as_mut() => {
+            trace!(%peer, "admin connection drain deadline reached");
+        }
     }
 }
 
@@ -281,6 +396,7 @@ async fn serve_connection(
     peer: std::net::SocketAddr,
     state: Arc<AppState>,
     permit: ConnPermitGuard,
+    probes: proxy::ListenProbes,
 ) {
     let _guard = state.metrics.active_tcp();
     let Some((proto, prefixed)) =
@@ -295,20 +411,157 @@ async fn serve_connection(
         &builders.lifecycle,
         peer,
         permit,
+        probes,
     ));
     let svc = service_fn(move |req| Arc::clone(&connection).dispatch(req));
     serve_detected(&builders, proto, io, svc, peer).await;
 }
 
-pub(crate) async fn accept_loop(
-    listeners: Vec<TcpListener>,
+async fn serve_admin_io<I>(
+    builders: &ServerBuilders,
+    stream: I,
+    peer: std::net::SocketAddr,
     state: Arc<AppState>,
-    lifecycle: lifecycle::Lifecycle,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let lifetime = AdminLifetime::from_start(tokio::time::Instant::now());
+    let Some((proto, prefixed)) =
+        read_initial_preface(stream, ADMIN_INITIAL_READ_TIMEOUT, &builders.lifecycle).await
+    else {
+        trace!(%peer, "admin connection closed before protocol preface");
+        return;
+    };
+    let io = TokioIo::new(prefixed);
+    let svc = service_fn(move |req| {
+        std::future::ready(Ok::<_, std::convert::Infallible>(proxy::dispatch_admin(
+            &state, &req,
+        )))
+    });
+    match proto {
+        DetectedProto::Http1 => {
+            drive_admin_graceful(
+                builders.http1.serve_connection(io, svc),
+                http1::Connection::graceful_shutdown,
+                &builders.lifecycle,
+                peer,
+                lifetime,
+            )
+            .await;
+        }
+        DetectedProto::Http2 => {
+            Box::pin(drive_admin_graceful(
+                builders.http2.serve_connection(io, svc),
+                http2::Connection::graceful_shutdown,
+                &builders.lifecycle,
+                peer,
+                lifetime,
+            ))
+            .await;
+        }
+    }
+}
+
+/// Serve one accepted TCP stream on `--admin-listen`. `builders` is declared first
+/// so the drain barrier stays armed until `stream`, `state`, and `_permit` drop.
+async fn serve_admin_connection(
+    builders: Arc<ServerBuilders>,
+    stream: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+    state: Arc<AppState>,
+    _permit: ConnPermitGuard,
+) {
+    serve_admin_io(&builders, stream, peer, state).await;
+}
+
+enum AcceptTarget {
+    Data(proxy::ListenProbes),
+    Admin(ConnLimit),
+}
+
+impl AcceptTarget {
+    fn try_acquire(&self, state: &AppState) -> Option<ConnPermitGuard> {
+        match self {
+            Self::Data(_) => state.try_acquire_permit(),
+            Self::Admin(limit) => limit.try_acquire(),
+        }
+    }
+
+    async fn acquire(&self, state: &AppState) -> Option<ConnPermitGuard> {
+        match self {
+            Self::Data(_) => state.conn_limit.acquire().await,
+            Self::Admin(limit) => limit.acquire().await,
+        }
+    }
+
+    fn log_accept_error(&self, error: &std::io::Error) {
+        match self {
+            Self::Data(_) => warn!(%error, "accept failed"),
+            Self::Admin(_) => warn!(%error, "admin accept failed"),
+        }
+    }
+
+    fn log_saturated(&self, state: &AppState) {
+        match self {
+            Self::Data(_) => warn!(
+                max_connections = state.conn_limit.max().map(NonZeroUsize::get),
+                "connection limit reached; queueing accepts"
+            ),
+            Self::Admin(limit) => warn!(
+                max_connections = limit.max().map(NonZeroUsize::get),
+                "admin connection limit reached; queueing accepts"
+            ),
+        }
+    }
+
+    fn spawn(
+        &self,
+        builders: &Arc<ServerBuilders>,
+        stream: tokio::net::TcpStream,
+        peer: std::net::SocketAddr,
+        state: &Arc<AppState>,
+        permit: ConnPermitGuard,
+    ) {
+        match self {
+            Self::Data(probes) => {
+                // Connection lifecycle is fine-grained, high-frequency detail, so
+                // it lives at trace (accept/close) and on a dedicated `access_log`
+                // target (per-request peer, version, method, path, upstream, status,
+                // and latency) rather than the main info log — which stays reserved
+                // for lifecycle and state changes. See the `access_log` config flag.
+                trace!(%peer, "connection accepted");
+                tokio::spawn(serve_connection(
+                    Arc::clone(builders),
+                    stream,
+                    peer,
+                    Arc::clone(state),
+                    permit,
+                    *probes,
+                ));
+            }
+            Self::Admin(_) => {
+                trace!(%peer, "admin connection accepted");
+                tokio::spawn(serve_admin_connection(
+                    Arc::clone(builders),
+                    stream,
+                    peer,
+                    Arc::clone(state),
+                    permit,
+                ));
+            }
+        }
+    }
+}
+
+async fn run_accept_loop(
+    listeners: &[TcpListener],
+    state: Arc<AppState>,
+    builders: Arc<ServerBuilders>,
+    target: AcceptTarget,
 ) {
     if listeners.is_empty() {
         return;
     }
-    let builders = Arc::new(ServerBuilders::new(lifecycle, state.el_ws.is_some()));
     let shutdown = builders.lifecycle.deadline();
     tokio::pin!(shutdown);
     let mut next_idx = 0usize;
@@ -317,10 +570,10 @@ pub(crate) async fn accept_loop(
         let (stream, peer) = tokio::select! {
             biased;
             _ = &mut shutdown => return,
-            accept = accept_round_robin(&listeners, &mut next_idx) => match accept {
+            accept = accept_round_robin(listeners, &mut next_idx) => match accept {
                 Ok(pair) => pair,
                 Err(e) => {
-                    warn!(error = %e, "accept failed");
+                    target.log_accept_error(&e);
                     // Back off so a persistent error (e.g. fd exhaustion)
                     // doesn't busy-spin a core retrying immediately.
                     tokio::select! {
@@ -334,7 +587,7 @@ pub(crate) async fn accept_loop(
         // Acquire a permit AFTER accepting an actual TCP connection so idle listeners
         // never pre-hoard permits needed by HTTP/2 Extended CONNECT streams or inflate
         // `ethonyx_connection_limit_saturated_total` before real contention occurs.
-        let permit = match state.try_acquire_permit() {
+        let permit = match target.try_acquire(&state) {
             Some(permit) => {
                 saturated = false;
                 permit
@@ -342,15 +595,12 @@ pub(crate) async fn accept_loop(
             None => {
                 if !saturated {
                     saturated = true;
-                    warn!(
-                        max_connections = state.conn_limit.max().map(NonZeroUsize::get),
-                        "connection limit reached; queueing accepts"
-                    );
+                    target.log_saturated(&state);
                 }
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => return,
-                    permit = state.conn_limit.acquire() => match permit {
+                    permit = target.acquire(&state) => match permit {
                         Some(permit) => permit,
                         None => return,
                     },
@@ -358,20 +608,36 @@ pub(crate) async fn accept_loop(
             }
         };
         transport::configure_tcp_stream(&stream);
-        // Connection lifecycle is fine-grained, high-frequency detail, so
-        // it lives at trace (accept/close) and on a dedicated `access_log`
-        // target (per-request peer, version, method, path, upstream, status,
-        // and latency) rather than the main info log — which stays reserved
-        // for lifecycle and state changes. See the `access_log` config flag.
-        trace!(%peer, "connection accepted");
-        tokio::spawn(serve_connection(
-            Arc::clone(&builders),
-            stream,
-            peer,
-            Arc::clone(&state),
-            permit,
-        ));
+        target.spawn(&builders, stream, peer, &state, permit);
     }
+}
+
+pub(crate) async fn accept_loop(
+    listeners: Vec<TcpListener>,
+    state: Arc<AppState>,
+    lifecycle: lifecycle::Lifecycle,
+    probes: proxy::ListenProbes,
+) {
+    let builders = Arc::new(ServerBuilders::new_data(lifecycle, state.el_ws.is_some()));
+    run_accept_loop(&listeners, state, builders, AcceptTarget::Data(probes)).await;
+}
+
+/// Dedicated accept loop for `--admin-listen` with its own bounded concurrency pool,
+/// isolated from `--max-connections` saturation and data-plane TCP gauges.
+pub(crate) async fn accept_admin_loop(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    lifecycle: lifecycle::Lifecycle,
+) {
+    let builders = Arc::new(ServerBuilders::new_admin(lifecycle));
+    let limit = ConnLimit::new(Some(ADMIN_MAX_CONNECTIONS));
+    run_accept_loop(
+        std::slice::from_ref(&listener),
+        state,
+        builders,
+        AcceptTarget::Admin(limit),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -430,7 +696,7 @@ mod tests {
         // 3. HTTP/1.1 connection completes preface immediately, survives 30s idle (> 15s),
         // and closes after 65s of keep-alive inactivity via `serve_detected`.
         let (mut h1_client, h1_server) = tokio::io::duplex(4096);
-        let builders = ServerBuilders::new(lifecycle, false);
+        let builders = ServerBuilders::new_data(lifecycle, false);
         let peer: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let server_task = tokio::spawn(async move {
             let (proto, prefixed) =
@@ -500,5 +766,346 @@ mod tests {
         );
         drop(post_lc);
         early_drain.wait().await;
+    }
+
+    async fn admin_test_state() -> Arc<AppState> {
+        use clap::Parser;
+        let cfg = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+        ]);
+        let validated = cfg.parse_validated().unwrap();
+        let (state, _poller) = AppState::start(
+            validated.opts,
+            validated.max_connections,
+            validated.upstreams,
+            validated.health,
+            crate::metrics::ServerMetrics::disabled(),
+        )
+        .await;
+        state
+    }
+
+    fn contains_h2_frame_type(mut data: &[u8], expected_type: u8) -> bool {
+        while data.len() >= 9 {
+            let payload_len =
+                usize::from(data[0]) << 16 | usize::from(data[1]) << 8 | usize::from(data[2]);
+            let frame_type = data[3];
+            let total = 9 + payload_len;
+            if data.len() < total {
+                break;
+            }
+            if frame_type == expected_type {
+                return true;
+            }
+            data = &data[total..];
+        }
+        false
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admin_connections_close_h1_immediately_evict_slowloris_at_5s_and_bound_h2c_at_10s() {
+        use http_body_util::BodyExt;
+
+        let state = admin_test_state().await;
+        let peer: std::net::SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        let (_shutdown_tx, lifecycle, _drain) = lifecycle::channel();
+        let builders = Arc::new(ServerBuilders::new_admin(lifecycle));
+
+        // 1. HTTP/1.1 disables keep-alive (`Connection: close`) and closes immediately after one reply.
+        let (mut h1_client, h1_server) = tokio::io::duplex(4096);
+        let b1 = Arc::clone(&builders);
+        let s1 = Arc::clone(&state);
+        let h1_task = tokio::spawn(async move { serve_admin_io(&b1, h1_server, peer, s1).await });
+        h1_client
+            .write_all(b"GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        h1_client.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
+        assert!(
+            text.to_ascii_lowercase().contains("connection: close"),
+            "admin HTTP/1.1 must disable keep-alive, got: {text}"
+        );
+        assert!(text.ends_with("\r\n\r\nok"), "got: {text}");
+        h1_task.await.unwrap();
+
+        // 2. Silent 0-byte socket and 1-byte HTTP/1.1 Slowloris (`b"G"`) both evict at exact 5s.
+        for payload in [&b""[..], &b"G"[..]] {
+            let (mut slow_client, slow_server) = tokio::io::duplex(256);
+            if !payload.is_empty() {
+                slow_client.write_all(payload).await.unwrap();
+            }
+            let b = Arc::clone(&builders);
+            let s = Arc::clone(&state);
+            let start = tokio::time::Instant::now();
+            let task = tokio::spawn(async move { serve_admin_io(&b, slow_server, peer, s).await });
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(4)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "payload {payload:?} must not evict before 5s"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            task.await.unwrap();
+            assert_eq!(
+                start.elapsed(),
+                ADMIN_HEADER_READ_TIMEOUT,
+                "payload {payload:?} must evict at exact 5s without auto-advance masking"
+            );
+            drop(slow_client);
+        }
+
+        // 3. Well-behaved idle `h2c` client receives graceful GOAWAY at 9s and closes before 10s.
+        let (h2_client, h2_server) = tokio::io::duplex(8192);
+        let b3 = Arc::clone(&builders);
+        let s3 = Arc::clone(&state);
+        let h2_start = tokio::time::Instant::now();
+        let h2_server_task =
+            tokio::spawn(async move { serve_admin_io(&b3, h2_server, peer, s3).await });
+        let (mut sender, h2_conn) =
+            hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .handshake::<_, Full<Bytes>>(TokioIo::new(h2_client))
+                .await
+                .unwrap();
+        let h2_client_task = tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+        let req = http::Request::builder()
+            .version(http::Version::HTTP_2)
+            .uri("http://localhost/livez")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            resp.into_body().collect().await.unwrap().to_bytes(),
+            b"ok"[..]
+        );
+
+        tokio::time::advance(Duration::from_millis(8_900)).await;
+        tokio::task::yield_now().await;
+        assert!(!h2_server_task.is_finished());
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        h2_server_task.await.unwrap();
+        h2_client_task.await.unwrap();
+        assert_eq!(
+            h2_start.elapsed(),
+            ADMIN_MAX_CONN_LIFETIME - ADMIN_CLOSE_GRACE,
+            "compliant h2c peer must close on the GOAWAY sent at exactly 9s"
+        );
+
+        // 4. Stubborn raw `h2c` peer ignoring GOAWAY receives GOAWAY at 9s and is hard-evicted at exact 10s.
+        let (mut raw_client, raw_server) = tokio::io::duplex(8192);
+        let b4 = Arc::clone(&builders);
+        let s4 = Arc::clone(&state);
+        let raw_start = tokio::time::Instant::now();
+        let raw_task = tokio::spawn(async move { serve_admin_io(&b4, raw_server, peer, s4).await });
+        // Client preface + empty SETTINGS frame (type 0x04, len 0).
+        raw_client.write_all(H2_PREFACE).await.unwrap();
+        raw_client
+            .write_all(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut h2_wire = Vec::new();
+        let mut chunk = [0u8; 256];
+        // Drain server's initial SETTINGS / SETTINGS ACK.
+        tokio::task::yield_now().await;
+        let n = raw_client.read(&mut chunk).await.unwrap();
+        h2_wire.extend_from_slice(&chunk[..n]);
+
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !raw_task.is_finished(),
+            "stubborn h2c peer should stay inside 1s post-GOAWAY window until 10s"
+        );
+        // Server must have emitted a GOAWAY frame (type 0x07) at 9s, then close at exact 10s.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        raw_task.await.unwrap();
+        assert_eq!(
+            raw_start.elapsed(),
+            ADMIN_MAX_CONN_LIFETIME,
+            "stubborn h2c peer must evict at exact 10s without auto-advance masking"
+        );
+        raw_client.read_to_end(&mut h2_wire).await.unwrap();
+        assert!(
+            contains_h2_frame_type(&h2_wire, 0x07),
+            "expected RFC 9113 GOAWAY (type 0x07) before hard eviction, got {} bytes",
+            h2_wire.len()
+        );
+
+        // 5. Server shutdown with zero grace during the `[9s, 10s]` post-GOAWAY window
+        // preempts immediately without waiting for the remaining `ADMIN_CLOSE_GRACE`.
+        let (sd_tx, sd_lc, sd_drain) = lifecycle::channel();
+        let sd_builders = Arc::new(ServerBuilders::new_admin(sd_lc));
+        let (mut sd_client, sd_server) = tokio::io::duplex(8192);
+        let b5 = Arc::clone(&sd_builders);
+        let s5 = Arc::clone(&state);
+        let sd_task = tokio::spawn(async move { serve_admin_io(&b5, sd_server, peer, s5).await });
+        sd_client.write_all(H2_PREFACE).await.unwrap();
+        sd_client
+            .write_all(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let _ = sd_client.read(&mut chunk).await.unwrap();
+
+        tokio::time::advance(Duration::from_millis(9_200)).await;
+        tokio::task::yield_now().await;
+        assert!(!sd_task.is_finished());
+
+        let before_shutdown = tokio::time::Instant::now();
+        sd_tx.send(before_shutdown);
+        sd_task.await.unwrap();
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before_shutdown,
+            "zero-grace shutdown during [9s, 10s] window must preempt immediately"
+        );
+        drop(sd_builders);
+        sd_drain.wait().await;
+
+        // 5b. Server shutdown with a long grace (`30s`) arriving during the `[9s, 10s]`
+        // post-GOAWAY window must never extend hard eviction past `ADMIN_MAX_CONN_LIFETIME` (`10s`).
+        let (late_tx, late_lc, late_drain) = lifecycle::channel();
+        let late_builders = Arc::new(ServerBuilders::new_admin(late_lc));
+        let (mut late_client, late_server) = tokio::io::duplex(8192);
+        let b5b = Arc::clone(&late_builders);
+        let s5b = Arc::clone(&state);
+        let late_task =
+            tokio::spawn(async move { serve_admin_io(&b5b, late_server, peer, s5b).await });
+        late_client.write_all(H2_PREFACE).await.unwrap();
+        late_client
+            .write_all(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let _ = late_client.read(&mut chunk).await.unwrap();
+
+        tokio::time::advance(Duration::from_millis(9_200)).await;
+        tokio::task::yield_now().await;
+        assert!(!late_task.is_finished());
+
+        late_tx.send(tokio::time::Instant::now() + Duration::from_secs(30));
+        tokio::task::yield_now().await;
+        assert!(!late_task.is_finished());
+
+        tokio::time::advance(Duration::from_millis(799)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !late_task.is_finished(),
+            "hard eviction must not fire before 10s"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            late_task.is_finished(),
+            "long-grace shutdown during [9s, 10s] window must not extend eviction past 10s"
+        );
+        late_task.await.unwrap();
+        drop(late_builders);
+        late_drain.wait().await;
+
+        // 6. Global shutdown with a long `--shutdown-grace 30s` closes compliant `h2c`
+        // immediately (`0ms`) and caps stubborn `h2c` peers at `ADMIN_CLOSE_GRACE` (`1s`).
+        let (g_tx, g_lc, g_drain) = lifecycle::channel();
+        let g_builders = Arc::new(ServerBuilders::new_admin(g_lc));
+
+        let (ok_client, ok_server) = tokio::io::duplex(8192);
+        let b6a = Arc::clone(&g_builders);
+        let s6a = Arc::clone(&state);
+        let ok_task = tokio::spawn(async move { serve_admin_io(&b6a, ok_server, peer, s6a).await });
+        let (mut ok_sender, ok_conn) =
+            hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .handshake::<_, Full<Bytes>>(TokioIo::new(ok_client))
+                .await
+                .unwrap();
+        let ok_driver = tokio::spawn(async move {
+            let _ = ok_conn.await;
+        });
+        let ok_resp = ok_sender
+            .send_request(
+                http::Request::builder()
+                    .version(http::Version::HTTP_2)
+                    .uri("http://localhost/livez")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), http::StatusCode::OK);
+        let _ = ok_resp.into_body().collect().await.unwrap();
+
+        let (mut stuck_client, stuck_server) = tokio::io::duplex(8192);
+        let b6b = Arc::clone(&g_builders);
+        let s6b = Arc::clone(&state);
+        let stuck_task =
+            tokio::spawn(async move { serve_admin_io(&b6b, stuck_server, peer, s6b).await });
+        stuck_client.write_all(H2_PREFACE).await.unwrap();
+        stuck_client
+            .write_all(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut stuck_wire = Vec::new();
+        let n = stuck_client.read(&mut chunk).await.unwrap();
+        stuck_wire.extend_from_slice(&chunk[..n]);
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let shutdown_at = tokio::time::Instant::now();
+        g_tx.send(shutdown_at + Duration::from_secs(30));
+
+        ok_task.await.unwrap();
+        ok_driver.await.unwrap();
+        assert_eq!(
+            shutdown_at.elapsed(),
+            Duration::ZERO,
+            "compliant h2c admin peer must close immediately on shutdown GOAWAY"
+        );
+
+        assert!(!stuck_task.is_finished());
+        tokio::time::advance(ADMIN_CLOSE_GRACE).await;
+        stuck_task.await.unwrap();
+        assert_eq!(
+            shutdown_at.elapsed(),
+            ADMIN_CLOSE_GRACE,
+            "stubborn h2c admin peer must evict at 1s ADMIN_CLOSE_GRACE, not 10s or 30s"
+        );
+        stuck_client.read_to_end(&mut stuck_wire).await.unwrap();
+        assert!(contains_h2_frame_type(&stuck_wire, 0x07));
+
+        drop(g_builders);
+        g_drain.wait().await;
+
+        // 7. Zero grace (`--shutdown-grace 0`) evicts a stubborn `h2c` peer immediately
+        // instead of waiting out `ADMIN_CLOSE_GRACE`.
+        let (z_tx, z_lc, z_drain) = lifecycle::channel();
+        let z_builders = Arc::new(ServerBuilders::new_admin(z_lc));
+        let (mut z_client, z_server) = tokio::io::duplex(8192);
+        let b7 = Arc::clone(&z_builders);
+        let s7 = Arc::clone(&state);
+        let z_task = tokio::spawn(async move { serve_admin_io(&b7, z_server, peer, s7).await });
+        z_client.write_all(H2_PREFACE).await.unwrap();
+        z_client
+            .write_all(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let _ = z_client.read(&mut chunk).await.unwrap();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let zero_at = tokio::time::Instant::now();
+        z_tx.send(zero_at);
+        z_task.await.unwrap();
+        assert_eq!(
+            zero_at.elapsed(),
+            Duration::ZERO,
+            "zero-grace shutdown must evict a stubborn h2c admin peer immediately"
+        );
+        drop(z_builders);
+        z_drain.wait().await;
     }
 }

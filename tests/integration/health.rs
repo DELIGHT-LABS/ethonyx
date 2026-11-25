@@ -1898,3 +1898,297 @@ async fn reference_gate_retains_503_on_first_local_chain_id_glitch_then_fails_op
 
     lag_proxy.shutdown().await;
 }
+
+#[tokio::test]
+async fn admin_listen_isolates_probes_under_max_connections_saturation_and_hides_probes_on_listen()
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let el = MockServer::start(ok_handler()).await;
+    let cl = MockServer::start(ok_handler()).await;
+    let ws = StubPort::dead().await;
+    let ws_url = ws.ws_url();
+    let proxy = EthonyxHandle::start_tuned(
+        &[
+            "--el-http-url",
+            &el.url,
+            "--el-ws-url",
+            &ws_url,
+            "--cl-beacon-url",
+            &cl.url,
+            "--trust-upstream",
+            "--mock-cl-node-health",
+            "--max-connections",
+            "1",
+            "--admin-listen",
+            "127.0.0.1:0",
+        ],
+        |cfg| cfg.shutdown_grace = Duration::from_secs(3),
+    )
+    .await;
+    let c = client();
+    let wait_tcp_zero = || async {
+        wait_for(|| async {
+            let (_, body) = get(&c, &proxy.admin_url("/metrics")).await;
+            let tcp = prom_metric_sum(
+                &String::from_utf8_lossy(&body),
+                "ethonyx_active_connections",
+                &[r#"protocol="tcp""#],
+            );
+            if tcp == 0.0 {
+                Ok(())
+            } else {
+                Err(format!("waiting for Step 1 tcp=0, got {tcp}"))
+            }
+        })
+        .await;
+    };
+
+    // 1. Probes are hidden on `--listen` (immediate 404 for HTTP methods, HTTP/1.1 WS
+    // `Upgrade`, and HTTP/2 Extended `CONNECT` without forwarding to EL/WS, while plain
+    // non-WebSocket `CONNECT` still returns `400 Bad Request`). Beacon API
+    // `--mock-cl-node-health` stays on `--listen` and is 404 on `--admin-listen`.
+    // Use separate scoped clients so idle sockets release the single `--max-connections 1`
+    // permit before each phase.
+    {
+        let listen_client = client();
+        for path in ["/livez", "/readyz", "/healthz", "/metrics"] {
+            for method in [Method::GET, Method::HEAD, Method::POST, Method::OPTIONS] {
+                let req = Request::builder()
+                    .method(method.clone())
+                    .uri(proxy.url(path))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                let resp = listen_client.request(req).await.unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::NOT_FOUND,
+                    "{method} {path} on --listen"
+                );
+                let _ = resp.into_body().collect().await.unwrap();
+            }
+        }
+        let h1_ws_resp = listen_client
+            .request(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(proxy.url("/livez"))
+                    .header("connection", "Upgrade")
+                    .header("upgrade", "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            h1_ws_resp.status(),
+            StatusCode::NOT_FOUND,
+            "HTTP/1.1 WS Upgrade to hidden /livez on --listen"
+        );
+        let _ = h1_ws_resp.into_body().collect().await.unwrap();
+        assert!(
+            el.received().is_empty(),
+            "hidden probes on --listen must never forward to EL upstream"
+        );
+        assert_eq!(
+            get(&listen_client, &proxy.url("/eth/v1/node/health"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    wait_tcp_zero().await;
+    {
+        let mut h2_listen = proxy.open_h2().await;
+        let h2_ws_resp = h2_listen
+            .send_request(ext_connect(proxy.url("/livez")))
+            .await
+            .unwrap();
+        assert_eq!(
+            h2_ws_resp.status(),
+            StatusCode::NOT_FOUND,
+            "HTTP/2 Extended CONNECT to hidden /livez on --listen"
+        );
+        let _ = h2_ws_resp.into_body().collect().await.unwrap();
+    }
+    wait_tcp_zero().await;
+    {
+        let mut raw_connect = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+            .await
+            .unwrap();
+        raw_connect
+            .write_all(b"CONNECT /livez HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw_buf = Vec::new();
+        raw_connect.read_to_end(&mut raw_buf).await.unwrap();
+        let raw_text = String::from_utf8_lossy(&raw_buf);
+        assert!(
+            raw_text.starts_with("HTTP/1.1 400 Bad Request"),
+            "non-WebSocket CONNECT /livez on --listen must return 400, got: {raw_text}"
+        );
+    }
+    wait_tcp_zero().await;
+    assert_eq!(
+        get(&c, &proxy.admin_url("/eth/v1/node/health")).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // 2. Saturate `--max-connections 1` on `--listen` with one held keep-alive client
+    // and queue a second data-plane client behind `conn_limit.acquire()`.
+    let mut conn1 = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    let rpc_req = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 52\r\n\r\n{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"id\":1}\n";
+    conn1.write_all(rpc_req).await.unwrap();
+    let mut buf = [0u8; 512];
+    let n = conn1.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200 OK"));
+
+    let mut conn2 = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    conn2.write_all(rpc_req).await.unwrap();
+
+    // Even while `--listen` is 100% saturated and conn2 is queued, `--admin-listen`
+    // answers all four probe/metrics routes immediately without bumping `active_connections{protocol="tcp"}`.
+    wait_for(|| async {
+        let (st, body) = get(&c, &proxy.admin_url("/metrics")).await;
+        if st != StatusCode::OK {
+            return Err(format!("admin /metrics status {st}"));
+        }
+        let text = String::from_utf8_lossy(&body);
+        let sat = prom_metric_sum(&text, "ethonyx_connection_limit_saturated_total", &[]);
+        let tcp = prom_metric_sum(&text, "ethonyx_active_connections", &[r#"protocol="tcp""#]);
+        if sat == 1.0 && tcp == 1.0 {
+            Ok(())
+        } else {
+            Err(format!("sat={sat}, tcp={tcp}"))
+        }
+    })
+    .await;
+
+    for path in ["/livez", "/readyz", "/healthz", "/metrics"] {
+        let (st, body) = get(&c, &proxy.admin_url(path)).await;
+        assert_eq!(st, StatusCode::OK, "admin GET {path} during saturation");
+        assert!(!body.is_empty(), "admin GET {path} body");
+    }
+
+    // Releasing conn1 lets queued conn2 proceed on `--listen`.
+    drop(conn1);
+    let n2 = tokio::time::timeout(Duration::from_secs(2), conn2.read(&mut buf))
+        .await
+        .expect("queued conn2 should complete after conn1 drops")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n2]).starts_with("HTTP/1.1 200 OK"));
+    drop(conn2);
+
+    // 3. HTTP/1.1 protocol edges on `--admin-listen`:
+    // `POST /livez` with `Expect: 100-continue` + oversized body returns immediate 405 without `100 Continue`,
+    // and `GET /livez` with WebSocket `Upgrade` headers still answers 200 OK.
+    let admin_port = proxy.admin_port.unwrap();
+    let mut expect_sock = tokio::net::TcpStream::connect(("127.0.0.1", admin_port))
+        .await
+        .unwrap();
+    expect_sock
+        .write_all(
+            b"POST /livez HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 1048576\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(2), expect_sock.read(&mut buf))
+        .await
+        .expect("admin 405 should arrive without waiting for body")
+        .unwrap();
+    let raw_405 = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        raw_405.starts_with("HTTP/1.1 405 Method Not Allowed"),
+        "expected immediate 405 without 100 Continue, got: {raw_405}"
+    );
+    assert!(
+        raw_405.to_ascii_lowercase().contains("allow: get, head"),
+        "missing Allow header in: {raw_405}"
+    );
+    drop(expect_sock);
+
+    let ws_probe_resp = c
+        .request(
+            Request::builder()
+                .method(Method::GET)
+                .uri(proxy.admin_url("/livez"))
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ws_probe_resp.status(), StatusCode::OK);
+    assert_eq!(
+        ws_probe_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+        b"ok"[..]
+    );
+
+    // 4. HTTP/2 (`h2c`) on `--admin-listen`: probes, HEAD stripping on 404, and 405 + Allow.
+    let mut h2 = proxy.open_h2_port(admin_port).await;
+    for (method, path, expected_status, expect_empty_body) in [
+        (Method::GET, "/readyz?foo=bar", StatusCode::OK, false),
+        (Method::HEAD, "/metrics", StatusCode::OK, true),
+        (Method::HEAD, "/unknown", StatusCode::NOT_FOUND, true),
+        (
+            Method::POST,
+            "/livez",
+            StatusCode::METHOD_NOT_ALLOWED,
+            false,
+        ),
+    ] {
+        let req = Request::builder()
+            .version(Version::HTTP_2)
+            .method(method.clone())
+            .uri(proxy.admin_url(path))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = h2.sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), expected_status, "H2 {method} {path}");
+        if expected_status == StatusCode::METHOD_NOT_ALLOWED {
+            assert_eq!(resp.headers()[http::header::ALLOW], "GET, HEAD");
+        }
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.is_empty(), expect_empty_body, "H2 {method} {path}");
+    }
+
+    // 5. HTTP/1.1 admin responses send `Connection: close` and close immediately,
+    // while the open idle `h2c` admin connection from Step 4 drains gracefully via GOAWAY
+    // well before the 3s `shutdown_grace` hard deadline.
+    let mut admin_h1 = tokio::net::TcpStream::connect(("127.0.0.1", admin_port))
+        .await
+        .unwrap();
+    admin_h1
+        .write_all(b"GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut h1_raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), admin_h1.read_to_end(&mut h1_raw))
+        .await
+        .expect("admin HTTP/1.1 socket must close immediately after response")
+        .unwrap();
+    let h1_text = String::from_utf8_lossy(&h1_raw);
+    assert!(h1_text.starts_with("HTTP/1.1 200 OK"), "got: {h1_text}");
+    assert!(
+        h1_text.to_ascii_lowercase().contains("connection: close"),
+        "expected Connection: close on admin HTTP/1.1, got: {h1_text}"
+    );
+    drop(admin_h1);
+
+    tokio::time::timeout(Duration::from_secs(1), proxy.shutdown())
+        .await
+        .expect("idle h2c admin connection must drain gracefully before 3s shutdown_grace");
+    drop(h2);
+}

@@ -13,11 +13,11 @@ nodes and optional **Consensus Layer** (CL) Beacon node pairs (supports both `EL
 
 | Request                              | Forwarded to        |
 |--------------------------------------|---------------------|
-| `GET/HEAD /livez`                    | 200 OK (process liveness) |
-| `GET/HEAD /readyz`                   | Readiness gate (200 / 503; data-plane queries always pass through) |
-| `GET/HEAD /healthz`                  | State snapshot (always 200) |
-| `GET/HEAD /metrics`                  | Prometheus metrics scrape endpoint |
-| `GET/HEAD /eth/v1/node/health`       | ethonyx node health (`200` / `206` or `?syncing_status` / `400` / `503`) if `--mock-cl-node-health` set, else `--cl-beacon-url` (`404` in EL-only mode) |
+| `GET/HEAD /livez`                    | 200 OK (process liveness; served exclusively on `--admin-listen` when set, `404` on `--listen`) |
+| `GET/HEAD /readyz`                   | Readiness gate (200 / 503; data-plane queries always pass through; moved to `--admin-listen` when set) |
+| `GET/HEAD /healthz`                  | State snapshot (always 200; moved to `--admin-listen` when set) |
+| `GET/HEAD /metrics`                  | Prometheus metrics scrape endpoint (moved to `--admin-listen` when set) |
+| `GET/HEAD /eth/v1/node/health`       | ethonyx node health (`200` / `206` or `?syncing_status` / `400` / `503`) if `--mock-cl-node-health` set, else `--cl-beacon-url` (`404` in EL-only mode; always served on `--listen` as a Beacon API endpoint) |
 | `POST /eth/v1/validator/register_validator` | `--cl-mev-relay-url` (rewritten to `/eth/v1/builder/validators`) if set, else `--cl-beacon-url` (`404` in EL-only mode) |
 | `POST /eth/v1/validator/{prepare_beacon_proposer, beacon_committee_subscriptions, sync_committee_subscriptions}` | `200 OK` if `--mock-cl-subscriptions` set, else `--cl-beacon-url` (`404` in EL-only mode) |
 | `/eth/...`, `/lighthouse/...`, `/prysm/...`, `/teku/...`, `/lodestar/...`, `/nimbus/...` | `--cl-beacon-url` (`404` when `--cl-beacon-url` is omitted) |
@@ -165,7 +165,8 @@ frames, and upstream handshakes.
 
 Inbound connections are bounded by `--max-connections` (`ETHONYX_MAX_CONNECTIONS`,
 default `4096`, `0` = unlimited) across all `--listen` addresses (including probe
-endpoints), HTTP/1.1, HTTP/2 (`max_concurrent_streams = 256`,
+endpoints unless `--admin-listen` is configured, in which case `--admin-listen`
+uses its own isolated 64-connection pool), HTTP/1.1, HTTP/2 (`max_concurrent_streams = 256`,
 `keep_alive_interval = 30s`), HTTP/1.1 upgraded WebSockets, and concurrent HTTP/2
 Extended `CONNECT` WebSocket streams (`503 Service Unavailable` when saturated).
 Newly accepted sockets enforce a 15-second initial protocol-preface read timeout
@@ -208,30 +209,44 @@ LB / service mesh in front.
 
 ## Usage
 
-`--el-http-url` is required; all other upstream endpoints (`--el-ws-url`,
-`--cl-beacon-url`, `--cl-mev-relay-url`, `--el-reference-url`, `--otel-endpoint`)
-have no implicit defaults and are enabled only when explicitly provided (`--listen`
-defaults to `0.0.0.0:8547`):
+`--el-http-url` is required; all other optional endpoints (`--admin-listen`,
+`--el-ws-url`, `--cl-beacon-url`, `--cl-mev-relay-url`, `--el-reference-url`,
+`--otel-endpoint`) have no implicit defaults and are enabled only when explicitly
+provided (`--listen` defaults to `0.0.0.0:8547`):
 
 ```sh
 ethonyx \
   --listen 0.0.0.0:8547 \
+  --admin-listen 0.0.0.0:9090 \
   --el-http-url   http://127.0.0.1:8545 \
   --el-ws-url     ws://127.0.0.1:8546 \
   --cl-beacon-url http://127.0.0.1:5052
 ```
 
 Every flag also accepts an `ETHONYX_*` env var (see `ethonyx --help`). To disable an
-optional upstream via environment variables, leave the variable unset rather than
-setting an empty string (`""`), which is rejected as a malformed URL; if a reference
+optional endpoint (`ETHONYX_ADMIN_LISTEN`, `ETHONYX_EL_WS_URL`, etc.) via environment
+variables, leave the variable unset rather than setting an empty string (`""`), which
+is rejected as invalid; if a reference
 URL's query string itself contains a comma, pass repeated `--el-reference-url` CLI
 flags rather than comma-delimiting.
 
+### Dedicated admin/probe listener (`--admin-listen`)
+
+In Kubernetes and high-traffic production deployments, pass `--admin-listen`
+(`ETHONYX_ADMIN_LISTEN`, e.g. `0.0.0.0:9090`) to isolate `/livez`, `/readyz`,
+`/healthz`, and `/metrics` onto a dedicated TCP listener with its own 64-connection
+pool and tight connection limits:
+- **Saturation resilience**: Kubelet probes and Prometheus scrapes remain responsive even when client traffic saturates `--max-connections` on `--listen`. To prevent idle clients from wedging the 64-slot admin pool, `--admin-listen` enforces a `5s` initial-preface and HTTP/1.1 header timeout, disables HTTP/1.1 keep-alive (`Connection: close`), caps HTTP/2 concurrency at `32` streams, bounds total connection lifetime to `10s` (sending a graceful HTTP/2 `GOAWAY` at `9s`), and caps admin shutdown drain at `1s` (or immediately under `--shutdown-grace 0`). Because pool saturation queues subsequent accepts until in-flight slots drain (up to `5s` for silent TCP clients or `10s` for slow/stalled HTTP/1.1 and HTTP/2 connections), restrict `--admin-listen` to cluster-internal or network-policy-scoped traffic rather than exposing it publicly.
+- **Surface isolation**: All valid requests (including `GET`, `HEAD`, `POST`, HTTP/1.1 WebSocket upgrades, and HTTP/2 Extended `CONNECT` WebSockets) to the four probe paths return `404 Not Found` on `--listen` (never forwarded to `--el-http-url` or `--el-ws-url`), while non-WebSocket `CONNECT` and non-origin request targets still return `400 Bad Request`. `--admin-listen` serves only those four paths (`405` with `Allow: GET, HEAD` on unsupported methods; `400` on `CONNECT` or non-origin request targets; `404` on all other paths, including `/eth/v1/node/health`, which remains a Beacon API route on `--listen`).
+- **Metric hygiene**: Connections on `--admin-listen` do not consume `--max-connections`, increment `ethonyx_active_connections{protocol="tcp"}`, or trigger `ethonyx_connection_limit_saturated_total`.
+- When `--admin-listen` is omitted, `--listen` serves probes and data-plane routes together as before.
+
 ### Multi-port listen
 
-`--listen` is repeatable (or comma-separated). All ports serve identical
-routes — useful when some traffic hits the box via LB on one port while
-operators / scrapers reach it directly on another:
+`--listen` is repeatable (or comma-separated). All `--listen` ports serve
+identical routes — useful when some traffic hits the box via LB on one port
+while operators or direct clients (and scrapers when `--admin-listen` is unset)
+reach it on another:
 
 ```sh
 ethonyx \
@@ -242,8 +257,10 @@ ethonyx \
 ETHONYX_LISTEN=0.0.0.0:8547,127.0.0.1:9547 ethonyx ...
 ```
 
-All listeners share a single fair round-robin accept loop and `--max-connections`
-permit pool, so an idle listener never withholds capacity from an active port.
+All `--listen` listeners share a single fair round-robin accept loop and
+`--max-connections` permit pool, so an idle listener never withholds capacity
+from an active port (when `--admin-listen` is configured, it runs its own
+separate accept loop and 64-connection pool).
 
 ## Logging
 
@@ -302,11 +319,11 @@ RUST_LOG=ethonyx=debug,access_log=info ethonyx ...
 
 ## Metrics
 
-ethonyx exports core application and proxy metrics on `GET /metrics`.
+ethonyx exports core application and proxy metrics on `GET /metrics` (on `--admin-listen` when configured, otherwise on `--listen`).
 
 The following metrics are exposed:
-- `ethonyx_active_connections`: Number of currently active client connections (labeled by `protocol`: `tcp` tracks open inbound HTTP/1.1 and HTTP/2 TCP sessions until upgrade handoff or socket close, while `ws` tracks active upgraded HTTP/1.1 and HTTP/2 Extended `CONNECT` WebSocket relays).
-- `ethonyx_connection_limit_saturated_total`: Total number of inbound TCP accepts queued or HTTP/2 Extended `CONNECT` WebSocket streams rejected due to `--max-connections` saturation.
+- `ethonyx_active_connections`: Number of currently active data-plane client connections on `--listen` (labeled by `protocol`: `tcp` tracks open inbound HTTP/1.1 and HTTP/2 TCP sessions until upgrade handoff or socket close, while `ws` tracks active upgraded HTTP/1.1 and HTTP/2 Extended `CONNECT` WebSocket relays; `--admin-listen` probe connections are excluded).
+- `ethonyx_connection_limit_saturated_total`: Total number of inbound TCP accepts queued or HTTP/2 Extended `CONNECT` WebSocket streams rejected due to `--max-connections` saturation on `--listen`.
 - `ethonyx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`; common HTTP status codes have individual series while unlisted codes are grouped under `status="OTHER"`).
 - `ethonyx_proxy_request_duration_seconds`: Explicit-bucket latency histogram of upstream proxied requests (`0.005`–`10`s + `+Inf`, labeled by `upstream`) exported consistently to Prometheus (`_bucket`/`_sum`/`_count` for `histogram_quantile()`) and OpenTelemetry.
 - `ethonyx_response_body_errors_total`: Total number of mid-stream upstream response body failures occurring after response headers were received (labeled by `upstream` as `EL` or `CL`, and `reason` as `idle_timeout` or `upstream_error`, including quiet SSE subscriptions that hit `--sse-idle-timeout`; client-side disconnects while reading the response are excluded; like request counters, each label series is emitted once its first error occurs, so alerts should check `> 0` or account for `absent()` rather than relying solely on `increase()` to catch the first sample).

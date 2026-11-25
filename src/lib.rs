@@ -3,7 +3,7 @@
 //! The binary in `src/main.rs` is a thin wrapper around [`Prepared`]. Callers can
 //! drive the full stack in-process via [`run`] / [`Prepared::run`], or split port
 //! binding from serving via [`Prepared::bind`] and [`Bound::serve`] to inspect
-//! ephemeral [`Bound::local_addrs`] first.
+//! ephemeral [`Bound::local_addrs`] and [`Bound::admin_addr`] first.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -42,7 +42,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Preparation is separate from [`Prepared::bind`] and [`Prepared::run`] so a
 /// binary can build its tracing subscriber from `Prepared::tracer` before the
 /// server starts, and callers using ephemeral `:0` ports can inspect
-/// [`Bound::local_addrs`] before calling [`Bound::serve`].
+/// [`Bound::local_addrs`] and [`Bound::admin_addr`] before calling [`Bound::serve`].
 #[must_use = "Prepared does nothing unless `.bind().await` or `.run(shutdown).await` is called"]
 pub struct Prepared {
     cfg: Config,
@@ -74,7 +74,8 @@ impl Prepared {
     }
 
     /// Warm the initial health snapshot (unless `--trust-upstream` is set) and bind
-    /// every `--listen` TCP socket, returning a [`Bound`] server ready to [`Bound::serve`].
+    /// every `--listen` TCP socket (plus optional `--admin-listen`), returning a
+    /// [`Bound`] server ready to [`Bound::serve`].
     ///
     /// Background health polling and connection acceptance start when [`Bound::serve`]
     /// is polled. If binding fails, any started telemetry providers trigger best-effort
@@ -140,23 +141,47 @@ impl Prepared {
         // No `.await` follows a failed bind: `Prepared::run` races `self.bind()`
         // against `shutdown`, so returning immediately via `?` ensures a concurrent
         // shutdown signal can never overtake and swallow a bind error.
-        let mut listeners = Vec::with_capacity(listen.len());
-        let mut local_addrs = Vec::with_capacity(listen.len());
+        let (listen, admin_listen) = listen.into_parts();
+        let mut resolved_listen = Vec::with_capacity(listen.len());
         for addr in listen {
-            let listener = TcpListener::bind((&*addr.host, addr.port))
-                .await
-                .map_err(|e| format!("failed to bind --listen address '{addr}': {e}"))?;
-            let local_addr = listener
-                .local_addr()
-                .map_err(|e| format!("failed to query local address for '{addr}': {e}"))?;
-            info!(listen = %local_addr, "listening");
+            resolved_listen.push(resolve_listener("--listen", addr).await?);
+        }
+        let mut resolved_admin = match admin_listen {
+            Some(addr) => Some(resolve_listener("--admin-listen", addr).await?),
+            None => None,
+        };
+        config::validate_resolved_addrs(&resolved_listen, resolved_admin.as_ref())?;
+
+        let mut listeners = Vec::with_capacity(resolved_listen.len());
+        let mut local_addrs = Vec::with_capacity(resolved_listen.len());
+        for resolved in &mut resolved_listen {
+            let (listener, local_addr) = bind_listener("--listen", resolved).await?;
+            resolved.set_bound_addr(local_addr);
             listeners.push(listener);
             local_addrs.push(local_addr);
+        }
+        let admin = match &mut resolved_admin {
+            Some(resolved) => {
+                let (listener, local_addr) = bind_listener("--admin-listen", resolved).await?;
+                resolved.set_bound_addr(local_addr);
+                Some((listener, local_addr))
+            }
+            None => None,
+        };
+        config::validate_resolved_addrs(&resolved_listen, resolved_admin.as_ref())?;
+        // Emit `"listening"` only after every listener bind and post-bind overlap check succeeds
+        // so a failed `--admin-listen` bind never leaves misleading `"listening"` logs for dropped sockets.
+        for local_addr in &local_addrs {
+            info!(listen = %local_addr, "listening");
+        }
+        if let Some((_, admin_addr)) = &admin {
+            info!(admin_listen = %admin_addr, "listening");
         }
 
         Ok(Bound {
             listeners,
             local_addrs,
+            admin,
             state,
             poller,
             shutdown_grace,
@@ -164,8 +189,9 @@ impl Prepared {
         })
     }
 
-    /// Bind every `cfg.listen` address, serve all routes, and wait for `shutdown`
-    /// before draining for `cfg.shutdown_grace` seconds and flushing telemetry.
+    /// Bind every `cfg.listen` address (and optional `cfg.admin_listen`), serve all
+    /// routes, and wait for `shutdown` before draining for `cfg.shutdown_grace`
+    /// seconds and flushing telemetry.
     ///
     /// If `shutdown` resolves before [`Prepared::bind`] completes, returns `Ok(())`
     /// immediately without binding any listener or awaiting telemetry flush (any
@@ -196,6 +222,7 @@ impl Prepared {
 pub struct Bound {
     listeners: Vec<TcpListener>,
     local_addrs: Vec<std::net::SocketAddr>,
+    admin: Option<(TcpListener, std::net::SocketAddr)>,
     state: Arc<AppState>,
     poller: Option<health::HealthPoller>,
     shutdown_grace: Duration,
@@ -208,6 +235,14 @@ impl Bound {
         &self.local_addrs
     }
 
+    /// Actual bound socket address for [`Config::admin_listen`], if configured.
+    pub const fn admin_addr(&self) -> Option<std::net::SocketAddr> {
+        match &self.admin {
+            Some((_, addr)) => Some(*addr),
+            None => None,
+        }
+    }
+
     /// Serve all bound listeners until `shutdown` resolves, then drain active
     /// connections for `cfg.shutdown_grace` seconds and shut down telemetry.
     pub async fn serve<F>(self, shutdown: F) -> Result<(), BoxError>
@@ -217,6 +252,7 @@ impl Bound {
         let Self {
             listeners,
             local_addrs: _,
+            admin,
             state,
             poller,
             shutdown_grace,
@@ -225,51 +261,57 @@ impl Bound {
 
         let (shutdown_tx, lifecycle, drain) = lifecycle::channel();
         let mut poller = poller.map(|p| p.spawn(Arc::clone(&state), lifecycle.shutdown()));
-        let mut accept_handle = tokio::spawn(server::accept_loop(listeners, state, lifecycle));
-
-        enum ServeExit {
-            Shutdown,
-            Accept(Result<(), tokio::task::JoinError>),
-            Poller(Result<(), tokio::task::JoinError>),
-        }
+        let probes = if admin.is_some() {
+            proxy::ListenProbes::Hidden
+        } else {
+            proxy::ListenProbes::Serve
+        };
+        let mut admin_handle = admin.map(|(listener, _)| {
+            tokio::spawn(server::accept_admin_loop(
+                listener,
+                Arc::clone(&state),
+                lifecycle.clone(),
+            ))
+        });
+        let mut accept_handle = Some(tokio::spawn(server::accept_loop(
+            listeners, state, lifecycle, probes,
+        )));
 
         tokio::pin!(shutdown);
-        let exit = tokio::select! {
+        let (first_res, unexpected) = tokio::select! {
             biased;
             () = &mut shutdown => {
                 info!("shutdown signal received");
-                ServeExit::Shutdown
+                (Ok(()), None)
             }
-            res = &mut accept_handle => {
+            Some(res) = OptionFuture::from(accept_handle.as_mut()) => {
+                accept_handle = None;
                 warn!("accept loop exited unexpectedly; shutting down");
-                ServeExit::Accept(res)
+                (res, Some("accept loop exited unexpectedly"))
+            }
+            Some(res) = OptionFuture::from(admin_handle.as_mut()), if admin_handle.is_some() => {
+                admin_handle = None;
+                warn!("admin accept loop exited unexpectedly; shutting down");
+                (res, Some("admin accept loop exited unexpectedly"))
             }
             Some(res) = OptionFuture::from(poller.as_mut()), if poller.is_some() => {
+                poller = None;
                 warn!("health poller exited unexpectedly; shutting down");
-                ServeExit::Poller(res)
+                (res, Some("health poller exited unexpectedly"))
             }
         };
 
         let deadline = tokio::time::Instant::now() + shutdown_grace;
         shutdown_tx.send(deadline);
 
-        let (accept_res, poller_res, unexpected) = match exit {
-            ServeExit::Shutdown => {
-                let (a, p) = tokio::join!(accept_handle, OptionFuture::from(poller));
-                (a, p, None)
-            }
-            ServeExit::Accept(a) => (
-                a,
-                OptionFuture::from(poller).await,
-                Some("accept loop exited unexpectedly"),
-            ),
-            ServeExit::Poller(p) => (
-                accept_handle.await,
-                Some(p),
-                Some("health poller exited unexpectedly"),
-            ),
-        };
-        let outcome: Result<(), BoxError> = accept_res
+        let (accept_res, admin_res, poller_res) = tokio::join!(
+            OptionFuture::from(accept_handle),
+            OptionFuture::from(admin_handle),
+            OptionFuture::from(poller),
+        );
+        let outcome: Result<(), BoxError> = first_res
+            .and_then(|()| accept_res.unwrap_or(Ok(())))
+            .and_then(|()| admin_res.unwrap_or(Ok(())))
             .and_then(|()| poller_res.unwrap_or(Ok(())))
             .map_err(BoxError::from)
             .and_then(|()| match unexpected {
@@ -285,6 +327,80 @@ impl Bound {
 
         telemetry.shutdown().await;
         outcome
+    }
+}
+
+async fn resolve_listener(
+    flag: &'static str,
+    addr: config::ListenAddr,
+) -> Result<config::ResolvedListen, BoxError> {
+    match addr.resolve_target() {
+        config::ResolveTarget::Literal(sa) => Ok(config::ResolvedListen::single(addr, sa)),
+        config::ResolveTarget::Lookup(host, port) => {
+            let addrs: Vec<_> = tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|e| format!("failed to resolve {flag} address '{addr}': {e}"))?
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!(
+                    "failed to resolve {flag} address '{addr}': no addresses returned"
+                )
+                .into());
+            }
+            Ok(config::ResolvedListen::many(addr, addrs))
+        }
+    }
+}
+
+fn format_bind_error(
+    flag: &'static str,
+    resolved: &config::ResolvedListen,
+    sa: std::net::SocketAddr,
+    e: &std::io::Error,
+) -> BoxError {
+    if matches!(
+        resolved.configured().resolve_target(),
+        config::ResolveTarget::Literal(_)
+    ) {
+        format!("failed to bind {flag} address '{resolved}': {e}").into()
+    } else {
+        format!("failed to bind {flag} address '{resolved}' ({sa}): {e}").into()
+    }
+}
+
+fn should_fail_fast_bind(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+async fn bind_listener(
+    flag: &'static str,
+    resolved: &config::ResolvedListen,
+) -> Result<(TcpListener, std::net::SocketAddr), BoxError> {
+    let mut last_err = None;
+    for &sa in resolved.addrs() {
+        match TcpListener::bind(sa).await {
+            Ok(listener) => {
+                let local_addr = listener.local_addr().map_err(|e| {
+                    format!("failed to query local {flag} address for '{resolved}': {e}")
+                })?;
+                return Ok((listener, local_addr));
+            }
+            // Fail fast on address/port occupancy or policy denial rather than falling
+            // back to a sibling A/AAAA record (which would cause dual-stack split-brain).
+            Err(e) if should_fail_fast_bind(&e) => {
+                return Err(format_bind_error(flag, resolved, sa, &e));
+            }
+            Err(e) => last_err = Some((sa, e)),
+        }
+    }
+    match last_err {
+        Some((sa, e)) => Err(format_bind_error(flag, resolved, sa, &e)),
+        None => Err(
+            format!("failed to bind {flag} address '{resolved}': no candidate addresses").into(),
+        ),
     }
 }
 
@@ -376,6 +492,7 @@ mod tests {
             "0",
         ]);
         let bound = Prepared::new(cfg).await.unwrap().bind().await.unwrap();
+        assert!(bound.admin_addr().is_none());
         let [a0, a1] = bound.local_addrs() else {
             panic!("expected two bound addresses");
         };
@@ -401,5 +518,206 @@ mod tests {
 
         let _ = tx.send(());
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_bind_binds_admin_addr_and_rolls_back_on_admin_bind_failure() {
+        use clap::Parser;
+
+        // Ephemeral `--admin-listen 127.0.0.1:0` gets its own distinct non-zero port.
+        let cfg = Config::parse_from([
+            "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
+            "--admin-listen",
+            "127.0.0.1:0",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+            "--shutdown-grace",
+            "0",
+        ]);
+        let bound = Prepared::new(cfg).await.unwrap().bind().await.unwrap();
+        let admin_addr = bound.admin_addr().expect("admin_addr must be bound");
+        assert_ne!(admin_addr.port(), 0);
+        assert_ne!(admin_addr.port(), bound.local_addrs()[0].port());
+        drop(bound);
+
+        // If `--admin-listen` fails to bind after `--listen` succeeds, the error cites
+        // `--admin-listen` and the already-bound `--listen` port is released immediately.
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let listen_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let free_listen_addr = listen_probe.local_addr().unwrap();
+        drop(listen_probe);
+
+        let fail_cfg = Config::parse_from([
+            "ethonyx",
+            "--listen",
+            &free_listen_addr.to_string(),
+            "--admin-listen",
+            &occupied_addr.to_string(),
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+        ]);
+        let err = Prepared::new(fail_cfg)
+            .await
+            .unwrap()
+            .bind()
+            .await
+            .err()
+            .expect("occupied admin port must fail bind")
+            .to_string();
+        assert!(err.contains("--admin-listen"), "unexpected error: {err}");
+        // The `--listen` socket was dropped on rollback and can be bound again immediately.
+        let rebound = TcpListener::bind(free_listen_addr).await;
+        assert!(rebound.is_ok(), "rollback should release --listen socket");
+        drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn prepared_bind_rejects_resolved_hostname_conflicts_and_allows_ephemeral_zero() {
+        use clap::Parser;
+
+        let resolved: Vec<_> = tokio::net::lookup_host(("localhost", 0))
+            .await
+            .expect("localhost must resolve")
+            .collect();
+        let has_v4 = resolved.iter().any(|a| a.is_ipv4());
+        let has_v6 = resolved.iter().any(|a| a.is_ipv6());
+        assert!(has_v4 || has_v6, "localhost resolved to no addresses");
+
+        // Pre-bind resolved candidate validation rejects hostname overlaps across both
+        // planes and within `--listen` before any socket is opened (zero-TOCTOU).
+        let mut cross_cases = Vec::new();
+        let mut same_cases = Vec::new();
+        if has_v4 {
+            cross_cases.extend(["0.0.0.0:8547", "127.0.0.1:8547"]);
+            same_cases.push(("0.0.0.0:8547,localhost:8547", "conflicts with"));
+        }
+        if has_v6 {
+            cross_cases.push("[::1]:8547");
+            same_cases.push(("[::]:8547,localhost:8547", "conflicts with"));
+        }
+        for listen_spec in cross_cases {
+            let cfg = Config::parse_from([
+                "ethonyx",
+                "--listen",
+                listen_spec,
+                "--admin-listen",
+                "localhost:8547",
+                "--el-http-url",
+                "http://127.0.0.1:8545",
+                "--trust-upstream",
+            ]);
+            let err = Prepared::new(cfg)
+                .await
+                .unwrap()
+                .bind()
+                .await
+                .err()
+                .expect("hostname overlapping --listen must fail pre-bind")
+                .to_string();
+            assert!(
+                err.contains("--admin-listen") && err.contains("conflicts with --listen"),
+                "unexpected error for {listen_spec}: {err}"
+            );
+        }
+        for (listen_spec, expected) in same_cases {
+            let cfg = Config::parse_from([
+                "ethonyx",
+                "--listen",
+                listen_spec,
+                "--el-http-url",
+                "http://127.0.0.1:8545",
+                "--trust-upstream",
+            ]);
+            let err = Prepared::new(cfg)
+                .await
+                .unwrap()
+                .bind()
+                .await
+                .err()
+                .expect("same-plane hostname overlap must fail pre-bind")
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "unexpected error for {listen_spec}: {err}"
+            );
+        }
+
+        // Ephemeral `:0` ports on `localhost` remain permitted across both planes and
+        // receive distinct kernel-assigned ports.
+        let cfg = Config::parse_from([
+            "ethonyx",
+            "--listen",
+            "localhost:0",
+            "--admin-listen",
+            "localhost:0",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+        ]);
+        let bound = Prepared::new(cfg).await.unwrap().bind().await.unwrap();
+        let data_port = bound.local_addrs()[0].port();
+        let admin_port = bound.admin_addr().expect("admin_addr must be bound").port();
+        assert_ne!(data_port, 0);
+        assert_ne!(admin_port, 0);
+        assert_ne!(data_port, admin_port);
+    }
+
+    #[tokio::test]
+    async fn bind_listener_fails_fast_on_addr_in_use_and_falls_back_on_unavailable_family() {
+        use std::io::{Error, ErrorKind};
+
+        // Pure OS-independent check for fail-fast vs family-fallback error classification.
+        assert!(should_fail_fast_bind(&Error::from(ErrorKind::AddrInUse)));
+        assert!(should_fail_fast_bind(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!should_fail_fast_bind(&Error::from(
+            ErrorKind::AddrNotAvailable
+        )));
+        assert!(!should_fail_fast_bind(&Error::from(ErrorKind::Unsupported)));
+        assert!(!should_fail_fast_bind(&Error::other("family unavailable")));
+
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let free_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let free_addr = free_probe.local_addr().unwrap();
+        drop(free_probe);
+
+        let (mut parsed, _) = config::ListenPlan::parse(&["localhost:8547".to_owned()], None)
+            .unwrap()
+            .into_parts();
+        let resolved =
+            config::ResolvedListen::many(parsed.pop().unwrap(), vec![occupied_addr, free_addr]);
+        let err = bind_listener("--admin-listen", &resolved)
+            .await
+            .expect_err("AddrInUse must fail fast instead of falling back")
+            .to_string();
+        assert!(
+            err.contains("--admin-listen") && err.contains(&occupied_addr.to_string()),
+            "unexpected error: {err}"
+        );
+        drop(occupied);
+
+        // On hosts without `net.ipv4.ip_nonlocal_bind = 1`, verify live fallback from an
+        // unassignable address (`AddrNotAvailable`) to the subsequent loopback candidate.
+        let unroutable: std::net::SocketAddr = "192.0.2.1:0".parse().unwrap();
+        if TcpListener::bind(unroutable).await.is_err() {
+            let (mut parsed, _) = config::ListenPlan::parse(&["localhost:0".to_owned()], None)
+                .unwrap()
+                .into_parts();
+            let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let resolved =
+                config::ResolvedListen::many(parsed.pop().unwrap(), vec![unroutable, loopback]);
+            let (_listener, local) = bind_listener("--listen", &resolved)
+                .await
+                .expect("AddrNotAvailable should fall back to loopback candidate");
+            assert!(local.ip().is_loopback());
+            assert_ne!(local.port(), 0);
+        }
     }
 }

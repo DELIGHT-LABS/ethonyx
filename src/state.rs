@@ -42,7 +42,7 @@ impl ConnPermitGuard {
 }
 
 impl ConnLimit {
-    fn new(max: Option<NonZeroUsize>) -> Self {
+    pub(crate) fn new(max: Option<NonZeroUsize>) -> Self {
         Self(max.map(|max| BoundedLimit {
             sem: Arc::new(Semaphore::new(max.get())),
             max,
@@ -57,7 +57,7 @@ impl ConnLimit {
     }
 
     /// Try to claim a permit without blocking.
-    fn try_acquire(&self) -> Option<ConnPermitGuard> {
+    pub(crate) fn try_acquire(&self) -> Option<ConnPermitGuard> {
         let Some(bounded) = &self.0 else {
             return Some(ConnPermitGuard::unlimited());
         };
