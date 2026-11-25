@@ -643,7 +643,7 @@ mod tests {
             parsed.max_connections,
             parsed.upstreams,
             parsed.health,
-            crate::metrics::ServerMetrics::default(),
+            crate::metrics::ServerMetrics::disabled(),
         )
         .await;
         let tcp_permit = state.try_acquire_permit().unwrap();
@@ -700,7 +700,7 @@ mod tests {
             unlimited.max_connections,
             unlimited.upstreams,
             unlimited.health,
-            crate::metrics::ServerMetrics::default(),
+            crate::metrics::ServerMetrics::disabled(),
         )
         .await;
         let unlimited_conn = WsConn::new(

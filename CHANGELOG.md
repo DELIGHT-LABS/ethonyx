@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `--max-connections` (`ETHONYX_MAX_CONNECTIONS`, default `4096`, `0` = unlimited) shared semaphore backpressure across all `--listen` ports, HTTP/1.1, HTTP/2, HTTP/1.1 upgraded WebSockets, and concurrent HTTP/2 Extended `CONNECT` WebSocket streams (with `ethonyx_connection_limit_saturated_total`), plus a `15s` initial protocol-preface read timeout and `65s` HTTP/1.1 header/keep-alive idle timeout.
 - Add `mode` (`"probed"` | `"trusted"`) to `/healthz` (`HealthSnapshot`), reporting honest unpolled state under `--trust-upstream` without fabricated peer counts or gauges.
 - Propagate W3C `traceparent` context on upstream WebSocket handshakes when `otel` is enabled.
-- Add `Prepared::bind()` and `Bound` (`local_addrs()`, `serve()`) library lifecycle entry points for race-free ephemeral listener binding (`127.0.0.1:0`), log resolved kernel socket addresses on startup, and isolate Prometheus/OpenTelemetry metric registries and idle-bucket upkeep per server instance without process-global `opentelemetry::global` or `metrics` state.
+- Add `Prepared::bind()` and `Bound` (`local_addrs()`, `serve()`) library lifecycle entry points for race-free ephemeral listener binding (`127.0.0.1:0`), log resolved kernel socket addresses on startup, and isolate lock-free atomic Prometheus and OpenTelemetry metric registries per server instance without process-global `opentelemetry::global` or `metrics` state (removing `metrics` and `metrics-exporter-prometheus` along with the 5-second upkeep loop and rendering `/metrics` in deterministic family/series order without blank separator lines).
 
 ### Changed
 

@@ -225,18 +225,7 @@ impl Bound {
 
         let (shutdown_tx, lifecycle, drain) = lifecycle::channel();
         let mut poller = poller.map(|p| p.spawn(Arc::clone(&state), lifecycle.shutdown()));
-
-        let prometheus = state.metrics.prometheus_handle();
         let mut accept_handle = tokio::spawn(server::accept_loop(listeners, state, lifecycle));
-
-        // Prometheus idle-bucket upkeep belongs to the serving task itself: it runs
-        // while this server waits for shutdown and needs no task of its own.
-        const UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
-        let mut upkeep = tokio::time::interval_at(
-            tokio::time::Instant::now() + UPKEEP_INTERVAL,
-            UPKEEP_INTERVAL,
-        );
-        upkeep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         enum ServeExit {
             Shutdown,
@@ -245,25 +234,21 @@ impl Bound {
         }
 
         tokio::pin!(shutdown);
-        let exit = loop {
-            tokio::select! {
-                biased;
-                () = &mut shutdown => {
-                    info!("shutdown signal received");
-                    break ServeExit::Shutdown;
-                }
-                res = &mut accept_handle => {
-                    warn!("accept loop exited unexpectedly; shutting down");
-                    break ServeExit::Accept(res);
-                }
-                Some(res) = OptionFuture::from(poller.as_mut()), if poller.is_some() => {
-                    warn!("health poller exited unexpectedly; shutting down");
-                    break ServeExit::Poller(res);
-                }
-                _ = upkeep.tick() => prometheus.run_upkeep(),
+        let exit = tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                info!("shutdown signal received");
+                ServeExit::Shutdown
+            }
+            res = &mut accept_handle => {
+                warn!("accept loop exited unexpectedly; shutting down");
+                ServeExit::Accept(res)
+            }
+            Some(res) = OptionFuture::from(poller.as_mut()), if poller.is_some() => {
+                warn!("health poller exited unexpectedly; shutting down");
+                ServeExit::Poller(res)
             }
         };
-        drop(prometheus);
 
         let deadline = tokio::time::Instant::now() + shutdown_grace;
         shutdown_tx.send(deadline);

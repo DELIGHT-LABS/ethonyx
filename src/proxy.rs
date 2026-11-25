@@ -898,7 +898,7 @@ mod tests {
             http_only.max_connections,
             http_only.upstreams,
             http_only.health,
-            crate::metrics::ServerMetrics::default(),
+            crate::metrics::ServerMetrics::disabled(),
         )
         .await;
         let http_permit = http_state.try_acquire_permit().unwrap();
@@ -931,7 +931,7 @@ mod tests {
             unlimited.max_connections,
             unlimited.upstreams,
             unlimited.health,
-            crate::metrics::ServerMetrics::default(),
+            crate::metrics::ServerMetrics::disabled(),
         )
         .await;
         assert_eq!(unlimited_state.conn_limit.max(), None);
@@ -956,7 +956,7 @@ mod tests {
             parsed.max_connections,
             parsed.upstreams,
             parsed.health,
-            crate::metrics::ServerMetrics::default(),
+            crate::metrics::ServerMetrics::disabled(),
         )
         .await;
         state.metrics.inc_saturated();
@@ -1006,7 +1006,7 @@ mod tests {
             parsed.max_connections,
             parsed.upstreams,
             parsed.health,
-            crate::metrics::ServerMetrics::default(),
+            crate::metrics::ServerMetrics::disabled(),
         )
         .await;
         let cl = state.cl.as_ref().expect("CL must be configured");
@@ -1129,7 +1129,7 @@ mod tests {
             default_cl.max_connections,
             default_cl.upstreams,
             default_cl.health,
-            crate::metrics::ServerMetrics::default(),
+            crate::metrics::ServerMetrics::disabled(),
         )
         .await;
         let plain_cl = default_state.cl.as_ref().expect("CL must be configured");

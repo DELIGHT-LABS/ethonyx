@@ -9,7 +9,7 @@ use std::time::Duration;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 
-pub(crate) use metrics::{OtelActiveGuard, OtelMetrics};
+pub(crate) use metrics::OtelMetrics;
 pub(crate) use propagation::{attach_parent_context, mark_span_error, propagate_context};
 
 const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");

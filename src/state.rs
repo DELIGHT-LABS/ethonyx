@@ -104,7 +104,7 @@ pub(crate) struct AppState {
     pub(crate) cl: Option<ClState>,
     pub(crate) conn_limit: ConnLimit,
     pub(crate) health: HealthSource,
-    pub(crate) metrics: ServerMetrics,
+    pub(crate) metrics: Arc<ServerMetrics>,
 }
 
 impl AppState {
@@ -115,7 +115,7 @@ impl AppState {
         max_connections: Option<NonZeroUsize>,
         upstreams: ValidatedUpstreams,
         health: HealthMode,
-        metrics: ServerMetrics,
+        metrics: Arc<ServerMetrics>,
     ) -> (Arc<Self>, Option<HealthPoller>) {
         let ValidatedUpstreams { el_http, el_ws, cl } = upstreams;
         let trust_upstream = matches!(health, HealthMode::Trusted);
