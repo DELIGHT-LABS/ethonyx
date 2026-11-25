@@ -25,8 +25,6 @@ serde_json = { version = "1.0.154", features = ["raw_value"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 # Keep `smallvec` (avoids heap Vec fallback in JSON span/filter paths) and `tracing-log` (rustls/tungstenite bridge).
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "smallvec", "fmt", "json", "env-filter", "tracing-log"] }
-metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.18", default-features = false }
 rustls = { version = "0.23.46" }
 socket2 = "0.6"
 opentelemetry = { version = "0.33.1", optional = true, default-features = false, features = ["trace", "metrics"] }

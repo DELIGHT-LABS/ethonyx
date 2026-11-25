@@ -9,7 +9,6 @@ accepted = [
     "CDLA-Permissive-2.0",
     "ISC",
     "Unicode-3.0",
-    "Zlib",
 ]
 
 # Development dependencies are not distributed. Retain build dependencies:

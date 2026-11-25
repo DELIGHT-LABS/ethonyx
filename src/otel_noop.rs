@@ -1,33 +1,29 @@
 //! Zero-sized stand-ins for `otel/` when the `otel` feature is disabled,
 //! keeping lifecycle, config, metrics, and request paths free of scattered `#[cfg]` gates.
 
-use crate::metrics::{ConnProtocol, HealthInstrument, UpstreamLayer};
+use std::time::Duration;
 
-pub(crate) struct OtelActiveGuard;
-
-impl OtelActiveGuard {
-    pub(crate) const fn add(&self, _delta: i64) {}
-}
+use crate::metrics::{ConnProtocol, HealthInstrument, MethodBucket, StatusSlot, UpstreamLayer};
 
 pub(crate) struct OtelMetrics;
+
+const _: () = assert!(std::mem::size_of::<OtelMetrics>() == 0);
 
 impl OtelMetrics {
     pub(crate) const fn disabled() -> Self {
         Self
     }
 
-    pub(crate) const fn active_guard(&self, _protocol: ConnProtocol) -> OtelActiveGuard {
-        OtelActiveGuard
-    }
+    pub(crate) const fn add_active(&self, _protocol: ConnProtocol, _delta: i64) {}
 
     pub(crate) const fn inc_saturated(&self) {}
 
     pub(crate) const fn record_request(
         &self,
-        _upstream: &'static str,
-        _method: &'static str,
-        _status: &'static str,
-        _secs: f64,
+        _layer: UpstreamLayer,
+        _method: MethodBucket,
+        _status: StatusSlot,
+        _elapsed: Duration,
     ) {
     }
 
@@ -44,7 +40,7 @@ pub(crate) struct Telemetry;
 
 impl Telemetry {
     pub(crate) const fn metrics(&self) -> OtelMetrics {
-        OtelMetrics
+        OtelMetrics::disabled()
     }
 
     pub(crate) async fn shutdown(self) {}

@@ -1,27 +1,15 @@
 //! Typed OpenTelemetry metric instruments mirroring `crate::metrics::ServerMetrics`.
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use opentelemetry::KeyValue;
 
 use crate::metrics::{
     ACTIVE_CONNECTIONS, CONNECTION_LIMIT_SATURATED, ConnProtocol, HealthInstrument,
-    LATENCY_BUCKETS, PROXY_REQUEST_DURATION, PROXY_REQUESTS_TOTAL, UpstreamLayer,
+    LATENCY_BUCKET_BOUNDS, MethodBucket, PROXY_REQUEST_DURATION, PROXY_REQUESTS_TOTAL, StatusSlot,
+    UpstreamLayer,
 };
-
-/// Detached active-connection up-down counter handle carried inside
-/// `ActiveGauge` / `ActiveConnectionGuard` without retaining `Arc<AppState>`.
-pub(crate) struct OtelActiveGuard(
-    Option<(opentelemetry::metrics::UpDownCounter<i64>, ConnProtocol)>,
-);
-
-impl OtelActiveGuard {
-    pub(crate) fn add(&self, delta: i64) {
-        if let Some((counter, protocol)) = &self.0 {
-            counter.add(delta, &[KeyValue::new("protocol", protocol.as_str())]);
-        }
-    }
-}
 
 struct OtelMetricsInner {
     meter: opentelemetry::metrics::Meter,
@@ -50,7 +38,12 @@ impl OtelMetrics {
         let duration = meter
             .f64_histogram(PROXY_REQUEST_DURATION)
             .with_unit("s")
-            .with_boundaries(LATENCY_BUCKETS.to_vec())
+            .with_boundaries(
+                LATENCY_BUCKET_BOUNDS
+                    .iter()
+                    .map(Duration::as_secs_f64)
+                    .collect(),
+            )
             .build();
         let requests = meter.u64_counter(PROXY_REQUESTS_TOTAL).build();
         Self(Some(Box::new(OtelMetricsInner {
@@ -63,12 +56,11 @@ impl OtelMetrics {
         })))
     }
 
-    pub(crate) fn active_guard(&self, protocol: ConnProtocol) -> OtelActiveGuard {
-        OtelActiveGuard(
-            self.0
-                .as_ref()
-                .map(|m| (m.active_connections.clone(), protocol)),
-        )
+    pub(crate) fn add_active(&self, protocol: ConnProtocol, delta: i64) {
+        if let Some(m) = &self.0 {
+            m.active_connections
+                .add(delta, &[KeyValue::new("protocol", protocol.as_str())]);
+        }
     }
 
     pub(crate) fn inc_saturated(&self) {
@@ -81,21 +73,24 @@ impl OtelMetrics {
 
     pub(crate) fn record_request(
         &self,
-        upstream: &'static str,
-        method: &'static str,
-        status: &'static str,
-        secs: f64,
+        layer: UpstreamLayer,
+        method: MethodBucket,
+        status: StatusSlot,
+        elapsed: Duration,
     ) {
         if let Some(m) = &self.0 {
-            m.duration
-                .record(secs, &[KeyValue::new("upstream", upstream)]);
+            let upstream = layer.as_str();
+            m.duration.record(
+                elapsed.as_secs_f64(),
+                &[KeyValue::new("upstream", upstream)],
+            );
             // Keep keys sorted ascending so `opentelemetry_sdk`'s `ValueMap` retains one
             // `Vec<KeyValue>` entry per series instead of both unsorted and sorted copies.
             m.requests.add(
                 1,
                 &[
-                    KeyValue::new("method", method),
-                    KeyValue::new("status", status),
+                    KeyValue::new("method", method.as_str()),
+                    KeyValue::new("status", status.as_str()),
                     KeyValue::new("upstream", upstream),
                 ],
             );
@@ -189,17 +184,23 @@ impl opentelemetry_sdk::metrics::exporter::PushMetricExporter for SnapshotExport
                             "s",
                             "duration histogram must declare second unit"
                         );
-                        let pts = hist
-                            .data_points()
-                            .map(|p| {
-                                let bounds: Vec<f64> = p.bounds().collect();
-                                assert_eq!(
-                                    bounds, LATENCY_BUCKETS,
-                                    "OTel histogram boundaries must match Prometheus LATENCY_BUCKETS"
-                                );
-                                (p.attributes().cloned().collect(), p.count() as f64)
-                            })
-                            .collect();
+                        let mut pts = Vec::new();
+                        let mut sum_pts = Vec::new();
+                        for p in hist.data_points() {
+                            let bounds: Vec<f64> = p.bounds().collect();
+                            let expected: Vec<f64> = LATENCY_BUCKET_BOUNDS
+                                .iter()
+                                .map(Duration::as_secs_f64)
+                                .collect();
+                            assert_eq!(
+                                bounds, expected,
+                                "OTel histogram boundaries must match Prometheus LATENCY_BUCKET_BOUNDS"
+                            );
+                            let attrs: Vec<KeyValue> = p.attributes().cloned().collect();
+                            sum_pts.push((attrs.clone(), p.sum()));
+                            pts.push((attrs, p.count() as f64));
+                        }
+                        out.push((format!("{name}_sum"), "histogram_sum", sum_pts));
                         ("histogram", pts)
                     }
                     other => panic!("unexpected metric aggregation: {other:?}"),
@@ -249,8 +250,8 @@ mod tests {
         // Open and immediately drop a WS connection to verify symmetrical +1 / -1.
         drop(server_metrics.ws_slot().activate());
         server_metrics.inc_saturated();
-        // Exercise both common and edge method/status buckets twice each so OnceLock
-        // caching and OTel SDK stream deduplication are verified end-to-end.
+        // Exercise both common and edge method/status buckets twice each so direct atomic
+        // indexing and OTel SDK stream deduplication are verified end-to-end.
         for _ in 0..2 {
             server_metrics.record_request(
                 crate::metrics::UpstreamLayer::El,
@@ -271,6 +272,13 @@ mod tests {
                 Duration::from_millis(2),
             );
         }
+        // Untracked status codes collapse into `status="OTHER"` on OTel as well as Prometheus.
+        server_metrics.record_request(
+            crate::metrics::UpstreamLayer::El,
+            crate::metrics::MethodBucket::Get,
+            418,
+            Duration::from_millis(1),
+        );
         {
             use crate::metrics::HealthGauge as G;
             // Register CL peers first while leaving EL peers unset: OTel must NOT emit
@@ -297,7 +305,7 @@ mod tests {
             server_metrics.set_health(G::ElPeers, 0.0);
         }
 
-        // Dropping `tcp_guard` exercises the retained `OtelActiveGuard` handle.
+        // Dropping `tcp_guard` exercises the `-1` OTel active-connection update.
         drop(tcp_guard);
         provider.force_flush().unwrap();
         provider.shutdown().unwrap();
@@ -388,13 +396,36 @@ mod tests {
                     &[("method", "OTHER"), ("status", "429"), ("upstream", "EL")],
                     2.0,
                 ),
+                (
+                    &[("method", "GET"), ("status", "OTHER"), ("upstream", "EL")],
+                    1.0,
+                ),
             ],
         );
         assert_metric(
             "ethonyx_proxy_request_duration_seconds",
             "histogram",
-            &[(&[("upstream", "EL")], 4.0), (&[("upstream", "CL")], 2.0)],
+            &[(&[("upstream", "EL")], 5.0), (&[("upstream", "CL")], 2.0)],
         );
+        let hist_sum = snapshots
+            .iter()
+            .find(|(n, kind, _)| {
+                n == "ethonyx_proxy_request_duration_seconds_sum" && *kind == "histogram_sum"
+            })
+            .expect("duration histogram sum exported");
+        // EL: 2*5ms + 2*2ms + 1ms = 0.015s; CL: 2*3ms = 0.006s (catches seconds vs ms drift).
+        for (upstream, expected_sum) in [("EL", 0.015_f64), ("CL", 0.006_f64)] {
+            let kvs = vec![KeyValue::new("upstream", upstream)];
+            let (_, actual) = hist_sum
+                .2
+                .iter()
+                .find(|(attrs, _)| *attrs == kvs)
+                .unwrap_or_else(|| panic!("missing histogram sum for {upstream}"));
+            assert!(
+                (*actual - expected_sum).abs() < 1e-9,
+                "OTel histogram sum for {upstream} must be in seconds: expected {expected_sum}, got {actual}"
+            );
+        }
         let saturated = assert_metric(
             "ethonyx_connection_limit_saturated_total",
             "u64_monotonic_sum",
@@ -422,7 +453,7 @@ mod tests {
             assert_metric(name, "gauge", &[(&[], val)]);
         }
 
-        // `ServerMetrics` mirrors the same series to the primary Prometheus handle.
+        // `ServerMetrics` renders the same series directly in Prometheus text format.
         let prom = server_metrics.render_prometheus();
         assert!(prom.contains("ethonyx_connection_limit_saturated_total 1"));
         assert!(prom.contains(
