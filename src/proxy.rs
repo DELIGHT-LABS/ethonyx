@@ -35,12 +35,22 @@ enum ConnPermit {
     Shared(WsConn),
 }
 
+/// Whether the data-plane `--listen` socket serves `/livez`, `/readyz`,
+/// `/healthz`, and `/metrics` locally (`Serve`), or hides them behind `404`
+/// because a dedicated `--admin-listen` listener owns the control plane (`Hidden`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListenProbes {
+    Serve,
+    Hidden,
+}
+
 /// Connection-owned state. Requests clone one Arc; detached WebSocket relays
 /// retain only the shared lifecycle token and permit (never `Arc<AppState>`).
 pub(crate) struct Connection {
     state: Arc<AppState>,
     peer: SocketAddr,
     permit: ConnPermit,
+    probes: ListenProbes,
 }
 
 impl Connection {
@@ -49,6 +59,7 @@ impl Connection {
         lifecycle: &crate::lifecycle::Lifecycle,
         peer: SocketAddr,
         permit: ConnPermitGuard,
+        probes: ListenProbes,
     ) -> Self {
         let permit = if state.el_ws.is_some() {
             ConnPermit::Shared(WsConn::new(permit, lifecycle.clone()))
@@ -59,6 +70,7 @@ impl Connection {
             state,
             peer,
             permit,
+            probes,
         }
     }
 
@@ -68,22 +80,17 @@ impl Connection {
     ) -> Result<Response<ResBody>, Infallible> {
         let is_head = req.method() == Method::HEAD;
         let version = req.version();
-        // Hyper's HTTP/2 server does not suppress bodies for `Method::HEAD` (unlike
-        // HTTP/1.1, which preserves local `text_response` `Content-Length` while
-        // omitting body bytes on the wire), so strip non-empty bodies on HTTP/2
-        // `HEAD` here while keeping all response headers intact.
-        let strip_head_body = is_head && version == Version::HTTP_2;
         let finish = |mut resp: Response<ResBody>| {
-            if strip_head_body && !resp.body().is_end_stream() {
-                *resp.body_mut() = empty_body();
-            }
+            strip_h2_head_body(is_head, version, &mut resp);
             Ok(resp)
         };
         // The same decision drives routing, metrics and access logs. GET/HEAD
-        // probes, unconfigured CL/WS routes, and invalid targets return locally
+        // probes (or all valid requests to probe paths when `--admin-listen`
+        // is set), unconfigured CL/WS routes, and invalid targets return locally
         // without upstream metrics/spans.
-        let forward = match classify_request(&req) {
+        let forward = match classify_request(&req, self.probes) {
             Route::Probe(probe) => return Ok(probe.response(is_head, &self.state)),
+            Route::NotFound => return finish(text_response(StatusCode::NOT_FOUND, "not found")),
             Route::Reject => {
                 return finish(text_response(
                     StatusCode::BAD_REQUEST,
@@ -162,9 +169,43 @@ impl Connection {
     }
 }
 
+/// Hyper's HTTP/2 server does not suppress bodies for `Method::HEAD` (unlike
+/// HTTP/1.1, which preserves local `text_response` `Content-Length` while omitting
+/// body bytes on the wire), so strip non-empty bodies on HTTP/2 `HEAD` while
+/// keeping all response headers intact.
+fn strip_h2_head_body(is_head: bool, version: Version, resp: &mut Response<ResBody>) {
+    if is_head && version == Version::HTTP_2 && !resp.body().is_end_stream() {
+        *resp.body_mut() = empty_body();
+    }
+}
+
+/// Synchronous dispatcher for the optional dedicated `--admin-listen` listener,
+/// serving only `/livez`, `/readyz`, `/healthz`, and `/metrics` without proxy
+/// metrics, OTel spans, or access logs.
+pub(crate) fn dispatch_admin<B>(state: &AppState, req: &Request<B>) -> Response<ResBody> {
+    let is_head = req.method() == Method::HEAD;
+    let path = req.uri().path();
+    let mut resp = if !path.starts_with('/') || req.method() == Method::CONNECT {
+        text_response(StatusCode::BAD_REQUEST, "invalid request target")
+    } else if let Some(probe) = Probe::from_path(path) {
+        if req.method() == Method::GET || is_head {
+            return probe.response(is_head, state);
+        }
+        let mut resp = text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        resp.headers_mut()
+            .insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+        resp
+    } else {
+        text_response(StatusCode::NOT_FOUND, "not found")
+    };
+    strip_h2_head_body(is_head, req.version(), &mut resp);
+    resp
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {
     Probe(Probe),
+    NotFound,
     Reject,
     Proxy(Target),
 }
@@ -185,6 +226,16 @@ enum Probe {
 }
 
 impl Probe {
+    fn from_path(path: &str) -> Option<Self> {
+        match path {
+            "/healthz" => Some(Self::Health),
+            "/readyz" => Some(Self::Ready),
+            "/livez" => Some(Self::Live),
+            "/metrics" => Some(Self::Metrics),
+            _ => None,
+        }
+    }
+
     fn response(self, head: bool, state: &AppState) -> Response<ResBody> {
         match self {
             Self::Health => health::report(state, head),
@@ -199,32 +250,28 @@ impl Probe {
     }
 }
 
-fn classify_request<B>(req: &Request<B>) -> Route {
+fn classify_request<B>(req: &Request<B>, probes: ListenProbes) -> Route {
     let path = req.uri().path();
     if !path.starts_with('/') {
         return Route::Reject;
     }
-    if req.method() == Method::GET || req.method() == Method::HEAD {
-        let probe = match path {
-            "/healthz" => Some(Probe::Health),
-            "/readyz" => Some(Probe::Ready),
-            "/livez" => Some(Probe::Live),
-            "/metrics" => Some(Probe::Metrics),
-            _ => None,
-        };
-        if let Some(probe) = probe {
-            return Route::Probe(probe);
+    let is_connect = req.method() == Method::CONNECT;
+    if is_connect && (is_cl_path(path) || !WsMode::is_extended_connect(req)) {
+        return Route::Reject;
+    }
+    if let Some(probe) = Probe::from_path(path) {
+        match probes {
+            ListenProbes::Hidden => return Route::NotFound,
+            ListenProbes::Serve if matches!(*req.method(), Method::GET | Method::HEAD) => {
+                return Route::Probe(probe);
+            }
+            ListenProbes::Serve => {}
         }
     }
-    if req.method() == Method::CONNECT {
-        return if !is_cl_path(path) && WsMode::is_extended_connect(req) {
-            Route::Proxy(Target::WebSocket(WsMode::ExtendedConnect))
-        } else {
-            Route::Reject
-        };
-    }
-    // CL routes take precedence over upgrade headers.
-    if is_cl_path(path) {
+    if is_connect {
+        Route::Proxy(Target::WebSocket(WsMode::ExtendedConnect))
+    } else if is_cl_path(path) {
+        // CL routes take precedence over upgrade headers.
         Route::Proxy(Target::Cl)
     } else if WsMode::is_upgrade(req) {
         Route::Proxy(Target::WebSocket(WsMode::Upgrade))
@@ -682,27 +729,49 @@ mod tests {
             ("/livez", Probe::Live),
             ("/metrics", Probe::Metrics),
         ] {
-            for method in [Method::GET, Method::HEAD, Method::POST, Method::CONNECT] {
+            for method in [
+                Method::GET,
+                Method::HEAD,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+                Method::CONNECT,
+            ] {
+                let is_probe_method = matches!(method, Method::GET | Method::HEAD);
+                let is_connect = method == Method::CONNECT;
                 let mut req = Request::builder()
-                    .method(method.clone())
+                    .method(method)
                     .uri(format!("{path}?check=1"))
                     .body(())
                     .unwrap();
-                let expected = if method == Method::GET || method == Method::HEAD {
+                let expected = if is_probe_method {
                     Route::Probe(probe)
-                } else if method == Method::CONNECT {
+                } else if is_connect {
                     Route::Reject
                 } else {
                     Route::Proxy(Target::El)
                 };
-                assert_eq!(classify_request(&req), expected);
-                if method == Method::CONNECT {
+                assert_eq!(classify_request(&req, ListenProbes::Serve), expected);
+                assert_eq!(
+                    classify_request(&req, ListenProbes::Hidden),
+                    if is_connect {
+                        Route::Reject
+                    } else {
+                        Route::NotFound
+                    }
+                );
+                if is_connect {
                     *req.version_mut() = Version::HTTP_2;
                     req.extensions_mut()
                         .insert(hyper::ext::Protocol::from_static("websocket"));
                     assert_eq!(
-                        classify_request(&req),
+                        classify_request(&req, ListenProbes::Serve),
                         Route::Proxy(Target::WebSocket(WsMode::ExtendedConnect))
+                    );
+                    assert_eq!(
+                        classify_request(&req, ListenProbes::Hidden),
+                        Route::NotFound
                     );
                 } else {
                     req.headers_mut()
@@ -710,13 +779,17 @@ mod tests {
                     req.headers_mut()
                         .insert("upgrade", "WebSocket".parse().unwrap());
                     assert_eq!(
-                        classify_request(&req),
-                        if method == Method::POST {
+                        classify_request(&req, ListenProbes::Serve),
+                        if is_probe_method {
+                            expected
+                        } else {
                             // Non-GET H1 upgrades are rejected early in `WsMode::response`.
                             Route::Proxy(Target::WebSocket(WsMode::Upgrade))
-                        } else {
-                            expected
                         }
+                    );
+                    assert_eq!(
+                        classify_request(&req, ListenProbes::Hidden),
+                        Route::NotFound
                     );
                 }
             }
@@ -729,7 +802,14 @@ mod tests {
                 .header("upgrade", "websocket")
                 .body(())
                 .unwrap();
-            assert_eq!(classify_request(&req), Route::Proxy(Target::Cl));
+            assert_eq!(
+                classify_request(&req, ListenProbes::Serve),
+                Route::Proxy(Target::Cl)
+            );
+            assert_eq!(
+                classify_request(&req, ListenProbes::Hidden),
+                Route::Proxy(Target::Cl)
+            );
 
             let mut connect_req = Request::builder()
                 .version(Version::HTTP_2)
@@ -742,7 +822,10 @@ mod tests {
             connect_req
                 .extensions_mut()
                 .insert(hyper::ext::Protocol::from_static("websocket"));
-            assert_eq!(classify_request(&connect_req), Route::Reject);
+            assert_eq!(
+                classify_request(&connect_req, ListenProbes::Serve),
+                Route::Reject
+            );
         }
         // Origin-form `CONNECT /` with HTTP/1.1 Upgrade headers (and non-websocket
         // HTTP/2 CONNECT + Upgrade headers) must still be rejected as `Route::Reject`.
@@ -760,7 +843,10 @@ mod tests {
                     .extensions_mut()
                     .insert(hyper::ext::Protocol::from_static("other"));
             }
-            assert_eq!(classify_request(&bad_connect), Route::Reject);
+            assert_eq!(
+                classify_request(&bad_connect, ListenProbes::Serve),
+                Route::Reject
+            );
         }
 
         let root_get = Request::builder()
@@ -768,7 +854,10 @@ mod tests {
             .uri("/")
             .body(())
             .unwrap();
-        assert_eq!(classify_request(&root_get), Route::Proxy(Target::El));
+        assert_eq!(
+            classify_request(&root_get, ListenProbes::Serve),
+            Route::Proxy(Target::El)
+        );
 
         let root_ws = Request::builder()
             .method(Method::GET)
@@ -778,7 +867,7 @@ mod tests {
             .body(())
             .unwrap();
         assert_eq!(
-            classify_request(&root_ws),
+            classify_request(&root_ws, ListenProbes::Serve),
             Route::Proxy(Target::WebSocket(WsMode::Upgrade))
         );
 
@@ -787,7 +876,10 @@ mod tests {
             .uri("*")
             .body(())
             .unwrap();
-        assert_eq!(classify_request(&asterisk), Route::Reject);
+        assert_eq!(
+            classify_request(&asterisk, ListenProbes::Serve),
+            Route::Reject
+        );
     }
 
     #[tokio::test]
@@ -910,6 +1002,7 @@ mod tests {
             &lc2,
             "127.0.0.1:12346".parse().unwrap(),
             http_permit,
+            ListenProbes::Serve,
         );
         drop(lc2);
         tokio::time::timeout(Duration::from_millis(100), drain2.wait())
@@ -981,6 +1074,107 @@ mod tests {
             assert_eq!(head.headers(), get.headers(), "{probe:?}");
             assert!(!get.body().is_end_stream(), "{probe:?}");
             assert!(head.body().is_end_stream(), "{probe:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_admin_serves_only_probes_and_strips_h2_head_bodies() {
+        use clap::Parser;
+
+        let parsed = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--trust-upstream",
+        ])
+        .parse_validated()
+        .unwrap();
+        let (state, _) = AppState::start(
+            parsed.opts,
+            parsed.max_connections,
+            parsed.upstreams,
+            parsed.health,
+            crate::metrics::ServerMetrics::disabled(),
+        )
+        .await;
+        state.metrics.inc_saturated();
+
+        // GET/HEAD probes (including query strings) succeed on H1 and H2.
+        for path in ["/livez", "/readyz?foo=bar", "/healthz", "/metrics"] {
+            for version in [Version::HTTP_11, Version::HTTP_2] {
+                let get_req = Request::builder()
+                    .version(version)
+                    .method(Method::GET)
+                    .uri(path)
+                    .body(())
+                    .unwrap();
+                let get_resp = dispatch_admin(&state, &get_req);
+                assert_eq!(get_resp.status(), StatusCode::OK, "{path} {version:?}");
+                assert!(!get_resp.body().is_end_stream());
+
+                let head_req = Request::builder()
+                    .version(version)
+                    .method(Method::HEAD)
+                    .uri(path)
+                    .body(())
+                    .unwrap();
+                let head_resp = dispatch_admin(&state, &head_req);
+                assert_eq!(head_resp.status(), StatusCode::OK, "{path} {version:?}");
+                assert!(head_resp.body().is_end_stream());
+            }
+        }
+
+        // Non-GET/HEAD on probe paths -> 405 Method Not Allowed with `Allow: GET, HEAD`.
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS] {
+            let req = Request::builder()
+                .method(method)
+                .uri("/livez")
+                .body(())
+                .unwrap();
+            let resp = dispatch_admin(&state, &req);
+            assert_eq!(
+                resp.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{}",
+                req.method()
+            );
+            assert_eq!(resp.headers()[http::header::ALLOW], "GET, HEAD");
+        }
+
+        // CONNECT and non-origin-form targets -> 400 Bad Request; H2 HEAD strips body.
+        for (method, uri, version, expect_empty_body) in [
+            (Method::CONNECT, "/livez", Version::HTTP_11, false),
+            (Method::OPTIONS, "*", Version::HTTP_11, false),
+            (Method::HEAD, "*", Version::HTTP_11, false),
+            (Method::HEAD, "*", Version::HTTP_2, true),
+        ] {
+            let req = Request::builder()
+                .version(version)
+                .method(method)
+                .uri(uri)
+                .body(())
+                .unwrap();
+            let resp = dispatch_admin(&state, &req);
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(resp.body().is_end_stream(), expect_empty_body);
+        }
+
+        // Unknown / proxy paths -> 404 Not Found; H2 HEAD strips body while H1 keeps Content-Length.
+        for (method, uri, version, expect_empty_body) in [
+            (Method::POST, "/", Version::HTTP_11, false),
+            (Method::GET, "/eth/v1/node/health", Version::HTTP_11, false),
+            (Method::HEAD, "/unknown", Version::HTTP_11, false),
+            (Method::HEAD, "/unknown", Version::HTTP_2, true),
+        ] {
+            let req = Request::builder()
+                .version(version)
+                .method(method)
+                .uri(uri)
+                .body(())
+                .unwrap();
+            let resp = dispatch_admin(&state, &req);
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert_eq!(resp.body().is_end_stream(), expect_empty_body);
         }
     }
 

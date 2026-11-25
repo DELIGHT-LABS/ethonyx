@@ -443,6 +443,7 @@ async fn handle_mock_request(
 struct EthonyxHandle {
     port: u16,
     ports: Vec<u16>,
+    admin_port: Option<u16>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), BoxError>>>,
     shutting_down: bool,
@@ -495,6 +496,7 @@ impl EthonyxHandle {
             .expect("bind");
         let ports: Vec<u16> = bound.local_addrs().iter().map(SocketAddr::port).collect();
         let port = ports[0];
+        let admin_port = bound.admin_addr().map(|a| a.port());
 
         let (tx, rx) = oneshot::channel::<()>();
         let task = tokio::spawn(bound.serve(async move {
@@ -503,6 +505,7 @@ impl EthonyxHandle {
         EthonyxHandle {
             port,
             ports,
+            admin_port,
             shutdown: Some(tx),
             task: Some(task),
             shutting_down: false,
@@ -511,6 +514,11 @@ impl EthonyxHandle {
 
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.port, path)
+    }
+
+    fn admin_url(&self, path: &str) -> String {
+        let port = self.admin_port.expect("--admin-listen not configured");
+        format!("http://127.0.0.1:{port}{path}")
     }
 
     fn trigger_shutdown(&mut self) {
@@ -535,7 +543,11 @@ impl EthonyxHandle {
     }
 
     async fn open_h2(&self) -> H2Client {
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+        self.open_h2_port(self.port).await
+    }
+
+    async fn open_h2_port(&self, port: u16) -> H2Client {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
         let (sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())

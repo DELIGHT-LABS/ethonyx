@@ -1,3 +1,9 @@
+mod listen;
+
+pub(crate) use listen::{
+    ListenAddr, ListenPlan, ResolveTarget, ResolvedListen, validate_resolved_addrs,
+};
+
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
@@ -5,7 +11,7 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 
 use crate::BoxError;
-use crate::upstream::{HttpUpstream, RedactedUrl, WsUpstream, parse_canonical_port};
+use crate::upstream::{HttpUpstream, RedactedUrl, WsUpstream};
 
 const DEFAULT_CL_MAX_SLOT_AGE_SECS: u64 = 60;
 const DEFAULT_EL_MAX_REFERENCE_LAG: u64 = 1;
@@ -87,6 +93,14 @@ pub struct Config {
         default_value = "0.0.0.0:8547"
     )]
     pub listen: Vec<String>,
+
+    /// Optional dedicated admin/probe listen address (host:port) for `/livez`,
+    /// `/readyz`, `/healthz`, and `/metrics`, isolated from `--max-connections`.
+    /// When set, those four probe paths are served exclusively here and return
+    /// `404 Not Found` on `--listen` (except non-WebSocket `CONNECT` and
+    /// non-origin request targets, which continue returning `400 Bad Request`).
+    #[arg(long, env = "ETHONYX_ADMIN_LISTEN")]
+    pub admin_listen: Option<String>,
 
     /// Execution-layer JSON-RPC over HTTP upstream URL (required).
     #[arg(long, env = "ETHONYX_EL_HTTP_URL")]
@@ -250,7 +264,7 @@ pub struct Config {
     #[arg(long, env = "ETHONYX_SSE_IDLE_TIMEOUT", default_value = "900", value_parser = parse_secs)]
     pub sse_idle_timeout: Duration,
 
-    /// Maximum concurrent inbound connections (including HTTP/2 WebSocket streams) across all listeners (0 = unlimited).
+    /// Maximum concurrent inbound connections (including HTTP/2 WebSocket streams) across all `--listen` addresses (0 = unlimited; `--admin-listen` uses its own isolated pool).
     #[arg(long, env = "ETHONYX_MAX_CONNECTIONS", default_value_t = 4096)]
     pub max_connections: usize,
 
@@ -293,93 +307,6 @@ impl SlotClock {
             .get()
             .saturating_add(head_slot.saturating_mul(self.seconds_per_slot.get()));
         now.saturating_sub(expected)
-    }
-}
-
-/// Parsed `--listen` endpoint preserving unbracketed host/zone strings so
-/// `(host, port)` binds both numeric (`%1`) and named (`%lo0`, `%eth0`) IPv6
-/// link-local scope IDs via OS `getaddrinfo`.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ListenAddr {
-    pub(crate) host: Box<str>,
-    pub(crate) port: u16,
-}
-
-impl ListenAddr {
-    fn parse(raw: &str) -> Result<Self, BoxError> {
-        let addr = raw.trim();
-        if addr.is_empty() {
-            return Err("invalid --listen address: entry must not be empty".into());
-        }
-        let (host, port_str) = match crate::upstream::split_host_port(addr) {
-            Ok(crate::upstream::HostPort::Bracketed { host, port }) => {
-                let Some(port_str) = port else {
-                    return Err(
-                        format!("invalid --listen address '{addr}': expected [ipv6]:port").into(),
-                    );
-                };
-                let valid_ipv6 = match host.split_once('%') {
-                    Some((addr_part, zone)) => {
-                        !zone.is_empty()
-                            && !zone
-                                .bytes()
-                                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-                            && addr_part.parse::<std::net::Ipv6Addr>().is_ok()
-                    }
-                    None => host.parse::<std::net::Ipv6Addr>().is_ok(),
-                };
-                if !valid_ipv6 {
-                    return Err(
-                        format!("invalid --listen address '{addr}': invalid IPv6 host").into(),
-                    );
-                }
-                (host, port_str)
-            }
-            Ok(crate::upstream::HostPort::Plain { host, port }) => {
-                let Some(port_str) = port else {
-                    return Err(
-                        format!("invalid --listen address '{addr}': expected host:port").into(),
-                    );
-                };
-                if host.is_empty()
-                    || host.bytes().any(|b| {
-                        b.is_ascii_whitespace()
-                            || b.is_ascii_control()
-                            || matches!(b, b'/' | b'@' | b'[' | b']')
-                    })
-                {
-                    return Err(format!("invalid --listen address '{addr}': invalid host").into());
-                }
-                (host, port_str)
-            }
-            Err(crate::upstream::HostPortError::UnclosedBracket) => {
-                return Err(
-                    format!("invalid --listen address '{addr}': unclosed IPv6 bracket").into(),
-                );
-            }
-            Err(crate::upstream::HostPortError::TrailingAfterBracket) => {
-                return Err(
-                    format!("invalid --listen address '{addr}': expected [ipv6]:port").into(),
-                );
-            }
-        };
-        let Some(port) = parse_canonical_port(port_str, true) else {
-            return Err(format!("invalid --listen address '{addr}': invalid port").into());
-        };
-        Ok(Self {
-            host: Box::from(host),
-            port,
-        })
-    }
-}
-
-impl fmt::Display for ListenAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.host.contains(':') {
-            write!(f, "[{}]:{}", self.host, self.port)
-        } else {
-            write!(f, "{}:{}", self.host, self.port)
-        }
     }
 }
 
@@ -472,7 +399,7 @@ pub(crate) struct ValidatedUpstreams {
 }
 
 pub(crate) struct ParsedConfig {
-    pub(crate) listen: Vec<ListenAddr>,
+    pub(crate) listen: ListenPlan,
     pub(crate) opts: ProxyOpts,
     pub(crate) max_connections: Option<NonZeroUsize>,
     pub(crate) upstreams: ValidatedUpstreams,
@@ -604,25 +531,6 @@ impl Config {
         )
     }
 
-    fn parse_listen_addrs(&self) -> Result<Vec<ListenAddr>, BoxError> {
-        if self.listen.is_empty() {
-            return Err("no listen addresses configured".into());
-        }
-        let mut addrs = Vec::with_capacity(self.listen.len());
-        for raw in &self.listen {
-            let addr = ListenAddr::parse(raw)?;
-            if addr.port != 0
-                && addrs.iter().any(|prev: &ListenAddr| {
-                    prev.port == addr.port && prev.host.eq_ignore_ascii_case(&addr.host)
-                })
-            {
-                return Err(format!("duplicate --listen address '{addr}'").into());
-            }
-            addrs.push(addr);
-        }
-        Ok(addrs)
-    }
-
     fn parse_cl(&self) -> Result<Option<ValidatedCl>, BoxError> {
         let Some(raw_beacon) = self.cl_beacon_url.as_deref() else {
             return Ok(None);
@@ -721,7 +629,7 @@ impl Config {
     ) -> Result<(ParsedConfig, Option<crate::otel::OtelEndpoints>), BoxError> {
         self.validate_scalars_and_durations()?;
         self.validate_flag_combinations()?;
-        let listen = self.parse_listen_addrs()?;
+        let listen = ListenPlan::parse(&self.listen, self.admin_listen.as_deref())?;
         let el_http = HttpUpstream::parse("--el-http-url", &self.el_http_url)?;
         let el_ws = self
             .el_ws_url
@@ -1122,15 +1030,16 @@ mod tests {
         assert_eq!(
             validated
                 .listen
+                .data()
                 .iter()
-                .map(|addr| (&*addr.host, addr.port, addr.to_string()))
+                .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             vec![
-                ("127.0.0.1", 8547, "127.0.0.1:8547".to_owned()),
-                ("::1", 8548, "[::1]:8548".to_owned()),
-                ("fe80::1%lo0", 8549, "[fe80::1%lo0]:8549".to_owned()),
-                ("fe80::1%1", 18999, "[fe80::1%1]:18999".to_owned()),
-                ("localhost", 0, "localhost:0".to_owned()),
+                "127.0.0.1:8547",
+                "[::1]:8548",
+                "[fe80::1%lo0]:8549",
+                "[fe80::1%1]:18999",
+                "localhost:0",
             ]
         );
 
@@ -1288,55 +1197,133 @@ mod tests {
         assert!(sub_sec.validate().is_ok());
     }
 
-    #[tokio::test]
-    async fn listen_addr_resolves_numeric_and_named_ipv6_zone_ids() {
-        use std::net::SocketAddr;
+    #[test]
+    fn admin_listen_validation_and_conflict_detection() {
+        // Default: unset -> probes stay on `--listen`.
+        let default_parsed = parse(&[]).parse_validated().unwrap();
+        assert!(default_parsed.listen.admin().is_none());
 
-        #[cfg(target_os = "macos")]
-        let named = "[fe80::1%lo0]:0";
-        #[cfg(target_os = "linux")]
-        let named = "[fe80::1%lo]:0";
+        // Valid `--admin-listen` (IPv4, IPv6, link-local zone ID, dual ephemeral `:0`, distinct NICs,
+        // and non-wildcard distinct IPv4 / IPv6 families such as `127.0.0.1` + `[::1]`).
+        for (listen, admin) in [
+            ("0.0.0.0:8547", "127.0.0.1:9090"),
+            ("127.0.0.1:0", "127.0.0.1:0"),
+            ("127.0.0.1:0", "[::]:0"),
+            ("10.0.0.5:8547", "127.0.0.1:8547"),
+            ("[::1]:8547", "[::1]:9090"),
+            ("127.0.0.1:8547", "[::1]:8547"),
+            ("0.0.0.0:8547", "[::1]:8547"),
+            ("[fe80::1%eth0]:8547", "[fe80::1%Eth0]:8547"),
+            ("[::ffff:10.0.0.1]:8547", "127.0.0.1:8547"),
+        ] {
+            let parsed = parse(&["--listen", listen, "--admin-listen", admin])
+                .parse_validated()
+                .unwrap_or_else(|e| panic!("expected ok for {listen} / {admin}: {e}"));
+            assert!(parsed.listen.admin().is_some());
+            assert_eq!(parsed.listen.data().len(), 1);
+        }
 
-        let cfg = Config::parse_from([
-            "ethonyx",
-            "--listen",
-            "[fe80::1%1]:0",
-            "--el-http-url",
-            "http://127.0.0.1:8545",
-        ]);
-        let validated = cfg.parse_validated().unwrap();
-        let addr = &validated.listen[0];
-        let resolved: Vec<_> = tokio::net::lookup_host((&*addr.host, addr.port))
-            .await
-            .expect("numeric IPv6 zone ID must resolve")
-            .collect();
-        assert!(matches!(resolved.as_slice(), [SocketAddr::V6(v6), ..] if v6.scope_id() == 1));
+        // Same-plane `--listen` continues to allow `[::]:port` + `0.0.0.0:port` for `IPV6_V6ONLY=1` dual-stack.
+        parse(&["--listen", "[::]:8547,0.0.0.0:8547"])
+            .validate()
+            .expect("same-plane dual-stack --listen must remain valid");
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            let cfg = Config::parse_from([
+        // Reject invalid syntax, empty value (`ETHONYX_ADMIN_LISTEN=""`), non-link-local `%zone`, and duplicate `%`.
+        for bad in [
+            "",
+            "   ",
+            "9090",
+            "[::1:9090",
+            "127.0.0.1:99999",
+            "[::1%lo0]:8547",
+            "[::%lo0]:8547",
+            "[::ffff:127.0.0.1%lo0]:8547",
+            "[2001:db8::1%eth0]:8547",
+            "[fe80::1%eth0%extra]:8547",
+        ] {
+            let err = parse(&["--admin-listen", bad])
+                .validate()
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("--admin-listen"), "missing flag in {err}");
+        }
+
+        // Clap rejects repeated `--admin-listen` flags.
+        assert!(
+            Config::try_parse_from([
                 "ethonyx",
-                "--listen",
-                named,
                 "--el-http-url",
                 "http://127.0.0.1:8545",
-            ]);
-            let validated = cfg.parse_validated().unwrap();
-            let addr = &validated.listen[0];
-            let resolved: Vec<_> = tokio::net::lookup_host((&*addr.host, addr.port))
-                .await
-                .expect("named IPv6 zone ID must resolve via OS getaddrinfo")
-                .collect();
-            assert!(matches!(resolved.as_slice(), [SocketAddr::V6(v6), ..] if v6.scope_id() != 0));
+                "--admin-listen",
+                "127.0.0.1:9090",
+                "--admin-listen",
+                "127.0.0.1:9091",
+            ])
+            .is_err()
+        );
 
-            #[cfg(target_os = "macos")]
-            {
-                let listener = tokio::net::TcpListener::bind((&*addr.host, addr.port))
-                    .await
-                    .expect("macOS lo0 must bind [fe80::1%lo0]:0");
-                let local = listener.local_addr().unwrap();
-                assert!(matches!(local, SocketAddr::V6(v6) if v6.scope_id() != 0));
-            }
+        // Reject duplicate and wildcard-overlapping `--admin-listen` against `--listen`
+        // (including canonical IPv6, IPv4-mapped IPv6, and cross-plane `[::]` vs IPv4).
+        for (listen, admin) in [
+            ("127.0.0.1:8547", "127.0.0.1:8547"),
+            ("0.0.0.0:8547", "127.0.0.1:8547"),
+            ("127.0.0.1:8547", "0.0.0.0:8547"),
+            ("[::1]:8547", "[0:0:0:0:0:0:0:1]:8547"),
+            ("[fe80::0001%lo0]:8547", "[FE80::1%lo0]:8547"),
+            ("[::]:8547", "[::1]:8547"),
+            ("[::]:8547", "[fe80::1%lo0]:8547"),
+            ("[::]:8547", "[::ffff:127.0.0.1]:8547"),
+            ("[::]:8547", "0.0.0.0:8547"),
+            ("0.0.0.0:8547", "[::]:8547"),
+            ("[::]:8547", "127.0.0.1:8547"),
+            ("127.0.0.1:8547", "[::]:8547"),
+            ("10.0.0.5:8547", "[::]:8547"),
+            ("[::]:8547", "localhost:8547"),
+            ("localhost:8547", "[::]:8547"),
+            ("[::ffff:127.0.0.1]:8547", "127.0.0.1:8547"),
+            ("127.0.0.1:8547", "[::ffff:127.0.0.1]:8547"),
+            ("[::ffff:7f00:1]:8547", "127.0.0.1:8547"),
+            ("[::ffff:127.0.0.1]:8547", "0.0.0.0:8547"),
+            ("[::ffff:0.0.0.0]:8547", "127.0.0.1:8547"),
+            ("[::ffff:0.0.0.0]:8547", "[::ffff:127.0.0.1]:8547"),
+        ] {
+            let err = parse(&["--listen", listen, "--admin-listen", admin])
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("--admin-listen") && err.contains("conflicts with --listen"),
+                "unexpected error for {listen} / {admin}: {err}"
+            );
         }
+
+        // Same-plane `[::]` + hostname is deferred to pre-bind resolution (may resolve to IPv4).
+        parse(&["--listen", "[::]:8547,localhost:8547"])
+            .validate()
+            .expect("same-plane [::] + hostname defers overlap check until bind");
+
+        // Wildcard overlap inside `--listen` itself is also rejected while keeping `"duplicate --listen"`
+        // for exact/canonical duplicates.
+        let dup_v6 = parse(&["--listen", "[::1]:8547,[0:0:0:0:0:0:0:1]:8547"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(dup_v6.contains("duplicate --listen"), "got: {dup_v6}");
+
+        let overlap = parse(&["--listen", "0.0.0.0:8547,127.0.0.1:8547"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(overlap.contains("conflicts with"), "got: {overlap}");
+
+        // Every earlier entry is checked, not only the immediately preceding one.
+        let non_adjacent = parse(&["--listen", "0.0.0.0:8547,127.0.0.1:9000,127.0.0.1:8547"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            non_adjacent.contains("conflicts with '0.0.0.0:8547'"),
+            "got: {non_adjacent}"
+        );
     }
 }
