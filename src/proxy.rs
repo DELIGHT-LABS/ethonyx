@@ -579,7 +579,7 @@ async fn execute_upstream(
         }
         RespFraming::NoContent | RespFraming::BodylessMetadata => {
             // Collapse `HEAD` and bodyless statuses unconditionally so downstream
-            // never wraps `Incoming` in `IdleTimeoutBody`, re-inserts `content-length`
+            // never wraps `Incoming` in `StreamBody`, re-inserts `content-length`
             // from an unclosed H2 `204`/`304`, or pipes forbidden `DATA` frames.
             empty_body()
         }
@@ -590,6 +590,8 @@ async fn execute_upstream(
                 state.opts.proxy_timeout,
                 state.opts.sse_idle_timeout,
             ),
+            &state.metrics,
+            layer,
         ),
     };
     Response::from_parts(resp_parts, body)

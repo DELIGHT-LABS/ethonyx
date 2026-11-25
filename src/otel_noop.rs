@@ -3,7 +3,9 @@
 
 use std::time::Duration;
 
-use crate::metrics::{ConnProtocol, HealthInstrument, MethodBucket, StatusSlot, UpstreamLayer};
+use crate::metrics::{
+    BodyErrorReason, ConnProtocol, HealthInstrument, MethodBucket, StatusSlot, UpstreamLayer,
+};
 
 pub(crate) struct OtelMetrics;
 
@@ -26,6 +28,8 @@ impl OtelMetrics {
         _elapsed: Duration,
     ) {
     }
+
+    pub(crate) const fn inc_body_error(&self, _layer: UpstreamLayer, _reason: BodyErrorReason) {}
 
     pub(crate) const fn set_health(
         &self,

@@ -6,17 +6,18 @@ use std::time::Duration;
 use opentelemetry::KeyValue;
 
 use crate::metrics::{
-    ACTIVE_CONNECTIONS, CONNECTION_LIMIT_SATURATED, ConnProtocol, HealthInstrument,
-    LATENCY_BUCKET_BOUNDS, MethodBucket, PROXY_REQUEST_DURATION, PROXY_REQUESTS_TOTAL, StatusSlot,
-    UpstreamLayer,
+    ACTIVE_CONNECTIONS, BodyErrorReason, CONNECTION_LIMIT_SATURATED, ConnProtocol,
+    HealthInstrument, LATENCY_BUCKET_BOUNDS, MethodBucket, PROXY_REQUEST_DURATION,
+    PROXY_REQUESTS_TOTAL, RESPONSE_BODY_ERRORS_TOTAL, StatusSlot, UpstreamLayer,
 };
 
 struct OtelMetricsInner {
     meter: opentelemetry::metrics::Meter,
     active_connections: opentelemetry::metrics::UpDownCounter<i64>,
     // Kept lazy: `opentelemetry_sdk` pre-allocates ~135 KiB per built instrument,
-    // so unused saturation/health gauges (e.g. EL-only or `--trust-upstream`) stay zero-cost.
+    // so unused saturation/body-error/health instruments (e.g. EL-only or `--trust-upstream`) stay zero-cost.
     saturated: OnceLock<opentelemetry::metrics::Counter<u64>>,
+    body_errors: OnceLock<opentelemetry::metrics::Counter<u64>>,
     duration: opentelemetry::metrics::Histogram<f64>,
     requests: opentelemetry::metrics::Counter<u64>,
     health: [OnceLock<opentelemetry::metrics::Gauge<f64>>; HealthInstrument::COUNT],
@@ -25,7 +26,7 @@ struct OtelMetricsInner {
 /// Typed OpenTelemetry metric fanout owned directly by [`crate::metrics::ServerMetrics`].
 ///
 /// Builds one OTel instrument per metric name (zero per-series wrapper allocations or
-/// `Recorder` virtual dispatch), lazily creating saturation and health instruments on first use.
+/// `Recorder` virtual dispatch), lazily creating saturation, body-error, and health instruments on first use.
 pub(crate) struct OtelMetrics(Option<Box<OtelMetricsInner>>);
 
 impl OtelMetrics {
@@ -50,6 +51,7 @@ impl OtelMetrics {
             meter,
             active_connections,
             saturated: OnceLock::new(),
+            body_errors: OnceLock::new(),
             duration,
             requests,
             health: [const { OnceLock::new() }; HealthInstrument::COUNT],
@@ -94,6 +96,20 @@ impl OtelMetrics {
                     KeyValue::new("upstream", upstream),
                 ],
             );
+        }
+    }
+
+    pub(crate) fn inc_body_error(&self, layer: UpstreamLayer, reason: BodyErrorReason) {
+        if let Some(m) = &self.0 {
+            m.body_errors
+                .get_or_init(|| m.meter.u64_counter(RESPONSE_BODY_ERRORS_TOTAL).build())
+                .add(
+                    1,
+                    &[
+                        KeyValue::new("reason", reason.as_str()),
+                        KeyValue::new("upstream", layer.as_str()),
+                    ],
+                );
         }
     }
 
@@ -285,6 +301,19 @@ mod tests {
             // a synthetic `layer="el"` datapoint until EL peers is explicitly recorded.
             server_metrics.set_health(G::ClPeers, 12.0);
             provider.force_flush().unwrap();
+            assert!(
+                !exporter.has_metric(crate::metrics::RESPONSE_BODY_ERRORS_TOTAL),
+                "body error counter must stay unregistered until a body error occurs"
+            );
+
+            server_metrics.inc_body_error(
+                crate::metrics::UpstreamLayer::El,
+                crate::metrics::BodyErrorReason::IdleTimeout,
+            );
+            server_metrics.inc_body_error(
+                crate::metrics::UpstreamLayer::Cl,
+                crate::metrics::BodyErrorReason::UpstreamError,
+            );
 
             for (gauge, value) in [
                 (G::ElHealth, 1.0),
@@ -432,6 +461,14 @@ mod tests {
             &[(&[], 1.0)],
         );
         assert_eq!(saturated.2.len(), 1);
+        assert_metric(
+            "ethonyx_response_body_errors_total",
+            "u64_monotonic_sum",
+            &[
+                (&[("reason", "idle_timeout"), ("upstream", "EL")], 1.0),
+                (&[("reason", "upstream_error"), ("upstream", "CL")], 1.0),
+            ],
+        );
 
         for (name, el, cl) in [
             ("ethonyx_upstream_health_status", 1.0, 1.0),
@@ -458,6 +495,12 @@ mod tests {
         assert!(prom.contains("ethonyx_connection_limit_saturated_total 1"));
         assert!(prom.contains(
             r#"ethonyx_proxy_requests_total{upstream="CL",method="OPTIONS",status="206"} 2"#
+        ));
+        assert!(prom.contains(
+            r#"ethonyx_response_body_errors_total{upstream="EL",reason="idle_timeout"} 1"#
+        ));
+        assert!(prom.contains(
+            r#"ethonyx_response_body_errors_total{upstream="CL",reason="upstream_error"} 1"#
         ));
     }
 }
