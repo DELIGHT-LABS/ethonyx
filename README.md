@@ -252,7 +252,7 @@ Structured JSON to stdout. Levels follow a sidecar-appropriate discipline:
 | Level   | What                                                                |
 |---------|---------------------------------------------------------------------|
 | `error` | genuine internal faults                                             |
-| `warn`  | readiness became **not-ready** (LB will deroute); upstream `502` proxy / WS dial errors; upstream `h2c → http/1.1` fallback; connection-limit saturation; `accept()` failed |
+| `warn`  | readiness became **not-ready** (LB will deroute); upstream `502` proxy / WS dial errors; mid-stream upstream response body errors / idle timeouts; upstream `h2c → http/1.1` fallback; connection-limit saturation; `accept()` failed |
 | `info`  | lifecycle (start w/ version / listen / shutdown), readiness **recovered** |
 | `debug` | routine activity: each health poll, upstream `h2c` confirmation, client connection/body read errors, WS disconnects |
 | `trace` | fine-grained internal flow (request routing, connection accept / close) |
@@ -260,9 +260,10 @@ Structured JSON to stdout. Levels follow a sidecar-appropriate discipline:
 `info` is reserved for notable, low-frequency events, so a healthy sidecar is
 nearly silent between state changes — request rates and latencies belong in
 metrics, not one log line per request. Upstream `502` proxy / WebSocket dial
-failures and connection-limit saturation transitions emit `warn` so degraded
-upstream connectivity is visible under the default `info` level, while routine
-client disconnects stay `debug`.
+failures, mid-stream upstream response body errors or idle timeouts, and
+connection-limit saturation transitions emit `warn` so degraded upstream
+connectivity is visible under the default `info` level, while routine client
+disconnects stay `debug`.
 Readiness *changes* are logged once by the poller (not per probe).
 
 The startup line carries two version fields: `version` (the crate version, e.g.
@@ -308,6 +309,7 @@ The following metrics are exposed:
 - `ethonyx_connection_limit_saturated_total`: Total number of inbound TCP accepts queued or HTTP/2 Extended `CONNECT` WebSocket streams rejected due to `--max-connections` saturation.
 - `ethonyx_proxy_requests_total`: Total number of proxied HTTP/WS requests (labeled by `upstream`, `method`, `status`; common HTTP status codes have individual series while unlisted codes are grouped under `status="OTHER"`).
 - `ethonyx_proxy_request_duration_seconds`: Explicit-bucket latency histogram of upstream proxied requests (`0.005`–`10`s + `+Inf`, labeled by `upstream`) exported consistently to Prometheus (`_bucket`/`_sum`/`_count` for `histogram_quantile()`) and OpenTelemetry.
+- `ethonyx_response_body_errors_total`: Total number of mid-stream upstream response body failures occurring after response headers were received (labeled by `upstream` as `EL` or `CL`, and `reason` as `idle_timeout` or `upstream_error`, including quiet SSE subscriptions that hit `--sse-idle-timeout`; client-side disconnects while reading the response are excluded; like request counters, each label series is emitted once its first error occurs, so alerts should check `> 0` or account for `absent()` rather than relying solely on `increase()` to catch the first sample).
 - `ethonyx_upstream_peers`: Number of peers reported by upstream nodes (labeled by `layer`: `layer="el"` is omitted when `net_peerCount` is unsupported, and `layer="cl"` is omitted when CL is disabled).
 - `ethonyx_upstream_sync_distance`: Remaining sync distance in blocks or slots (labeled by `layer` as `el` or `cl`).
 - `ethonyx_upstream_block_number`: Latest execution layer block number.

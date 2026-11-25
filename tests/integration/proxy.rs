@@ -977,6 +977,143 @@ async fn sse_event_stream_survives_past_proxy_timeout_while_stalled_json_aborts(
     };
     tokio::join!(sse_check, stalled_json_check);
 
+    let (status, metrics_body) = get(&c, &proxy.url("/metrics")).await;
+    assert_eq!(status, StatusCode::OK);
+    let metrics_text = String::from_utf8_lossy(&metrics_body);
+    assert_eq!(
+        prom_metric_sum(
+            &metrics_text,
+            "ethonyx_response_body_errors_total",
+            &[r#"upstream="EL""#, r#"reason="idle_timeout""#],
+        ),
+        1.0
+    );
+    assert_eq!(
+        prom_metric_sum(
+            &metrics_text,
+            "ethonyx_response_body_errors_total",
+            &[r#"upstream="CL""#],
+        ),
+        0.0
+    );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn response_body_errors_metric_tracks_unbounded_sse_reset_and_ignores_client_disconnect() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream_eof = Arc::new(tokio::sync::Notify::new());
+    let upstream_eof_srv = Arc::clone(&upstream_eof);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream_url = format!("http://{addr}");
+    let _upstream = AbortOnDrop(tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let upstream_eof_srv = Arc::clone(&upstream_eof_srv);
+            tokio::spawn(async move {
+                let mut req_buf = [0u8; 1024];
+                let Ok(n) = sock.read(&mut req_buf).await else {
+                    return;
+                };
+                let head = String::from_utf8_lossy(&req_buf[..n]);
+                if head.starts_with("GET /eth/v1/events/truncated") {
+                    // Close chunked SSE stream without the terminating `0\r\n\r\n` chunk
+                    // so Hyper deterministically reports an incomplete-message upstream error.
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\n\
+                              Content-Type: text/event-stream\r\n\
+                              Transfer-Encoding: chunked\r\n\r\n\
+                              e\r\ndata: event1\n\n\r\n",
+                        )
+                        .await;
+                    let _ = sock.shutdown().await;
+                } else {
+                    // Hold an unbounded SSE stream open until ethonyx closes the upstream
+                    // connection after the downstream keep-alive client disconnects.
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\n\
+                              Content-Type: text/event-stream\r\n\
+                              Transfer-Encoding: chunked\r\n\r\n\
+                              e\r\ndata: event1\n\n\r\n",
+                        )
+                        .await;
+                    let mut drain = [0u8; 16];
+                    let _ = sock.read(&mut drain).await;
+                    upstream_eof_srv.notify_one();
+                }
+            });
+        }
+    }));
+
+    let proxy = EthonyxHandle::start(&[
+        "--trust-upstream",
+        "--sse-idle-timeout",
+        "0",
+        "--cl-beacon-url",
+        &upstream_url,
+        "--el-http-url",
+        &upstream_url,
+    ])
+    .await;
+    let c = client();
+
+    // 1. Unbounded SSE stream (`--sse-idle-timeout 0`) still counts upstream mid-stream errors.
+    let resp = c
+        .request(
+            Request::builder()
+                .method(Method::GET)
+                .uri(proxy.url("/eth/v1/events/truncated"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.into_body().collect().await.is_err());
+
+    // 2. Keep-alive HTTP/1.1 client disconnecting mid-stream cancels `StreamBody` via drop
+    // (propagating EOF to upstream) without counting as an upstream body error.
+    let mut client_sock = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+        .await
+        .unwrap();
+    client_sock
+        .write_all(b"GET /eth/v1/events/client-drop HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 512];
+    let n = client_sock.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200 OK"));
+    drop(client_sock);
+
+    tokio::time::timeout(Duration::from_secs(2), upstream_eof.notified())
+        .await
+        .expect("upstream socket should observe EOF after client disconnect");
+
+    let (status, metrics_body) = get(&c, &proxy.url("/metrics")).await;
+    assert_eq!(status, StatusCode::OK);
+    let metrics_text = String::from_utf8_lossy(&metrics_body);
+    assert_eq!(
+        prom_metric_sum(
+            &metrics_text,
+            "ethonyx_response_body_errors_total",
+            &[r#"upstream="CL""#, r#"reason="upstream_error""#],
+        ),
+        1.0
+    );
+    assert_eq!(
+        prom_metric_sum(
+            &metrics_text,
+            "ethonyx_response_body_errors_total",
+            &[r#"reason="idle_timeout""#],
+        ),
+        0.0
+    );
+
     proxy.shutdown().await;
 }
 

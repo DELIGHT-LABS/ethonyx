@@ -12,6 +12,7 @@ pub(crate) const ACTIVE_CONNECTIONS: &str = "ethonyx_active_connections";
 pub(crate) const CONNECTION_LIMIT_SATURATED: &str = "ethonyx_connection_limit_saturated_total";
 pub(crate) const PROXY_REQUEST_DURATION: &str = "ethonyx_proxy_request_duration_seconds";
 pub(crate) const PROXY_REQUESTS_TOTAL: &str = "ethonyx_proxy_requests_total";
+pub(crate) const RESPONSE_BODY_ERRORS_TOTAL: &str = "ethonyx_response_body_errors_total";
 
 /// Explicit histogram buckets `(bound, Prometheus le label)` shared by Prometheus
 /// and OpenTelemetry for RPC/Beacon proxy latencies so `histogram_quantile()`
@@ -378,6 +379,26 @@ impl StatusSlot {
     }
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyErrorReason {
+    IdleTimeout = 0,
+    // Must remain last; `Self::COUNT` is derived from this variant.
+    UpstreamError = 1,
+}
+
+impl BodyErrorReason {
+    const COUNT: usize = Self::UpstreamError as usize + 1;
+    const ALL: [Self; Self::COUNT] = [Self::IdleTimeout, Self::UpstreamError];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdleTimeout => "idle_timeout",
+            Self::UpstreamError => "upstream_error",
+        }
+    }
+}
+
 // `render_prometheus` pairs each `ALL` array with its table rows by position while
 // writers index by discriminant, so every `ALL` must list variants in discriminant order.
 const _: () = {
@@ -394,6 +415,11 @@ const _: () = {
     let mut i = 0;
     while i < MethodBucket::COUNT {
         assert!(MethodBucket::ALL[i] as usize == i);
+        i += 1;
+    }
+    let mut i = 0;
+    while i < BodyErrorReason::COUNT {
+        assert!(BodyErrorReason::ALL[i] as usize == i);
         i += 1;
     }
     let mut i = 0;
@@ -417,6 +443,7 @@ const _: () = {
 pub(crate) struct ServerMetrics {
     otel: OtelMetrics,
     saturated: AtomicU64,
+    body_errors: [[AtomicU64; BodyErrorReason::COUNT]; UpstreamLayer::COUNT],
     health: [AtomicGauge; HealthGauge::COUNT],
     active: [ActiveSlot; ConnProtocol::COUNT],
     duration: [AtomicHistogram; UpstreamLayer::COUNT],
@@ -436,6 +463,8 @@ impl ServerMetrics {
         Arc::new(Self {
             otel,
             saturated: AtomicU64::new(0),
+            body_errors: [const { [const { AtomicU64::new(0) }; BodyErrorReason::COUNT] };
+                UpstreamLayer::COUNT],
             health: [const { AtomicGauge::new() }; HealthGauge::COUNT],
             active: [const { ActiveSlot::new() }; ConnProtocol::COUNT],
             duration: [const { AtomicHistogram::new() }; UpstreamLayer::COUNT],
@@ -532,6 +561,28 @@ impl ServerMetrics {
             }
         }
 
+        let mut wrote_body_errors = false;
+        for (layer, reasons) in UpstreamLayer::ALL.into_iter().zip(&self.body_errors) {
+            let upstream = layer.as_str();
+            for (reason, counter) in BodyErrorReason::ALL.into_iter().zip(reasons) {
+                let count = counter.load(Ordering::Relaxed);
+                if count == 0 {
+                    continue;
+                }
+                write_type_once(
+                    &mut out,
+                    &mut wrote_body_errors,
+                    RESPONSE_BODY_ERRORS_TOTAL,
+                    "counter",
+                );
+                let _ = writeln!(
+                    out,
+                    "{RESPONSE_BODY_ERRORS_TOTAL}{{upstream=\"{upstream}\",reason=\"{}\"}} {count}",
+                    reason.as_str()
+                );
+            }
+        }
+
         for instrument in HealthInstrument::ALL {
             match instrument.slots() {
                 HealthSlots::Layered { el, cl } => {
@@ -594,6 +645,12 @@ impl ServerMetrics {
         self.requests[layer as usize][method as usize][status.index()]
             .fetch_add(1, Ordering::Relaxed);
         self.otel.record_request(layer, method, status, elapsed);
+    }
+
+    /// Record a mid-stream upstream response body error (after response headers arrived).
+    pub(crate) fn inc_body_error(&self, layer: UpstreamLayer, reason: BodyErrorReason) {
+        self.body_errors[layer as usize][reason as usize].fetch_add(1, Ordering::Relaxed);
+        self.otel.inc_body_error(layer, reason);
     }
 
     /// Set one health gauge. Unset gauges (a disabled layer, or everything under
@@ -884,6 +941,9 @@ mod tests {
             200,
             Duration::from_millis(10),
         );
+        m.inc_body_error(UpstreamLayer::El, BodyErrorReason::IdleTimeout);
+        m.inc_body_error(UpstreamLayer::El, BodyErrorReason::IdleTimeout);
+        m.inc_body_error(UpstreamLayer::Cl, BodyErrorReason::UpstreamError);
         for (gauge, val) in [
             (HealthGauge::ElHealth, 1.0),
             (HealthGauge::ClHealth, 1.0),
@@ -912,7 +972,15 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen_types.len(), 4 + HealthInstrument::COUNT);
+        assert_eq!(seen_types.len(), 5 + HealthInstrument::COUNT);
+        assert!(rendered.contains(
+            "ethonyx_response_body_errors_total{upstream=\"EL\",reason=\"idle_timeout\"} 2\n"
+        ));
+        assert!(rendered.contains(
+            "ethonyx_response_body_errors_total{upstream=\"CL\",reason=\"upstream_error\"} 1\n"
+        ));
+        assert!(!rendered.contains("upstream=\"EL\",reason=\"upstream_error\""));
+        assert!(!rendered.contains("upstream=\"CL\",reason=\"idle_timeout\""));
     }
 
     #[test]

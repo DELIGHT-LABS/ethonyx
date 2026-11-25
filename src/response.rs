@@ -4,6 +4,7 @@
 use std::fmt;
 use std::ops::ControlFlow;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -12,8 +13,10 @@ use http::header::{CONTENT_TYPE, HeaderValue};
 use http::{Response, StatusCode, Version};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use tokio::time::Instant;
+use tracing::warn;
 
 use crate::lifecycle::LazyDeadline;
+use crate::metrics::{BodyErrorReason, ServerMetrics, UpstreamLayer};
 
 const PROMETHEUS_CONTENT_TYPE: HeaderValue =
     HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8");
@@ -45,35 +48,56 @@ impl<E: std::error::Error + 'static> std::error::Error for IdleTimeoutError<E> {
     }
 }
 
-/// Streaming response body wrapper that enforces a per-frame idle timeout while
-/// preserving `Body::size_hint` and `Body::is_end_stream` (keeping `Content-Length`
-/// intact on HTTP/1.1 responses) and allocating `Sleep` lazily only if `Pending`.
-struct IdleTimeoutBody<B> {
-    /// Cleared on EOF, error, or timeout so `Option<Incoming>` uses `Incoming`'s
-    /// niche (no separate `done: bool` padding) and releases inner resources immediately.
-    inner: Option<B>,
-    timeout: Duration,
+struct ActiveStream<B> {
+    inner: B,
+    timeout: Option<Duration>,
     deadline: LazyDeadline,
+    metrics: Arc<ServerMetrics>,
+    layer: UpstreamLayer,
 }
 
-impl<B> IdleTimeoutBody<B> {
-    const fn new(inner: B, timeout: Duration) -> Self {
-        Self {
-            inner: Some(inner),
+/// Streaming response body wrapper that enforces an optional per-frame idle timeout
+/// and records mid-stream upstream body errors while preserving `Body::size_hint`
+/// and `Body::is_end_stream` (keeping `Content-Length` intact on HTTP/1.1 responses)
+/// and allocating `Sleep` lazily only if `Pending` with a configured timeout.
+///
+/// Clearing `self.0` on EOF, error, or timeout atomically releases `inner`,
+/// `Box<Sleep>`, and `Arc<ServerMetrics>` with zero tag overhead via `Arc`'s niche.
+struct StreamBody<B>(Option<ActiveStream<B>>);
+
+impl<B> StreamBody<B> {
+    const fn new(
+        inner: B,
+        timeout: Option<Duration>,
+        metrics: Arc<ServerMetrics>,
+        layer: UpstreamLayer,
+    ) -> Self {
+        Self(Some(ActiveStream {
+            inner,
             timeout,
             deadline: LazyDeadline::new(),
-        }
+            metrics,
+            layer,
+        }))
     }
 
-    fn finish(&mut self) {
-        self.inner = None;
-        self.deadline = LazyDeadline::new();
+    fn record_error(&mut self, reason: BodyErrorReason, err: &dyn fmt::Display) {
+        if let Some(stream) = self.0.take() {
+            stream.metrics.inc_body_error(stream.layer, reason);
+            warn!(
+                upstream = stream.layer.as_str(),
+                reason = reason.as_str(),
+                error = %err,
+                "upstream response body error"
+            );
+        }
     }
 }
 
-impl<B> Body for IdleTimeoutBody<B>
+impl<B> Body for StreamBody<B>
 where
     B: Body<Data = Bytes> + Unpin,
+    B::Error: fmt::Display,
 {
     type Data = Bytes;
     type Error = IdleTimeoutError<B::Error>;
@@ -83,26 +107,33 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = &mut *self;
-        let Some(inner) = this.inner.as_mut() else {
+        let Some(stream) = this.0.as_mut() else {
             return Poll::Ready(None);
         };
-        match Pin::new(inner).poll_frame(cx) {
+        match Pin::new(&mut stream.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                this.deadline.disarm();
+                if stream.inner.is_end_stream() {
+                    this.0 = None;
+                } else {
+                    stream.deadline.disarm();
+                }
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(err))) => {
-                this.finish();
+                this.record_error(BodyErrorReason::UpstreamError, &err);
                 Poll::Ready(Some(Err(IdleTimeoutError::Inner(err))))
             }
             Poll::Ready(None) => {
-                this.finish();
+                this.0 = None;
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                if this.deadline.poll_expired(cx, this.timeout) {
-                    this.finish();
-                    Poll::Ready(Some(Err(IdleTimeoutError::IdleTimeout)))
+                if let Some(timeout) = stream.timeout
+                    && stream.deadline.poll_expired(cx, timeout)
+                {
+                    let err = IdleTimeoutError::IdleTimeout;
+                    this.record_error(BodyErrorReason::IdleTimeout, &err);
+                    Poll::Ready(Some(Err(err)))
                 } else {
                     Poll::Pending
                 }
@@ -111,13 +142,13 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.as_ref().is_none_or(Body::is_end_stream)
+        self.0.as_ref().is_none_or(|s| s.inner.is_end_stream())
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.inner
+        self.0
             .as_ref()
-            .map_or_else(|| SizeHint::with_exact(0), Body::size_hint)
+            .map_or_else(|| SizeHint::with_exact(0), |s| s.inner.size_hint())
     }
 }
 
@@ -130,12 +161,14 @@ enum ResBodyInner {
         prefix: Bytes,
         rest: Incoming,
     },
-    Timeout(IdleTimeoutBody<Incoming>),
+    Stream(StreamBody<Incoming>),
 }
 
 /// Unboxed concrete HTTP body shared across local responses, health probes,
-/// passthrough request streams, and idle-bounded upstream response streams.
+/// passthrough request streams, and observed upstream response streams.
 pub(crate) struct ResBody(ResBodyInner);
+
+const _: () = assert!(std::mem::size_of::<ResBody>() <= 96);
 
 impl ResBody {
     pub(crate) fn incoming(body: Incoming) -> Self {
@@ -157,16 +190,24 @@ impl ResBody {
         }
     }
 
-    /// Wrap an upstream [`Incoming`] stream with an optional per-frame idle timeout,
-    /// collapsing already-empty bodies to [`empty_body()`].
-    pub(crate) fn streaming(body: Incoming, idle_timeout: Option<Duration>) -> Self {
+    /// Wrap an upstream [`Incoming`] stream with an optional per-frame idle timeout
+    /// and mid-stream error observer, collapsing already-empty bodies to [`empty_body()`]
+    /// before cloning `metrics`.
+    pub(crate) fn streaming(
+        body: Incoming,
+        idle_timeout: Option<Duration>,
+        metrics: &Arc<ServerMetrics>,
+        layer: UpstreamLayer,
+    ) -> Self {
         if body.is_end_stream() {
             return empty_body();
         }
-        match idle_timeout {
-            Some(timeout) => Self(ResBodyInner::Timeout(IdleTimeoutBody::new(body, timeout))),
-            None => Self(ResBodyInner::Incoming(body)),
-        }
+        Self(ResBodyInner::Stream(StreamBody::new(
+            body,
+            idle_timeout,
+            Arc::clone(metrics),
+            layer,
+        )))
     }
 }
 
@@ -198,7 +239,7 @@ impl Body for ResBody {
                         .map(|opt| opt.map(|res| res.map_err(IdleTimeoutError::Inner)))
                 }
             }
-            ResBodyInner::Timeout(body) => Pin::new(body).poll_frame(cx),
+            ResBodyInner::Stream(body) => Pin::new(body).poll_frame(cx),
         }
     }
 
@@ -207,7 +248,7 @@ impl Body for ResBody {
             ResBodyInner::Bytes(bytes) => bytes.is_empty(),
             ResBodyInner::Incoming(body) => body.is_end_stream(),
             ResBodyInner::Prefix { prefix, rest } => prefix.is_empty() && rest.is_end_stream(),
-            ResBodyInner::Timeout(body) => body.is_end_stream(),
+            ResBodyInner::Stream(body) => body.is_end_stream(),
         }
     }
 
@@ -218,7 +259,7 @@ impl Body for ResBody {
             ResBodyInner::Prefix { prefix, rest } => {
                 prefix_size_hint(prefix.len(), rest.size_hint())
             }
-            ResBodyInner::Timeout(body) => body.size_hint(),
+            ResBodyInner::Stream(body) => body.size_hint(),
         }
     }
 }
@@ -533,24 +574,124 @@ mod tests {
         assert_eq!(unbounded.upper(), None);
     }
 
-    #[tokio::test]
-    async fn idle_timeout_body_preserves_size_hint_and_avoids_timer_when_immediately_ready() {
+    #[tokio::test(start_paused = true)]
+    async fn stream_body_preserves_size_hint_and_avoids_eager_timer() {
         let payload = Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x1\"}");
-        let mut body = IdleTimeoutBody::new(Full::new(payload.clone()), Duration::from_secs(5));
+        let metrics = ServerMetrics::disabled();
+        let mut body = StreamBody::new(
+            Full::new(payload.clone()),
+            Some(Duration::from_secs(5)),
+            Arc::clone(&metrics),
+            UpstreamLayer::El,
+        );
         assert!(!body.is_end_stream());
         assert_eq!(body.size_hint().exact(), Some(payload.len() as u64));
 
-        let collected = (&mut body).collect().await.unwrap().to_bytes();
-        assert_eq!(collected, payload);
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first, payload);
         assert!(
-            !body.deadline.is_allocated(),
-            "immediate bodies must not allocate Sleep"
+            body.0.is_none() && Arc::strong_count(&metrics) == 1,
+            "StreamBody must drop active state immediately once inner reports is_end_stream()"
         );
         assert!(body.is_end_stream());
+        assert!(body.frame().await.is_none());
+        assert!(
+            metrics.render_prometheus().is_empty(),
+            "normal EOF must not record body errors"
+        );
 
-        let empty = IdleTimeoutBody::new(Full::new(Bytes::new()), Duration::from_secs(5));
+        // Immediately ready multi-frame streams must stay active without allocating `Sleep`.
+        let (imm_tx, imm_rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
+        imm_tx
+            .try_send(Ok(Frame::data(Bytes::from_static(b"a"))))
+            .unwrap();
+        imm_tx
+            .try_send(Ok(Frame::data(Bytes::from_static(b"b"))))
+            .unwrap();
+        drop(imm_tx);
+        let mut imm_body = StreamBody::new(
+            ChannelBody(imm_rx),
+            Some(Duration::from_secs(5)),
+            Arc::clone(&metrics),
+            UpstreamLayer::El,
+        );
+        let a = imm_body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(a, Bytes::from_static(b"a"));
+        assert!(
+            imm_body
+                .0
+                .as_ref()
+                .is_some_and(|s| !s.deadline.is_allocated()),
+            "immediate frames must not allocate Sleep while the stream stays active"
+        );
+        let b = imm_body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(b, Bytes::from_static(b"b"));
+        assert!(imm_body.frame().await.is_none());
+        assert!(imm_body.0.is_none());
+
+        let empty = StreamBody::new(
+            Full::new(Bytes::new()),
+            Some(Duration::from_secs(5)),
+            Arc::clone(&metrics),
+            UpstreamLayer::El,
+        );
         assert!(empty.is_end_stream());
         assert_eq!(empty.size_hint().exact(), Some(0));
+        drop(empty);
+
+        // Streaming body that yields `Pending` before clean `Poll::Ready(None)` EOF also
+        // releases `Arc<ServerMetrics>` and `Sleep` without recording an error.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
+        let mut eof_body = StreamBody::new(
+            ChannelBody(rx),
+            Some(Duration::from_secs(5)),
+            Arc::clone(&metrics),
+            UpstreamLayer::Cl,
+        );
+        let eof_reader = tokio::spawn(async move {
+            let chunk = eof_body
+                .frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap();
+            assert_eq!(chunk, Bytes::from_static(b"ok"));
+            assert!(
+                eof_body
+                    .0
+                    .as_ref()
+                    .is_some_and(|s| s.deadline.is_allocated()),
+                "Pending before chunk must allocate Sleep so EOF cleanup is exercised"
+            );
+            assert!(eof_body.frame().await.is_none());
+            assert!(eof_body.0.is_none());
+            eof_body
+        });
+        tokio::task::yield_now().await;
+        tx.send(Ok(Frame::data(Bytes::from_static(b"ok"))))
+            .await
+            .unwrap();
+        drop(tx);
+        let _eof_body = eof_reader.await.unwrap();
+        assert_eq!(
+            Arc::strong_count(&metrics),
+            1,
+            "clean Poll::Ready(None) EOF after Pending must drop Arc<ServerMetrics>"
+        );
+        assert!(metrics.render_prometheus().is_empty());
     }
 
     struct ChannelBody<E = Infallible>(tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, E>>);
@@ -568,9 +709,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn idle_timeout_body_resets_between_chunks_and_aborts_when_stalled() {
+    async fn stream_body_records_idle_timeout_and_upstream_errors_once_and_ignores_drop() {
+        let metrics = ServerMetrics::disabled();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let mut body = IdleTimeoutBody::new(ChannelBody::<Infallible>(rx), Duration::from_secs(10));
+        let mut body = StreamBody::new(
+            ChannelBody::<Infallible>(rx),
+            Some(Duration::from_secs(10)),
+            Arc::clone(&metrics),
+            UpstreamLayer::El,
+        );
 
         let reader = tokio::spawn(async move {
             let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
@@ -580,8 +727,8 @@ mod tests {
             let err = body.frame().await.unwrap().unwrap_err();
             assert_eq!(err.to_string(), "response body idle timeout");
             assert!(
-                !body.deadline.is_allocated(),
-                "finish() must release Sleep immediately on timeout"
+                body.0.is_none(),
+                "timeout must drop active state (inner, Sleep, metrics) immediately"
             );
             assert!(body.is_end_stream());
             assert_eq!(body.size_hint().exact(), Some(0));
@@ -604,10 +751,81 @@ mod tests {
             .unwrap();
         tokio::task::yield_now().await;
 
-        // Stalling > 10s with tx still open triggers the idle timeout and drops inner.
-        tokio::time::sleep(Duration::from_secs(11)).await;
+        // Stalling to exact 10s with tx still open triggers the idle timeout and drops inner.
+        tokio::time::sleep(Duration::from_millis(9_900)).await;
+        assert!(
+            !reader.is_finished(),
+            "idle timeout must not fire before 10s"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        // `reader.await` alone would auto-advance the paused clock to a late timer.
+        assert!(
+            reader.is_finished(),
+            "idle timeout must fire at 10s after the last frame"
+        );
         reader.await.unwrap();
-        assert!(tx.is_closed(), "finish() must drop inner body on timeout");
+        assert!(tx.is_closed(), "timeout must drop inner body");
+
+        // Unbounded stream (`timeout: None`, e.g. `--sse-idle-timeout 0`) never allocates
+        // `Sleep` across `Pending` yet still counts mid-stream upstream errors once.
+        let (tx_err, rx_err) = tokio::sync::mpsc::channel(4);
+        let mut unbounded = StreamBody::new(
+            ChannelBody::<&'static str>(rx_err),
+            None,
+            Arc::clone(&metrics),
+            UpstreamLayer::Cl,
+        );
+        let err_reader = tokio::spawn(async move {
+            let chunk = unbounded
+                .frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap();
+            assert_eq!(chunk, Bytes::from_static(b"hello"));
+            assert!(
+                unbounded
+                    .0
+                    .as_ref()
+                    .is_some_and(|s| !s.deadline.is_allocated()),
+                "timeout: None must never allocate Sleep even after Pending"
+            );
+            let err = unbounded.frame().await.unwrap().unwrap_err();
+            assert_eq!(err.to_string(), "upstream reset");
+            assert!(unbounded.0.is_none());
+            assert!(unbounded.frame().await.is_none());
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        tx_err
+            .send(Ok(Frame::data(Bytes::from_static(b"hello"))))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tx_err.send(Err("upstream reset")).await.unwrap();
+        err_reader.await.unwrap();
+
+        // Client-side drop before EOF or error must not increment any body-error counter.
+        let (_tx_drop, rx_drop) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(4);
+        let dropped = StreamBody::new(
+            ChannelBody(rx_drop),
+            Some(Duration::from_secs(10)),
+            Arc::clone(&metrics),
+            UpstreamLayer::El,
+        );
+        drop(dropped);
+
+        let rendered = metrics.render_prometheus();
+        assert!(rendered.contains(
+            "ethonyx_response_body_errors_total{upstream=\"EL\",reason=\"idle_timeout\"} 1\n"
+        ));
+        assert!(rendered.contains(
+            "ethonyx_response_body_errors_total{upstream=\"CL\",reason=\"upstream_error\"} 1\n"
+        ));
+        assert!(!rendered.contains("upstream=\"EL\",reason=\"upstream_error\""));
+        assert!(!rendered.contains("upstream=\"CL\",reason=\"idle_timeout\""));
     }
 
     #[test]
@@ -806,7 +1024,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn drain_http1_error_body_respects_version_byte_cap_and_timeout_budget() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct CountingBody<B> {
