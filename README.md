@@ -450,10 +450,10 @@ Common tasks (via `just`):
 
 | Recipe          | Action                                        |
 |-----------------|-----------------------------------------------|
-| `just check`    | fmt + clippy + test + audit (full local gate) |
+| `just check`    | fmt + clippy + doc + test (default & `--all-features`) + deny + audit |
 | `just fmt`      | `cargo fmt --all`                             |
-| `just deny`     | `cargo deny check` (supply-chain audit)       |
-| `just coverage` | HTML coverage report under `target/llvm-cov/` |
+| `just deny`     | `cargo deny --all-features check` (supply-chain audit) |
+| `just coverage` | HTML coverage report under `target/llvm-cov/` (`--all-features`) |
 | `just release`  | `cargo release patch --execute`               |
 
 Open in a devcontainer (VSCode / Codespaces) and `.devcontainer/devcontainer.json`

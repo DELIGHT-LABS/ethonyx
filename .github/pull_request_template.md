@@ -15,7 +15,9 @@
 
 ## Checklist
 
-- [ ] `cargo fmt --all` clean
-- [ ] `cargo clippy --all-targets --locked -- -D warnings` clean
-- [ ] `cargo test --locked` passes
+- [ ] `cargo fmt --all -- --check` clean
+- [ ] `cargo clippy --all-targets --locked -- -D warnings` clean (default & `--all-features`)
+- [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked` clean (default & `--all-features`)
+- [ ] `cargo test --locked` passes (default & `--all-features`)
+- [ ] `cargo deny --all-features check` and `cargo audit -D warnings` clean
 - [ ] `CHANGELOG.md` updated under `[Unreleased]` if user-visible
