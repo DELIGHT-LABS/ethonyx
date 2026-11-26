@@ -67,11 +67,12 @@ impl Connection {
         req: Request<Incoming>,
     ) -> Result<Response<ResBody>, Infallible> {
         let is_head = req.method() == Method::HEAD;
+        let version = req.version();
         // Hyper's HTTP/2 server does not suppress bodies for `Method::HEAD` (unlike
         // HTTP/1.1, which preserves local `text_response` `Content-Length` while
         // omitting body bytes on the wire), so strip non-empty bodies on HTTP/2
         // `HEAD` here while keeping all response headers intact.
-        let strip_head_body = is_head && req.version() == Version::HTTP_2;
+        let strip_head_body = is_head && version == Version::HTTP_2;
         let finish = |mut resp: Response<ResBody>| {
             if strip_head_body && !resp.body().is_end_stream() {
                 *resp.body_mut() = empty_body();
@@ -98,13 +99,8 @@ impl Connection {
         };
         let (layer, upstream_proto) = forward.layer_and_proto();
         let method_bucket = MethodBucket::classify(req.method());
-        let access_ctx = tracing::enabled!(target: "access_log", tracing::Level::INFO).then(|| {
-            (
-                req.version(),
-                req.method().clone(),
-                req.uri().path_and_query().cloned(),
-            )
-        });
+        let access_ctx = tracing::enabled!(target: "access_log", tracing::Level::INFO)
+            .then(|| (req.method().clone(), req.uri().path_and_query().cloned()));
         let otel_enabled = self.state.opts.otel_enabled;
         let span = if otel_enabled || tracing::enabled!(tracing::Level::DEBUG) {
             let span = tracing::info_span!(
@@ -123,24 +119,29 @@ impl Connection {
             tracing::Span::none()
         };
         let start = std::time::Instant::now();
-        let response = route(req, &self.state, forward)
-            .instrument(span.clone())
-            .await;
-        let elapsed = start.elapsed();
-        let status = response.status().as_u16();
-        if !span.is_disabled() {
-            // Pass `i64` so `tracing-opentelemetry` records an integer attribute (`Value::I64`)
-            // per OTel HTTP semantic conventions without allocating a formatted `String`.
-            span.record("http.response.status_code", i64::from(status));
-            // On `otel` builds, keep this ungated on `otel_enabled` so library callers
-            // with an external `tracing-opentelemetry` layer also receive `Status::Error`
-            // on 5xx (no-op on default builds without the `otel` feature).
-            if status >= 500 {
-                crate::otel::mark_span_error(&span);
+        // Move `span` into the instrumented future and record via `fut.span()` so
+        // every request avoids `span.clone()` refcount churn and keeps one `Span`
+        // (not two) live in `Connection::dispatch`'s async state machine.
+        let (response, elapsed, status) = {
+            let mut fut = std::pin::pin!(route(req, &self.state, forward).instrument(span));
+            let response = fut.as_mut().await;
+            let elapsed = start.elapsed();
+            let status = response.status().as_u16();
+            let span = fut.span();
+            if !span.is_disabled() {
+                // Pass `i64` so `tracing-opentelemetry` records an integer attribute (`Value::I64`)
+                // per OTel HTTP semantic conventions without allocating a formatted `String`.
+                span.record("http.response.status_code", i64::from(status));
+                // On `otel` builds, keep this ungated on `otel_enabled` so library callers
+                // with an external `tracing-opentelemetry` layer also receive `Status::Error`
+                // on 5xx (no-op on default builds without the `otel` feature).
+                if status >= 500 {
+                    crate::otel::mark_span_error(span);
+                }
             }
-        }
-        drop(span);
-        if let Some((version, method, pq)) = access_ctx {
+            (response, elapsed, status)
+        };
+        if let Some((method, pq)) = access_ctx {
             info!(
                 target: "access_log",
                 peer = %self.peer,
@@ -349,6 +350,7 @@ async fn proxy_http(
         Some(mock) if !has_non_100_expect(&parts.headers) => match mock {
             LocalMock::NodeHealth => return health::node_health(state, parts.uri.query()),
             LocalMock::ClSubscription => {
+                drop(parts);
                 let deadline = tokio::time::Instant::now() + state.opts.proxy_timeout;
                 if let Err(err) = drain_body(body, MAX_MOCK_DRAIN_BYTES, deadline).await {
                     return body_read_error_response(err);
