@@ -16,7 +16,8 @@ use crate::transport::{HttpTarget, ProxyClient};
 use super::cl::{cl_peer_count, cl_syncing_status};
 use super::el::el_batch_detect;
 use super::eval::{
-    ClProbe, ClSyncEval, ElSyncEval, LocalProbe, Probe, ReadinessEval, evaluate_readiness,
+    ClProbe, ClSyncEval, ElSyncEval, LocalProbe, Probe, ReadinessEval, evaluate_readiness_at,
+    now_unix,
 };
 use super::fetch::ProbeTarget;
 use super::reference::ReferencePoller;
@@ -63,8 +64,13 @@ impl PollObserver {
         }
     }
 
-    fn observe(&mut self, metrics: &ServerMetrics, probe: &Probe) {
-        let eval = evaluate_readiness(self.policy, probe);
+    fn observe(
+        &mut self,
+        metrics: &ServerMetrics,
+        probe: &Probe,
+        now: impl FnOnce() -> Option<u64>,
+    ) {
+        let eval = evaluate_readiness_at(self.policy, probe, now);
         let ready = eval.is_ready();
         let status = if ready { "ready" } else { "not_ready" };
         debug!(status, "health poll");
@@ -147,15 +153,21 @@ impl Publisher {
         policy: HealthPolicy,
         initial: Probe,
         metrics: &ServerMetrics,
+        now: impl FnOnce() -> Option<u64>,
     ) -> (Self, watch::Receiver<Probe>) {
         let mut observer = PollObserver::new(policy);
-        observer.observe(metrics, &initial);
+        observer.observe(metrics, &initial, now);
         let (tx, rx) = watch::channel(initial);
         (Self { tx, observer }, rx)
     }
 
-    fn publish(&mut self, metrics: &ServerMetrics, probe: Probe) {
-        self.observer.observe(metrics, &probe);
+    fn publish(
+        &mut self,
+        metrics: &ServerMetrics,
+        probe: Probe,
+        now: impl FnOnce() -> Option<u64>,
+    ) {
+        self.observer.observe(metrics, &probe, now);
         // `AppState` holds a receiver and the poller task holds `Arc<AppState>`.
         self.tx.send_replace(probe);
     }
@@ -197,7 +209,7 @@ pub(crate) async fn warm(
         local,
         reference: ref_probe,
     };
-    let (publisher, rx) = Publisher::new(policy, initial, metrics);
+    let (publisher, rx) = Publisher::new(policy, initial, metrics, now_unix);
     (
         HealthSource::Polled { rx, policy },
         Some(HealthPoller {
@@ -263,7 +275,7 @@ impl HealthPoller {
                     reference: Some(reference),
                 },
             };
-            publisher.publish(&state.metrics, probe);
+            publisher.publish(&state.metrics, probe, now_unix);
         }
     }
 }
@@ -323,8 +335,15 @@ mod tests {
         };
         let metrics = ServerMetrics::default();
         let mut observer = PollObserver::new(DEFAULT_POLICY);
-        let mut record =
-            |p: &Probe| observer.record_metrics(&metrics, p, evaluate_readiness(DEFAULT_POLICY, p));
+        let mut record = |p: &Probe| {
+            observer.record_metrics(
+                &metrics,
+                p,
+                evaluate_readiness_at(DEFAULT_POLICY, p, || {
+                    panic!("non-strict evaluation must not read the clock")
+                }),
+            )
+        };
         // A transient outage before/around `-32601` must never register or pin `ElPeers` at 0.
         let outage = Probe {
             local: Arc::new(LocalProbe {
@@ -399,44 +418,84 @@ mod tests {
                 text.matches("readiness recovered").count(),
             )
         };
-        let probe = |syncing| Probe {
+        let probe_at = |syncing, timestamp| Probe {
             local: Arc::new(LocalProbe {
                 el: Ok(ElBatchResult {
                     syncing: Ok(syncing),
                     peers: Ok(None),
                     block: Ok(ElBlockResult {
                         number: 50,
-                        timestamp: 1_700_000_000,
+                        timestamp,
                     }),
                 }),
                 cl: None,
             }),
             reference: None,
         };
+        let probe = |syncing| probe_at(syncing, 1_700_000_000);
+        let no_clock =
+            || -> Option<u64> { panic!("non-strict observation must not read the clock") };
+        let strict_policy = HealthPolicy {
+            strict: Some(crate::config::StrictFreshness {
+                el_max_block_age_secs: 60,
+                cl_max_slot_age_secs: 60,
+            }),
+            ..DEFAULT_POLICY
+        };
         let metrics = ServerMetrics::default();
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::callsite::rebuild_interest_cache();
-            let (mut healthy_start, _rx) =
-                Publisher::new(DEFAULT_POLICY, probe(ElSyncingResult::Synced), &metrics);
+            let (mut healthy_start, _rx) = Publisher::new(
+                DEFAULT_POLICY,
+                probe(ElSyncingResult::Synced),
+                &metrics,
+                no_clock,
+            );
             assert_eq!(logged(), (0, 0), "a healthy first poll stays quiet");
-            healthy_start.publish(&metrics, probe(ElSyncingResult::SyncingBool));
-            healthy_start.publish(&metrics, probe(ElSyncingResult::SyncingBool));
+            healthy_start.publish(&metrics, probe(ElSyncingResult::SyncingBool), no_clock);
+            healthy_start.publish(&metrics, probe(ElSyncingResult::SyncingBool), no_clock);
             assert_eq!(logged(), (1, 0), "one warning per degradation");
-            healthy_start.publish(&metrics, probe(ElSyncingResult::Synced));
-            healthy_start.publish(&metrics, probe(ElSyncingResult::Synced));
+            healthy_start.publish(&metrics, probe(ElSyncingResult::Synced), no_clock);
+            healthy_start.publish(&metrics, probe(ElSyncingResult::Synced), no_clock);
             assert_eq!(logged(), (1, 1), "one notice per recovery");
 
             let (_degraded_start, _rx2) = Publisher::new(
                 DEFAULT_POLICY,
                 probe(ElSyncingResult::SyncingBool),
                 &metrics,
+                no_clock,
             );
             assert_eq!(
                 logged(),
                 (2, 1),
                 "a degraded first poll is reported at once"
             );
+
+            // Deterministic `--readyz-strict` transitions across the exact 60s/61s freshness boundary.
+            const TS: u64 = 1_700_000_000;
+            let (mut strict, _rx3) = Publisher::new(
+                strict_policy,
+                probe_at(ElSyncingResult::Synced, TS),
+                &metrics,
+                || Some(TS + 60),
+            );
+            assert_eq!(
+                logged(),
+                (2, 1),
+                "strict fresh boundary (age == 60) stays quiet"
+            );
+            strict.publish(&metrics, probe_at(ElSyncingResult::Synced, TS), || {
+                Some(TS + 61)
+            });
+            strict.publish(&metrics, probe_at(ElSyncingResult::Synced, TS), || {
+                Some(TS + 62)
+            });
+            assert_eq!(logged(), (3, 1), "strict stale transition logs once");
+            strict.publish(&metrics, probe_at(ElSyncingResult::Synced, TS + 5), || {
+                Some(TS + 65)
+            });
+            assert_eq!(logged(), (3, 2), "strict freshness recovery logs once");
         });
     }
 }

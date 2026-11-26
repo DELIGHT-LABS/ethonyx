@@ -22,10 +22,10 @@ const MAX_EL_BATCH_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SMALL_PROBE_BODY_BYTES: usize = 64 * 1024;
 const MAX_RPC_ERROR_BYTES: usize = 512;
 
-/// Format `val` into a bounded `String` (at most `MAX_RPC_ERROR_BYTES + 3` bytes),
+/// Format `args` into a bounded `String` (at most `MAX_RPC_ERROR_BYTES + 3` bytes),
 /// stopping formatting early on a UTF-8 boundary with `"..."` so untrusted upstream
 /// payloads or verbose errors never allocate unbounded intermediate strings.
-fn format_truncated(val: impl fmt::Display) -> String {
+fn format_truncated(args: fmt::Arguments<'_>) -> String {
     struct Bounded {
         buf: String,
         truncated: bool,
@@ -55,7 +55,7 @@ fn format_truncated(val: impl fmt::Display) -> String {
         buf: String::new(),
         truncated: false,
     };
-    let _ = fmt::write(&mut out, format_args!("{val}"));
+    let _ = fmt::write(&mut out, args);
     out.buf
 }
 
@@ -72,13 +72,13 @@ pub(super) enum HealthError {
 
 impl HealthError {
     pub(super) fn transport(err: impl fmt::Display) -> Self {
-        Self::Transport(format_truncated(err))
+        Self::Transport(format_truncated(format_args!("{err}")))
     }
 
     /// Cap formatted decode errors so untrusted upstream strings echoed by `serde`
     /// cannot bloat `Probe` or repeat verbatim on every `/healthz` and `/readyz`.
     pub(super) fn decode(err: impl fmt::Display) -> Self {
-        Self::Decode(Cow::Owned(format_truncated(err)))
+        Self::Decode(Cow::Owned(format_truncated(format_args!("{err}"))))
     }
 
     pub(super) const fn decode_msg(msg: &'static str) -> Self {
@@ -88,7 +88,7 @@ impl HealthError {
     /// Cap copied upstream JSON-RPC error payloads so a multi-MiB error response
     /// cannot bloat `Probe` or repeat verbatim on every `/healthz` and `/readyz`.
     pub(super) fn rpc_truncated(raw: &str) -> Self {
-        Self::Rpc(format_truncated(raw))
+        Self::Rpc(format_truncated(format_args!("{raw}")))
     }
 }
 
@@ -303,10 +303,10 @@ mod tests {
 
         // Exact-limit string must not get truncated; multi-chunk Display stops at the cap.
         let exact = "a".repeat(MAX_RPC_ERROR_BYTES);
-        assert_eq!(format_truncated(&exact), exact);
+        assert_eq!(format_truncated(format_args!("{exact}")), exact);
         // The cap falls inside a two-byte scalar here: the cut backs up one byte.
         let straddling = format!("a{}", "é".repeat(MAX_RPC_ERROR_BYTES));
-        let cut = format_truncated(&straddling);
+        let cut = format_truncated(format_args!("{straddling}"));
         assert_eq!(cut.len(), MAX_RPC_ERROR_BYTES - 1 + 3);
         assert!(cut.ends_with("é..."));
         struct MultiChunk;
@@ -318,7 +318,7 @@ mod tests {
                 Ok(())
             }
         }
-        let chunked = format_truncated(MultiChunk);
+        let chunked = format_truncated(format_args!("{MultiChunk}"));
         assert_eq!(chunked.len(), MAX_RPC_ERROR_BYTES + 3);
         assert!(chunked.ends_with("..."));
     }

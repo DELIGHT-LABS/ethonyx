@@ -25,28 +25,31 @@ struct TelemetryProviders {
 }
 
 impl TelemetryProviders {
-    fn shutdown_blocking(self, deadline: tokio::time::Instant) {
+    fn shutdown_blocking(self, tokio_deadline: tokio::time::Instant, timeout: Duration) {
         let Self {
             shutdown_tx,
             traces,
             metrics,
         } = self;
-        // Publish a shared shutdown deadline so in-flight OTLP HTTP exports
+        // Publish a shared Tokio shutdown deadline so in-flight OTLP HTTP exports
         // (including `SdkMeterProvider::shutdown_with_timeout`, whose timeout
         // argument is ignored by `opentelemetry_sdk` 0.33.1) abort on time and
-        // strip `Retry-After` throttle headers.
-        shutdown_tx.send(deadline);
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // strip `Retry-After` throttle headers. Track the OS thread's own
+        // sequential fallback budget against `std::time::Instant` so it never
+        // reads `tokio::time::Instant::now()` outside a Tokio runtime context.
+        shutdown_tx.send(tokio_deadline);
+        let wall_now = std::time::Instant::now();
+        let wall_deadline = wall_now.checked_add(timeout).unwrap_or(wall_now);
         std::thread::scope(|s| {
             let metrics_ref = &metrics;
             let metrics_handle = std::thread::Builder::new()
                 .name("otel-metrics-sd".into())
                 .spawn_scoped(s, move || {
-                    if let Err(error) = metrics_ref.shutdown_with_timeout(remaining) {
+                    if let Err(error) = metrics_ref.shutdown_with_timeout(timeout) {
                         tracing::warn!(%error, "OTel meter provider shutdown failed");
                     }
                 });
-            if let Err(error) = traces.shutdown_with_timeout(remaining) {
+            if let Err(error) = traces.shutdown_with_timeout(timeout) {
                 tracing::warn!(%error, "OTel tracer provider shutdown failed");
             }
             match metrics_handle {
@@ -60,7 +63,8 @@ impl TelemetryProviders {
                         %error,
                         "failed to spawn OTel metrics shutdown thread; shutting down sequentially"
                     );
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let remaining =
+                        wall_deadline.saturating_duration_since(std::time::Instant::now());
                     if let Err(error) = metrics.shutdown_with_timeout(remaining) {
                         tracing::warn!(%error, "OTel meter provider shutdown failed");
                     }
@@ -95,7 +99,8 @@ impl Telemetry {
         let Some(providers) = self.0.take() else {
             return;
         };
-        let deadline = tokio::time::Instant::now() + timeout;
+        let now = tokio::time::Instant::now();
+        let deadline = now.checked_add(timeout).unwrap_or(now);
         // Run blocking OTel provider shutdown on a dedicated detached OS thread
         // instead of Tokio's blocking pool so:
         // 1. `tokio::time::timeout_at` enforces a strict upper bound even if
@@ -107,7 +112,7 @@ impl Telemetry {
         match std::thread::Builder::new()
             .name("otel-shutdown".into())
             .spawn(move || {
-                providers.shutdown_blocking(deadline);
+                providers.shutdown_blocking(deadline, timeout);
                 let _ = done_tx.send(());
             }) {
             Ok(_handle) => {
@@ -131,14 +136,15 @@ impl Telemetry {
 impl Drop for Telemetry {
     fn drop(&mut self) {
         if let Some(providers) = self.0.take() {
-            let deadline = tokio::time::Instant::now() + OTLP_SHUTDOWN_TIMEOUT;
+            let now = tokio::time::Instant::now();
+            let deadline = now.checked_add(OTLP_SHUTDOWN_TIMEOUT).unwrap_or(now);
             // Installed subscriber layers (`SdkTracer`) and `OtelMetrics` (`Meter`)
             // retain strong clones of the underlying pipelines, so abnormal drops
             // without `shutdown().await` offload explicit shutdown to a detached
             // thread without blocking async workers or coupling to a dying runtime.
             let _ = std::thread::Builder::new()
                 .name("otel-drop".into())
-                .spawn(move || providers.shutdown_blocking(deadline));
+                .spawn(move || providers.shutdown_blocking(deadline, OTLP_SHUTDOWN_TIMEOUT));
         }
     }
 }

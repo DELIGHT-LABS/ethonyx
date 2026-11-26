@@ -172,6 +172,7 @@ pub(super) enum FreshEval<'a> {
     Disabled {
         head_slot: u64,
     },
+    ClockUnavailable,
     Err(MethodError<'a>),
 }
 
@@ -180,7 +181,7 @@ impl FreshEval<'_> {
         match self {
             Self::Measured { age, max_age, .. } => age <= max_age,
             Self::Disabled { .. } => true,
-            Self::Err(_) => false,
+            Self::ClockUnavailable | Self::Err(_) => false,
         }
     }
 }
@@ -201,6 +202,7 @@ impl fmt::Display for FreshEval<'_> {
                 max_age,
             } => write!(f, "{kind} {num} stale: {age}s (max {max_age})"),
             Self::Disabled { head_slot } => write!(f, "slot {head_slot} (age check disabled)"),
+            Self::ClockUnavailable => f.write_str("system clock before unix epoch"),
             Self::Err(err) => err.fmt(f),
         }
     }
@@ -228,6 +230,14 @@ impl ReadinessEval<'_> {
 }
 
 pub(super) fn evaluate_readiness<'a>(policy: HealthPolicy, probe: &'a Probe) -> ReadinessEval<'a> {
+    evaluate_readiness_at(policy, probe, now_unix)
+}
+
+pub(super) fn evaluate_readiness_at<'a>(
+    policy: HealthPolicy,
+    probe: &'a Probe,
+    now: impl FnOnce() -> Option<u64>,
+) -> ReadinessEval<'a> {
     let local = &probe.local;
     let el_sync = eval_el_syncing(&local.el);
     let cl_sync = local.cl.as_ref().map(|cl| eval_cl_syncing(&cl.status));
@@ -242,21 +252,22 @@ pub(super) fn evaluate_readiness<'a>(policy: HealthPolicy, probe: &'a Probe) -> 
     // `now` is only needed for strict freshness checks; the default path skips reading the clock.
     let (el_block_fresh, cl_slot_fresh) = match policy.strict {
         Some(strict) => {
-            let now = now_unix();
-            let el_f = Some(eval_el_block_fresh(
-                &local.el,
-                strict.el_max_block_age_secs,
-                now,
-            ));
-            let cl_f = local.cl.as_ref().map(|cl| {
-                eval_cl_slot_fresh(
-                    &cl.status,
-                    policy.slot_clock,
-                    strict.cl_max_slot_age_secs,
+            let now = now();
+            (
+                Some(eval_el_block_fresh(
+                    &local.el,
+                    strict.el_max_block_age_secs,
                     now,
-                )
-            });
-            (el_f, cl_f)
+                )),
+                local.cl.as_ref().map(|cl| {
+                    eval_cl_slot_fresh(
+                        &cl.status,
+                        policy.slot_clock,
+                        strict.cl_max_slot_age_secs,
+                        now,
+                    )
+                }),
+            )
         }
         None => (None, None),
     };
@@ -270,10 +281,11 @@ pub(super) fn evaluate_readiness<'a>(policy: HealthPolicy, probe: &'a Probe) -> 
     }
 }
 
-pub(super) fn now_unix() -> u64 {
+pub(super) fn now_unix() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 fn eval_el_syncing(el: &Result<ElBatchResult, HealthError>) -> ElSyncEval<'_> {
@@ -311,16 +323,17 @@ fn eval_cl_syncing(r: &Result<ClStatus, HealthError>) -> ClSyncEval<'_> {
 fn eval_el_block_fresh(
     el: &Result<ElBatchResult, HealthError>,
     max_age: u64,
-    now: u64,
+    now: Option<u64>,
 ) -> FreshEval<'_> {
-    match el.as_ref().and_then(|batch| batch.block.as_ref()) {
-        Ok(block) => FreshEval::Measured {
+    match (el.as_ref().and_then(|batch| batch.block.as_ref()), now) {
+        (Err(err), _) => FreshEval::Err(MethodError("eth_getBlockByNumber", err)),
+        (Ok(_), None) => FreshEval::ClockUnavailable,
+        (Ok(block), Some(now)) => FreshEval::Measured {
             kind: "block",
             num: block.number,
             age: block.age(now),
             max_age,
         },
-        Err(err) => FreshEval::Err(MethodError("eth_getBlockByNumber", err)),
     }
 }
 
@@ -328,19 +341,20 @@ fn eval_cl_slot_fresh(
     r: &Result<ClStatus, HealthError>,
     slot_clock: Option<SlotClock>,
     max_age: u64,
-    now: u64,
+    now: Option<u64>,
 ) -> FreshEval<'_> {
-    match (r, slot_clock) {
-        (Ok(s), None) => FreshEval::Disabled {
+    match (r, slot_clock, now) {
+        (Err(err), _, _) => FreshEval::Err(MethodError("node/syncing", err)),
+        (Ok(s), None, _) => FreshEval::Disabled {
             head_slot: s.head_slot,
         },
-        (Ok(s), Some(clock)) => FreshEval::Measured {
+        (Ok(_), Some(_), None) => FreshEval::ClockUnavailable,
+        (Ok(s), Some(clock), Some(now)) => FreshEval::Measured {
             kind: "slot",
             num: s.head_slot,
             age: clock.slot_age(s.head_slot, now),
             max_age,
         },
-        (Err(err), _) => FreshEval::Err(MethodError("node/syncing", err)),
     }
 }
 
@@ -578,7 +592,7 @@ mod tests {
                 timestamp: 0x3e2,
             }),
         );
-        let e = eval_el_block_fresh(&r, 60, 1000);
+        let e = eval_el_block_fresh(&r, 60, Some(1000));
         assert_eval(e.is_ok(), e, true, "block 5, age 6s");
     }
 
@@ -591,7 +605,7 @@ mod tests {
                 timestamp: 0x384,
             }),
         );
-        let e = eval_el_block_fresh(&r, 60, 1000);
+        let e = eval_el_block_fresh(&r, 60, Some(1000));
         assert_eval(e.is_ok(), e, false, "block 5 stale: 100s (max 60)");
     }
 
@@ -604,7 +618,7 @@ mod tests {
             is_optimistic: false,
             el_offline: false,
         });
-        let e = eval_cl_slot_fresh(&r, SlotClock::new(0, 12), 60, 9_999_999);
+        let e = eval_cl_slot_fresh(&r, SlotClock::new(0, 12), 60, Some(9_999_999));
         assert_eval(e.is_ok(), e, true, "slot 7 (age check disabled)");
     }
 
@@ -617,8 +631,61 @@ mod tests {
             is_optimistic: false,
             el_offline: false,
         });
-        let e = eval_cl_slot_fresh(&r, SlotClock::new(1000, 12), 60, 1300);
+        let e = eval_cl_slot_fresh(&r, SlotClock::new(1000, 12), 60, Some(1300));
         assert_eval(e.is_ok(), e, false, "slot 10 stale: 180s (max 60)");
+    }
+
+    #[test]
+    fn probe_errors_and_disabled_slot_clock_take_precedence_when_clock_unavailable() {
+        let el_err = batch(
+            Ok(ElSyncingResult::Synced),
+            Err(HealthError::Rpc("rpc timeout".into())),
+        );
+        let e = eval_el_block_fresh(&el_err, 60, None);
+        assert_eval(
+            e.is_ok(),
+            e,
+            false,
+            "eth_getBlockByNumber: rpc error: rpc timeout",
+        );
+
+        let el_ok = batch(
+            Ok(ElSyncingResult::Synced),
+            Ok(ElBlockResult {
+                number: 5,
+                timestamp: 0x3e2,
+            }),
+        );
+        let e = eval_el_block_fresh(&el_ok, 60, None);
+        assert_eval(e.is_ok(), e, false, "system clock before unix epoch");
+
+        let cl_err: Result<ClStatus, HealthError> = Err(HealthError::decode_msg("beacon down"));
+        for slot_clock in [None, SlotClock::new(1000, 12)] {
+            let e = eval_cl_slot_fresh(&cl_err, slot_clock, 60, None);
+            assert_eval(e.is_ok(), e, false, "node/syncing: decode: beacon down");
+        }
+
+        let cl_ok = Ok(ClStatus {
+            head_slot: 7,
+            sync_distance: 0,
+            is_syncing: false,
+            is_optimistic: false,
+            el_offline: false,
+        });
+        let disabled = eval_cl_slot_fresh(&cl_ok, None, 60, None);
+        assert_eval(
+            disabled.is_ok(),
+            disabled,
+            true,
+            "slot 7 (age check disabled)",
+        );
+        let unavail = eval_cl_slot_fresh(&cl_ok, SlotClock::new(1000, 12), 60, None);
+        assert_eval(
+            unavail.is_ok(),
+            unavail,
+            false,
+            "system clock before unix epoch",
+        );
     }
 
     #[test]
