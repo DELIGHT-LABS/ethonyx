@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Uri, header::CONTENT_TYPE};
-use hyper::body::Body as _;
 
-use crate::response::{BodyReadError, ResBody, collect_body, drain_body, empty_body, full_body};
+use crate::response::{
+    BodyReadError, ResBody, collect_body, drain_http1_error_body, empty_body, full_body,
+};
 use crate::transport::{
     HttpTarget, HttpTransport, ProbeMode, ProbeTransportError, ProxyClient, UNTRACKED_TRANSPORT,
 };
@@ -19,8 +20,6 @@ const MAX_EL_BATCH_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// CL Beacon (`/eth/v1/node/{syncing,peer_count}`) and Reference EL (`chainId`/`blockNumber`)
 /// payloads are ~100–250 bytes; keep untrusted/external endpoint memory tightly bounded.
 const MAX_SMALL_PROBE_BODY_BYTES: usize = 64 * 1024;
-const MAX_NON_2XX_DRAIN_BYTES: usize = 8 * 1024;
-const MAX_NON_2XX_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_RPC_ERROR_BYTES: usize = 512;
 
 /// Format `val` into a bounded `String` (at most `MAX_RPC_ERROR_BYTES + 3` bytes),
@@ -228,17 +227,10 @@ impl<'a> ProbeTarget<'a> {
             .send_probe(self.client, self.timeout, mode, make_req)
             .await?;
         let status = resp.status();
-        let is_http1 = resp.version() == http::Version::HTTP_11;
+        let version = resp.version();
         let body = resp.into_body();
         if !status.is_success() {
-            // Opportunistically drain small HTTP/1.1 error bodies (e.g. 429/503 JSON)
-            // so Hyper keeps the TCP+TLS connection pooled, capped tightly so a stalled
-            // error body never burns the full `--health-timeout`.
-            if is_http1 && !body.is_end_stream() {
-                let drain_deadline =
-                    deadline.min(tokio::time::Instant::now() + MAX_NON_2XX_DRAIN_TIMEOUT);
-                let _ = drain_body(body, MAX_NON_2XX_DRAIN_BYTES, drain_deadline).await;
-            }
+            drain_http1_error_body(version, body, deadline).await;
             return Err(HealthError::HttpStatus(status));
         }
         collect_body(body, max_body, Some(deadline))

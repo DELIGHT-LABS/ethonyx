@@ -350,7 +350,10 @@ pub(crate) async fn accept_loop(
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => return,
-                    permit = state.conn_limit.acquire() => permit,
+                    permit = state.conn_limit.acquire() => match permit {
+                        Some(permit) => permit,
+                        None => return,
+                    },
                 }
             }
         };

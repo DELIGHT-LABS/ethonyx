@@ -43,6 +43,10 @@ http-body-util = "0.1.5"
 hyper-util = { version = "0.1.21", features = ["server-auto"] }
 tokio = { version = "1.54.1", features = ["test-util"] }
 
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
 # Omit DWARF debuginfo on third-party crates while keeping full local debuginfo for CodeLLDB.
 [profile.dev.package."*"]
 debug = false

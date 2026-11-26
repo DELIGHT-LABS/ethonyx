@@ -272,8 +272,7 @@ match (`git` is `v0.1.2`); an ad-hoc build off a later commit shows
 changes — so a binary's exact provenance is always visible in its logs. (`git`
 is `unknown` when built without a git checkout, e.g. from a source tarball.)
 
-Set the level with `--log-level <trace|debug|info|warn|error>` (default `info`); under `--log-level debug|trace`, `opentelemetry-otlp` is capped at `info` so raw OTLP export URLs are not logged.
-`RUST_LOG` overrides `--log-level` and allows per-target directives (when `--otel-endpoint` is set, scope debug logging — e.g. `RUST_LOG=ethonyx=debug` or `RUST_LOG=debug,opentelemetry-otlp=info` — so `opentelemetry-otlp` export-error debug logs do not print raw OTLP URLs):
+Set the level with `--log-level <trace|debug|info|warn|error>` (default `info`). `RUST_LOG` overrides `--log-level` and allows per-target directives. Under both `--log-level` and `RUST_LOG`, `opentelemetry-otlp` is always capped at `info` and `*.PartialSuccess` warnings are suppressed so raw OTLP export URLs and collector error bodies are never logged:
 
 ```sh
 ethonyx --log-level debug ...

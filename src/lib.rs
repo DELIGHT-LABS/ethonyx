@@ -5,8 +5,7 @@
 //! binding from serving via [`Prepared::bind`] and [`Bound::serve`] to inspect
 //! ephemeral [`Bound::local_addrs`] first.
 
-#![forbid(unsafe_code)]
-#![warn(unreachable_pub)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod config;
 mod headers;

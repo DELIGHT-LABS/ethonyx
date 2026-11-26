@@ -4,6 +4,8 @@
 //! tree had uncommitted changes). Falls back to `unknown` when git isn't
 //! available (e.g. building from a source tarball).
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -105,7 +107,10 @@ fn emit_git_rerun_hints() {
 }
 
 fn main() {
-    let stdout = git_stdout(&["describe", "--always", "--dirty", "--tags"]);
+    let has_git = Path::new(".git").exists();
+    let stdout = has_git
+        .then(|| git_stdout(&["describe", "--always", "--dirty", "--tags"]))
+        .flatten();
     let describe = stdout
         .as_deref()
         .map(str::trim)
@@ -116,6 +121,8 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=Cargo.toml");
     emit_if_exists(Path::new("Cargo.lock"));
-    emit_source_rerun_hints(Path::new("src"));
-    emit_git_rerun_hints();
+    if has_git {
+        emit_source_rerun_hints(Path::new("src"));
+        emit_git_rerun_hints();
+    }
 }
