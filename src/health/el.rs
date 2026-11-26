@@ -97,10 +97,46 @@ pub(super) struct ElBatchResult {
     pub(super) block: Result<ElBlockResult, HealthError>,
 }
 
+/// `i64` JSON decoder that rejects string values without echoing them into
+/// `serde_json::Error`, bounding error allocations against multi-MiB EL batch payloads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BoundedI64(i64);
+
+impl<'de> serde::Deserialize<'de> for BoundedI64 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = BoundedI64;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a 64-bit signed integer")
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(BoundedI64(v))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                i64::try_from(v)
+                    .map(BoundedI64)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, _v: &str) -> Result<Self::Value, E> {
+                Err(E::invalid_type(
+                    serde::de::Unexpected::Other("string"),
+                    &self,
+                ))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct RpcResponse<'a> {
     #[serde(default)]
-    id: Option<i64>,
+    id: Option<BoundedI64>,
     #[serde(borrow)]
     result: Option<&'a serde_json::value::RawValue>,
     #[serde(borrow)]
@@ -163,7 +199,7 @@ fn parse_el_quantity(body: &[u8]) -> Result<u64, HealthError> {
     {
         return Err(HealthError::rpc_truncated(err.get()));
     }
-    if resp.id != Some(1) {
+    if resp.id != Some(BoundedI64(1)) {
         return Err(HealthError::decode_msg("unexpected response id"));
     }
     resp.decode::<HexQuantity>().map(|HexQuantity(n)| n)
@@ -198,6 +234,9 @@ where
             Err(err) => Err(HealthError::decode(err)),
         };
     }
+    if trimmed.first() != Some(&b'[') {
+        return Err(HealthError::decode_msg("expected JSON-RPC batch array"));
+    }
 
     let arr: [JsonObject<RpcResponse<'a>>; N] =
         serde_json::from_slice(trimmed).map_err(HealthError::decode)?;
@@ -206,7 +245,7 @@ where
     for JsonObject(resp) in arr {
         let Some(idx) = resp
             .id
-            .and_then(|id| id.checked_sub(1))
+            .and_then(|BoundedI64(id)| id.checked_sub(1))
             .and_then(|i| usize::try_from(i).ok())
             .filter(|&i| i < N)
         else {
@@ -231,13 +270,14 @@ fn parse_el_ref_batch(body: &[u8]) -> Result<(u64, u64), HealthError> {
     Ok((chain_id, block))
 }
 
+#[derive(serde::Deserialize)]
+struct RpcErrorCode {
+    code: BoundedI64,
+}
+
 fn is_method_not_found(err_raw: &str) -> bool {
-    #[derive(serde::Deserialize)]
-    struct RpcErrorCode {
-        code: i64,
-    }
     serde_json::from_str::<JsonObject<RpcErrorCode>>(err_raw)
-        .is_ok_and(|JsonObject(e)| e.code == JSONRPC_METHOD_NOT_FOUND)
+        .is_ok_and(|JsonObject(e)| e.code.0 == JSONRPC_METHOD_NOT_FOUND)
 }
 
 fn parse_el_batch(body: &[u8]) -> Result<ElBatchResult, HealthError> {
@@ -462,6 +502,8 @@ mod tests {
                 "{input}"
             );
         }
+        assert!(serde_json::from_str::<BoundedI64>("9223372036854775808").is_err());
+        assert!(serde_json::from_str::<BoundedI64>("18446744073709519015").is_err());
         let parsed =
             parse_el_batch(br#"[{"id":1,"result":null},{"id":2},{"id":3,"result":{}}]"#).unwrap();
         assert!(parsed.syncing.is_err());
@@ -553,5 +595,47 @@ mod tests {
             .to_string();
         assert!(err.len() <= 128, "syncing decode error bloated: {err}");
         assert!(!err.contains("ééé"), "syncing error echoed payload: {err}");
+
+        // Oversized top-level string for a batch response must fail upfront without echoing
+        // into transient `serde_json::Error` allocations.
+        let HealthError::Decode(top_msg) = parse_el_batch(syncing_str.as_bytes()).unwrap_err()
+        else {
+            panic!("expected Decode error for oversized top-level batch string");
+        };
+        assert!(top_msg.len() <= 128, "top-level decode bloated: {top_msg}");
+        assert!(
+            !top_msg.contains("ééé"),
+            "top-level batch error echoed payload: {top_msg}"
+        );
+
+        // Oversized strings in `RpcResponse.id` and `RpcErrorCode.code` must not echo
+        // into transient `serde_json::Error` allocations.
+        let huge_id_batch = format!(
+            r#"[{{"jsonrpc":"2.0","id":"{huge}","result":false}},{{"jsonrpc":"2.0","id":2,"result":"0x1"}},{{"jsonrpc":"2.0","id":3,"result":{{"number":"0x1","timestamp":"0x1"}}}}]"#
+        );
+        let HealthError::Decode(id_msg) = parse_el_batch(huge_id_batch.as_bytes()).unwrap_err()
+        else {
+            panic!("expected Decode error for oversized string id");
+        };
+        assert!(id_msg.len() <= 128, "id decode error bloated: {id_msg}");
+        assert!(
+            !id_msg.contains("ééé"),
+            "id decode error echoed payload: {id_msg}"
+        );
+
+        let huge_code = format!(r#"{{"code":"{huge}"}}"#);
+        let code_err = serde_json::from_str::<JsonObject<RpcErrorCode>>(&huge_code)
+            .err()
+            .expect("string error code must fail")
+            .to_string();
+        assert!(
+            code_err.len() <= 128,
+            "error code decode bloated: {code_err}"
+        );
+        assert!(
+            !code_err.contains("ééé"),
+            "error code echoed payload: {code_err}"
+        );
+        assert!(!is_method_not_found(&huge_code));
     }
 }

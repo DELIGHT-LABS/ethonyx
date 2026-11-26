@@ -325,7 +325,7 @@ fn build_snapshot<'a>(
     el_transport: &'static str,
     cl_transport: Option<&'static str>,
     slot_clock: Option<SlotClock>,
-    now: u64,
+    now: Option<u64>,
 ) -> HealthSnapshot<'a> {
     let local = &probe.local;
     let mut el = ElHealth {
@@ -350,7 +350,7 @@ fn build_snapshot<'a>(
             match &batch.block {
                 Ok(block) => {
                     el.block_number = Some(block.number);
-                    el.block_age_secs = Some(block.age(now));
+                    el.block_age_secs = now.map(|now| block.age(now));
                 }
                 Err(e) => el
                     .errors
@@ -380,7 +380,9 @@ fn build_snapshot<'a>(
                     cl.el_offline = Some(s.el_offline);
                     cl.sync_distance = Some(s.sync_distance);
                     cl.head_slot = Some(s.head_slot);
-                    cl.slot_age_secs = slot_clock.map(|clock| clock.slot_age(s.head_slot, now));
+                    cl.slot_age_secs = slot_clock
+                        .zip(now)
+                        .map(|(clock, now)| clock.slot_age(s.head_slot, now));
                 }
                 Err(e) => cl.errors.push(DisplayJson(MethodError("node/syncing", e))),
             }
@@ -514,7 +516,7 @@ mod tests {
             "h2c",
             Some("http/1.1"),
             SlotClock::new(1000, 12),
-            1300,
+            Some(1300),
         );
         assert_eq!(snap.el.transport, "h2c");
         assert_eq!(snap.el.syncing, Some(false));
@@ -552,11 +554,23 @@ mod tests {
             None,
         );
         let el_only_json =
-            serde_json::to_value(build_snapshot(&el_only, "http/1.1", None, None, 1300)).unwrap();
+            serde_json::to_value(build_snapshot(&el_only, "http/1.1", None, None, Some(1300)))
+                .unwrap();
         assert!(el_only_json.get("cl").is_none());
         assert!(el_only_json.get("reference").is_none());
         assert!(el_only_json["el"].get("peers").is_none());
         assert!(el_only_json["el"].get("errors").is_none());
+
+        // A pre-epoch system clock (`now == None`) omits age fields rather than fabricating 0.
+        let no_clock_snap = build_snapshot(
+            &probe,
+            "h2c",
+            Some("http/1.1"),
+            SlotClock::new(1000, 12),
+            None,
+        );
+        assert_eq!(no_clock_snap.el.block_age_secs, None);
+        assert_eq!(no_clock_snap.cl.as_ref().unwrap().slot_age_secs, None);
     }
 
     #[test]
@@ -583,7 +597,7 @@ mod tests {
             "http/1.1",
             Some("http/1.1"),
             SlotClock::new(1000, 12),
-            1300,
+            Some(1300),
         );
         assert_eq!(snap.el.syncing, None);
         assert_eq!(snap.el.peers, None);
@@ -619,8 +633,14 @@ mod tests {
             },
             None,
         );
-        let batch_json =
-            serde_json::to_value(build_snapshot(&batch_err, "http/1.1", None, None, 1300)).unwrap();
+        let batch_json = serde_json::to_value(build_snapshot(
+            &batch_err,
+            "http/1.1",
+            None,
+            None,
+            Some(1300),
+        ))
+        .unwrap();
         assert_eq!(
             batch_json["el"]["errors"],
             serde_json::json!([
@@ -647,7 +667,7 @@ mod tests {
             },
             None,
         );
-        let snap = build_snapshot(&probe, "http/1.1", None, None, 1300);
+        let snap = build_snapshot(&probe, "http/1.1", None, None, Some(1300));
         assert_eq!(snap.el.syncing, Some(true));
         assert_eq!(snap.el.sync_distance, Some(16));
     }
@@ -682,7 +702,7 @@ mod tests {
             "http/1.1",
             Some("http/1.1"),
             SlotClock::new(0, 12),
-            1300,
+            Some(1300),
         );
         assert_eq!(snap.cl.as_ref().unwrap().head_slot, Some(10));
         assert_eq!(snap.cl.as_ref().unwrap().slot_age_secs, None);
@@ -730,6 +750,14 @@ mod tests {
 
     #[test]
     fn node_health_returns_206_only_when_both_layers_reachable_and_syncing() {
+        use super::eval::evaluate_readiness_at;
+
+        const NOW: u64 = 2_200;
+        let no_clock =
+            || -> Option<u64> { panic!("non-strict evaluation must not read the clock") };
+        let eval_default = |policy, probe| evaluate_readiness_at(policy, probe, no_clock);
+        let eval_at = |policy, probe| evaluate_readiness_at(policy, probe, || Some(NOW));
+
         let default_policy = crate::config::HealthPolicy {
             el_max_reference_lag: 1,
             strict: None,
@@ -752,30 +780,52 @@ mod tests {
             current_block: 10,
             distance: 10,
         };
+        // Exact strict freshness boundaries at `NOW = 2200` (`max_age = 60`):
+        // `age == 60` stays fresh, `age == 61` is stale.
         let fresh_block = ElBlockResult {
             number: 10,
-            timestamp: u64::MAX,
+            timestamp: NOW - 60,
         };
         let stale_block = ElBlockResult {
             number: 10,
-            timestamp: 1000,
+            timestamp: NOW - 61,
         };
 
-        // 1. Ready -> 200 OK (default and strict with fresh block)
+        // 1. Ready -> 200 OK (default and strict at exact freshness boundary); stale synced -> 503.
         let ready_probe = mk_dual_probe(Ok(synced_el), Ok(fresh_block), Ok(synced_cl()), None);
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(default_policy, &ready_probe),
+                eval_default(default_policy, &ready_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::OK
         );
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(strict_policy, &ready_probe),
+                eval_at(strict_clock_policy, &ready_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::OK
+        );
+        let stale_synced_probe =
+            mk_dual_probe(Ok(synced_el), Ok(stale_block), Ok(synced_cl()), None);
+        assert_eq!(
+            classify_node_health(
+                eval_at(strict_clock_policy, &stale_synced_probe),
+                StatusCode::PARTIAL_CONTENT
+            ),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Pre-epoch system clock (`None`) must fail closed under `--readyz-strict`.
+        let clock_err_eval = evaluate_readiness_at(strict_clock_policy, &ready_probe, || None);
+        assert!(!clock_err_eval.is_ready());
+        assert_eq!(
+            clock_err_eval.el_block_fresh.unwrap().to_string(),
+            "system clock before unix epoch"
+        );
+        assert_eq!(
+            classify_node_health(clock_err_eval, StatusCode::PARTIAL_CONTENT),
+            StatusCode::SERVICE_UNAVAILABLE
         );
 
         // 2. EL syncing + CL reachable -> 206 Partial Content (or custom `syncing_status`
@@ -798,21 +848,18 @@ mod tests {
         );
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(default_policy, &el_sync_probe),
+                eval_default(default_policy, &el_sync_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::PARTIAL_CONTENT
         );
         assert_eq!(
-            classify_node_health(
-                evaluate_readiness(default_policy, &el_sync_probe),
-                StatusCode::OK
-            ),
+            classify_node_health(eval_default(default_policy, &el_sync_probe), StatusCode::OK),
             StatusCode::OK
         );
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(strict_policy, &el_sync_probe),
+                eval_at(strict_policy, &el_sync_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::PARTIAL_CONTENT
@@ -826,7 +873,7 @@ mod tests {
         );
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(default_policy, &el_sync_bool_probe),
+                eval_default(default_policy, &el_sync_bool_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::PARTIAL_CONTENT
@@ -841,7 +888,7 @@ mod tests {
         );
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(default_policy, &cl_down_probe),
+                eval_default(default_policy, &cl_down_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::SERVICE_UNAVAILABLE
@@ -856,7 +903,7 @@ mod tests {
         );
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(default_policy, &el_down_probe),
+                eval_default(default_policy, &el_down_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::SERVICE_UNAVAILABLE
@@ -866,7 +913,7 @@ mod tests {
         let cl_sync_probe = mk_dual_probe(Ok(synced_el), Ok(stale_block), Ok(syncing_cl()), None);
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(strict_clock_policy, &cl_sync_probe),
+                eval_at(strict_clock_policy, &cl_sync_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::PARTIAL_CONTENT
@@ -879,7 +926,7 @@ mod tests {
         );
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(strict_policy, &strict_block_err_probe),
+                eval_at(strict_policy, &strict_block_err_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::SERVICE_UNAVAILABLE
@@ -898,7 +945,7 @@ mod tests {
         );
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(default_policy, &silent_optimistic_probe),
+                eval_default(default_policy, &silent_optimistic_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::SERVICE_UNAVAILABLE
@@ -915,7 +962,7 @@ mod tests {
         );
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(default_policy, &el_offline_probe),
+                eval_default(default_policy, &el_offline_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::SERVICE_UNAVAILABLE
@@ -935,7 +982,7 @@ mod tests {
         );
         assert_eq!(
             classify_node_health(
-                evaluate_readiness(default_policy, &lagging_synced_probe),
+                eval_default(default_policy, &lagging_synced_probe),
                 StatusCode::PARTIAL_CONTENT
             ),
             StatusCode::SERVICE_UNAVAILABLE

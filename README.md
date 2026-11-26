@@ -389,7 +389,7 @@ point `--el-reference-url` at your peer nodes (or external reference RPCs):
 - **Peer-only vs. external reference URLs**: Listing peer Ethonyx/EL URLs (never the cluster's own frontend LB VIP) in a shared ConfigMap is safe even when a node's own URL is included (entries matching `--el-http-url` are stripped at startup, and pod-DNS self-entries evaluate to `lag == 0`), ensuring the highest peer stays `200 Ready` in Kubernetes `Service` pools (which do not fail open when 0 pods are ready). Mixing in an external commercial RPC can drain all local pods if the entire local cluster falls behind that external provider — pair external references with load-balancer panic-mode fail-open where appropriate.
 - **Sub-second block chains**: On chains with `< 1s` block times (e.g. Arbitrum `250ms`, Sei `400ms`), raise `--el-max-reference-lag` (e.g. `3–8`) so normal P2P propagation and asynchronous poll-window spread do not flap readiness.
 - **EL-only mode**: Omit `--cl-beacon-url` on non-Beacon chains; configure `--el-reference-url` or `--readyz-strict` if you want silent EL stalls to fail `/readyz`.
-- `--el-max-block-age-secs` and `--cl-max-slot-age-secs` remain inert without `--readyz-strict`; `/healthz` always reports the raw age regardless. Peer counts never gate readiness.
+- `--el-max-block-age-secs` and `--cl-max-slot-age-secs` remain inert without `--readyz-strict`; `/healthz` always reports the raw age regardless (omitted only if the system clock precedes the Unix epoch). Peer counts never gate readiness.
 
 ### Trusted / Commercial Endpoint & Data-Plane Mocking Tuning
 
