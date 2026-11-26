@@ -911,7 +911,7 @@ mod tests {
         assert_eq!(unlimited_state.conn_limit.max(), None);
         assert_eq!(unlimited_state.conn_limit.available_permits(), None);
         let _u1 = unlimited_state.try_acquire_permit().unwrap();
-        let _u2 = unlimited_state.conn_limit.acquire().await;
+        let _u2 = unlimited_state.conn_limit.acquire().await.unwrap();
     }
 
     #[tokio::test]

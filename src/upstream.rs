@@ -134,22 +134,20 @@ impl fmt::Debug for RedactedUrl<'_> {
     }
 }
 
-/// Formats a pre-validated [`Uri`] (lowercase scheme, validated authority, no fragment)
+/// Formats a pre-validated [`Endpoint`] (lowercase scheme, validated authority, no fragment)
 /// with non-root paths and queries redacted.
 #[derive(Clone, Copy)]
-pub(crate) struct RedactedUri<'a>(&'a Uri);
+pub(crate) struct RedactedUri<'a>(&'a Endpoint);
 
 impl fmt::Display for RedactedUri<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let scheme = self.0.scheme_str().expect("validated scheme");
-        let authority = self.0.authority().expect("validated authority");
         fmt_redacted_parts(
             f,
-            scheme,
+            self.0.scheme.as_str(),
             false,
-            authority.as_str(),
-            self.0.path(),
-            self.0.query().is_some(),
+            self.0.authority.as_str(),
+            self.0.uri.path(),
+            self.0.uri.query().is_some(),
         )
     }
 }
@@ -193,7 +191,7 @@ fn validate_authority(
     flag: &'static str,
     raw: &str,
     authority: &Authority,
-) -> Result<(), BoxError> {
+) -> Result<Option<u16>, BoxError> {
     let auth = authority.as_str();
     if auth.contains('@') {
         return Err(invalid_url(flag, raw, "URL userinfo is not supported"));
@@ -221,10 +219,47 @@ fn validate_authority(
             return Err(invalid_url(flag, raw, "invalid authority"));
         }
     };
-    if port_str.is_some_and(|p| parse_canonical_port(p, false).is_none()) {
-        return Err(invalid_url(flag, raw, "invalid port"));
+    port_str
+        .map(|p| {
+            parse_canonical_port(p, false).ok_or_else(|| invalid_url(flag, raw, "invalid port"))
+        })
+        .transpose()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointScheme {
+    Http,
+    Https,
+    Ws,
+    Wss,
+}
+
+impl EndpointScheme {
+    const fn is_tls(self) -> bool {
+        matches!(self, Self::Https | Self::Wss)
     }
-    Ok(())
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+            Self::Ws => "ws",
+            Self::Wss => "wss",
+        }
+    }
+
+    const fn default_port(self) -> u16 {
+        if self.is_tls() { 443 } else { 80 }
+    }
+
+    fn into_scheme(self) -> Option<Scheme> {
+        match self {
+            Self::Http => Some(Scheme::HTTP),
+            Self::Https => Some(Scheme::HTTPS),
+            Self::Ws => Scheme::try_from("ws").ok(),
+            Self::Wss => Scheme::try_from("wss").ok(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -234,19 +269,16 @@ enum SchemeFamily {
 }
 
 impl SchemeFamily {
-    fn parse(self, raw: Option<&str>) -> Option<(Scheme, bool)> {
+    fn parse(self, raw: Option<&str>) -> Option<(EndpointScheme, Scheme)> {
         let s = raw?;
-        match self {
-            Self::Http if s.eq_ignore_ascii_case("http") => Some((Scheme::HTTP, false)),
-            Self::Http if s.eq_ignore_ascii_case("https") => Some((Scheme::HTTPS, true)),
-            Self::Ws if s.eq_ignore_ascii_case("ws") => {
-                Some((Scheme::try_from("ws").expect("valid ws scheme"), false))
-            }
-            Self::Ws if s.eq_ignore_ascii_case("wss") => {
-                Some((Scheme::try_from("wss").expect("valid wss scheme"), true))
-            }
-            _ => None,
-        }
+        let kind = match self {
+            Self::Http if s.eq_ignore_ascii_case("http") => EndpointScheme::Http,
+            Self::Http if s.eq_ignore_ascii_case("https") => EndpointScheme::Https,
+            Self::Ws if s.eq_ignore_ascii_case("ws") => EndpointScheme::Ws,
+            Self::Ws if s.eq_ignore_ascii_case("wss") => EndpointScheme::Wss,
+            _ => return None,
+        };
+        Some((kind, kind.into_scheme()?))
     }
 
     const fn expected(self) -> &'static str {
@@ -269,8 +301,10 @@ enum BaseTarget {
 
 struct Endpoint {
     uri: Uri,
+    authority: Authority,
     target: BaseTarget,
-    is_tls: bool,
+    scheme: EndpointScheme,
+    port: u16,
 }
 
 impl Endpoint {
@@ -283,15 +317,16 @@ impl Endpoint {
             .parse()
             .map_err(|_| invalid_url(flag, raw, "malformed URI"))?;
 
-        let Some((scheme, is_tls)) = family.parse(parsed.scheme_str()) else {
+        let Some((scheme_kind, scheme)) = family.parse(parsed.scheme_str()) else {
             return Err(invalid_url(flag, raw, family.expected()));
         };
 
         let mut parts = parsed.into_parts();
-        let Some(authority) = parts.authority.as_ref() else {
+        let Some(authority) = parts.authority.take() else {
             return Err(invalid_url(flag, raw, "missing host"));
         };
-        validate_authority(flag, raw, authority)?;
+        let explicit_port = validate_authority(flag, raw, &authority)?;
+        let port = explicit_port.unwrap_or_else(|| scheme_kind.default_port());
 
         // Normalize `https://host?query` (`path_and_query == "?query"`) to `"/?query"` once
         // at startup so any present `path_and_query` begins with `'/'` (RFC 9112 origin-form).
@@ -305,6 +340,7 @@ impl Endpoint {
         }
 
         parts.scheme = Some(scheme);
+        parts.authority = Some(authority.clone());
         let uri = Uri::from_parts(parts).map_err(|_| invalid_url(flag, raw, "malformed URI"))?;
 
         let base_path = uri.path();
@@ -318,13 +354,11 @@ impl Endpoint {
 
         Ok(Self {
             uri,
+            authority,
             target,
-            is_tls,
+            scheme: scheme_kind,
+            port,
         })
-    }
-
-    const fn default_port(&self) -> u16 {
-        if self.is_tls { 443 } else { 80 }
     }
 
     /// Compose the upstream URI in a single pass. Moves `inbound`'s [`PathAndQuery`]
@@ -368,7 +402,7 @@ impl Endpoint {
         };
         let mut parts = Parts::default();
         parts.scheme = self.uri.scheme().cloned();
-        parts.authority = self.uri.authority().cloned();
+        parts.authority = Some(self.authority.clone());
         parts.path_and_query = Some(pq);
         Uri::from_parts(parts).map_err(http::Error::from)
     }
@@ -411,7 +445,7 @@ impl HttpUpstream {
     }
 
     pub(crate) const fn is_tls(&self) -> bool {
-        self.0.is_tls
+        self.0.scheme.is_tls()
     }
 
     pub(crate) const fn uri(&self) -> &Uri {
@@ -419,20 +453,19 @@ impl HttpUpstream {
     }
 
     pub(crate) const fn redacted(&self) -> RedactedUri<'_> {
-        RedactedUri(&self.0.uri)
+        RedactedUri(&self.0)
     }
 
     /// Compare two validated endpoints after normalizing host case and default
     /// `:80`/`:443` ports while preserving path and query bytes (`/v1` vs `/v1/`).
     pub(crate) fn same_endpoint(&self, other: &Self) -> bool {
-        if self.0.is_tls != other.0.is_tls {
-            return false;
-        }
-        let a = self.0.uri.authority().expect("validated authority");
-        let b = other.0.uri.authority().expect("validated authority");
-        let default_port = self.0.default_port();
-        a.host().eq_ignore_ascii_case(b.host())
-            && a.port_u16().unwrap_or(default_port) == b.port_u16().unwrap_or(default_port)
+        self.0.scheme == other.0.scheme
+            && self.0.port == other.0.port
+            && self
+                .0
+                .authority
+                .host()
+                .eq_ignore_ascii_case(other.0.authority.host())
             && self.0.uri.path() == other.0.uri.path()
             && self.0.uri.query() == other.0.uri.query()
     }
@@ -470,8 +503,7 @@ pub(crate) struct WsUpstream {
 impl WsUpstream {
     pub(crate) fn parse(flag: &'static str, raw: &str) -> Result<Self, BoxError> {
         let endpoint = Endpoint::parse(flag, raw, SchemeFamily::Ws)?;
-        let authority = endpoint.uri.authority().expect("validated authority");
-        let host_header = HeaderValue::from_str(authority.as_str())
+        let host_header = HeaderValue::from_str(endpoint.authority.as_str())
             .map_err(|_| invalid_url(flag, raw, "invalid Host header"))?;
         Ok(Self {
             endpoint,
@@ -480,11 +512,11 @@ impl WsUpstream {
     }
 
     pub(crate) const fn is_tls(&self) -> bool {
-        self.endpoint.is_tls
+        self.endpoint.scheme.is_tls()
     }
 
     pub(crate) const fn redacted(&self) -> RedactedUri<'_> {
-        RedactedUri(&self.endpoint.uri)
+        RedactedUri(&self.endpoint)
     }
 
     pub(crate) const fn host_header(&self) -> &HeaderValue {
@@ -492,18 +524,14 @@ impl WsUpstream {
     }
 
     /// `(host, port)` suitable for `TcpStream::connect` (IPv6 square brackets
-    /// stripped and default `80` / `443` port resolved from the validated authority).
+    /// stripped and default `80` / `443` port resolved at parse time).
     pub(crate) fn dial_target(&self) -> (&str, u16) {
-        let authority = self.endpoint.uri.authority().expect("validated authority");
-        let raw_host = authority.host();
+        let raw_host = self.endpoint.authority.host();
         let host = raw_host
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(raw_host);
-        let port = authority
-            .port_u16()
-            .unwrap_or_else(|| self.endpoint.default_port());
-        (host, port)
+        (host, self.endpoint.port)
     }
 
     pub(crate) fn rewrite_uri(&self, inbound: Uri) -> Result<Uri, http::Error> {

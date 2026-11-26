@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use http::header::{CONTENT_TYPE, HeaderValue};
-use http::{Response, StatusCode};
+use http::{Response, StatusCode, Version};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use tokio::time::Instant;
 
@@ -353,6 +353,26 @@ pub(crate) async fn drain_body(
     deadline: Instant,
 ) -> Result<(), BodyReadError<hyper::Error>> {
     read_limited(body, limit, Some(deadline), |_| {}).await
+}
+
+const NON_2XX_DRAIN_BYTES: usize = 8 * 1024;
+const NON_2XX_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+async fn drain_http1_error_body_with<B>(version: Version, body: B, deadline: Instant)
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    if version == Version::HTTP_11 && !body.is_end_stream() {
+        let drain_deadline = deadline.min(Instant::now() + NON_2XX_DRAIN_TIMEOUT);
+        let _ = read_limited(body, NON_2XX_DRAIN_BYTES, Some(drain_deadline), |_| {}).await;
+    }
+}
+
+/// Opportunistically drain small HTTP/1.1 non-2xx error bodies so Hyper keeps the
+/// TCP+TLS connection pooled, without buffering untrusted error bodies or burning
+/// the full request timeout on stalled peers.
+pub(crate) async fn drain_http1_error_body(version: Version, body: Incoming, deadline: Instant) {
+    drain_http1_error_body_with(version, body, deadline).await;
 }
 
 const MAX_PREALLOC_HINT: usize = 16 * 1024;
@@ -782,5 +802,106 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(matches!(task.await.unwrap(), Err(BodyReadError::TimedOut)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_http1_error_body_respects_version_byte_cap_and_timeout_budget() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingBody<B> {
+            inner: B,
+            polls: Arc<AtomicUsize>,
+            bytes: Arc<AtomicUsize>,
+        }
+
+        impl<B: Body<Data = Bytes> + Unpin> Body for CountingBody<B> {
+            type Data = Bytes;
+            type Error = B::Error;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                self.polls.fetch_add(1, Ordering::Relaxed);
+                let res = Pin::new(&mut self.inner).poll_frame(cx);
+                if let Poll::Ready(Some(Ok(frame))) = &res
+                    && let Some(data) = frame.data_ref()
+                {
+                    self.bytes.fetch_add(data.len(), Ordering::Relaxed);
+                }
+                res
+            }
+        }
+
+        let make_counting = |cap: usize| {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(cap);
+            let polls = Arc::new(AtomicUsize::new(0));
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let body = CountingBody {
+                inner: ChannelBody(rx),
+                polls: Arc::clone(&polls),
+                bytes: Arc::clone(&bytes),
+            };
+            (tx, body, polls, bytes)
+        };
+
+        // 1. HTTP/2 bodies are skipped immediately without polling any frames.
+        let (tx, body, polls, bytes) = make_counting(2);
+        tx.send(Ok(Frame::data(Bytes::from_static(b"ignored"))))
+            .await
+            .unwrap();
+        drop(tx);
+        drain_http1_error_body_with(
+            Version::HTTP_2,
+            body,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+        assert_eq!(bytes.load(Ordering::Relaxed), 0);
+
+        // 2. HTTP/1.1 body up to `NON_2XX_DRAIN_BYTES` (`8 KiB`) is drained completely.
+        let (tx, body, polls, bytes) = make_counting(4);
+        let chunk = Bytes::from(vec![b'a'; 4096]);
+        tx.send(Ok(Frame::data(chunk.clone()))).await.unwrap();
+        tx.send(Ok(Frame::data(chunk.clone()))).await.unwrap();
+        drop(tx);
+        drain_http1_error_body_with(
+            Version::HTTP_11,
+            body,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(bytes.load(Ordering::Relaxed), NON_2XX_DRAIN_BYTES);
+        assert_eq!(polls.load(Ordering::Relaxed), 3); // 2 data frames + EOF
+
+        // 3. HTTP/1.1 body exceeding `NON_2XX_DRAIN_BYTES` aborts on the crossing frame
+        // without polling subsequent queued frames.
+        let (tx, body, polls, _bytes) = make_counting(4);
+        for _ in 0..4 {
+            tx.send(Ok(Frame::data(chunk.clone()))).await.unwrap();
+        }
+        drop(tx);
+        drain_http1_error_body_with(
+            Version::HTTP_11,
+            body,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(polls.load(Ordering::Relaxed), 3); // 4th frame must never be polled
+
+        // 4. Stalled HTTP/1.1 error body caps at `NON_2XX_DRAIN_TIMEOUT` (`250ms`) when the
+        // outer deadline is longer, and honors a shorter outer deadline (`50ms`) otherwise.
+        let (_tx, body, _polls, _bytes) = make_counting(2);
+        let start = Instant::now();
+        drain_http1_error_body_with(Version::HTTP_11, body, start + Duration::from_secs(10)).await;
+        assert_eq!(start.elapsed(), NON_2XX_DRAIN_TIMEOUT);
+
+        let (_tx2, body2, _polls2, _bytes2) = make_counting(2);
+        let start2 = Instant::now();
+        let short = Duration::from_millis(50);
+        drain_http1_error_body_with(Version::HTTP_11, body2, start2 + short).await;
+        assert_eq!(start2.elapsed(), short);
     }
 }

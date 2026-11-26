@@ -123,6 +123,18 @@ impl HttpClient for OtlpHyperClient {
                                 .await
                                 .map_err(|e| -> HttpError { Box::new(e) })?;
                             let (parts, body) = resp.into_parts();
+                            if !parts.status.is_success() {
+                                // `opentelemetry-otlp` discards non-2xx bodies after debug-logging
+                                // them; draining without buffering avoids 4 MiB error allocations
+                                // and prevents raw collector error bodies from leaking to callers.
+                                crate::response::drain_http1_error_body(
+                                    parts.version,
+                                    body,
+                                    export_deadline,
+                                )
+                                .await;
+                                return Ok(http::Response::from_parts(parts, Bytes::new()));
+                            }
                             let collected = crate::response::collect_body(
                                 body,
                                 OTLP_MAX_RESPONSE_BODY_BYTES,
@@ -517,7 +529,9 @@ mod tests {
                 Response::builder()
                     .status(StatusCode::TOO_MANY_REQUESTS)
                     .header(http::header::RETRY_AFTER, "30")
-                    .body(crate::response::full_body(Bytes::new()))
+                    .body(crate::response::full_body(Bytes::from_static(
+                        b"secret-token-echoed-by-collector",
+                    )))
                     .unwrap()
             }
         })
@@ -528,12 +542,17 @@ mod tests {
         let fast_uri = format!("http://{addr}/v1/metrics");
         let slow_uri = format!("http://{addr}/slow");
 
-        // 1. Before shutdown, collector `Retry-After` is preserved verbatim.
+        // 1. Before shutdown, collector `Retry-After` is preserved verbatim while
+        // non-2xx error bodies are drained without buffering or returning raw payloads.
         let resp = client
             .send_bytes(post_req(&fast_uri, b"metrics"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.body().is_empty(),
+            "non-2xx OTLP error body must be discarded"
+        );
         assert_eq!(
             resp.headers()
                 .get(http::header::RETRY_AFTER)
@@ -573,6 +592,75 @@ mod tests {
                 .get(http::header::RETRY_AFTER)
                 .is_none(),
             "post-shutdown response must drop Retry-After"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_2xx_5xx_error_body_reuses_connection_within_cap_and_closes_when_oversized() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_srv = Arc::clone(&accepts);
+        let _server = AbortOnDrop(tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let large = req.uri().path() == "/large";
+                        let _ = req.into_body().collect().await;
+                        let body = if large {
+                            Bytes::from_static(&[b'x'; 65_536])
+                        } else {
+                            Bytes::from_static(&[b'x'; 8_192])
+                        };
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Full::new(body))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        }));
+
+        let (_tx, shutdown) = crate::lifecycle::shutdown_channel();
+        let client = test_client(OTLP_DEFAULT_TIMEOUT, shutdown);
+        let small_uri = format!("http://{addr}/small");
+        let large_uri = format!("http://{addr}/large");
+
+        for _ in 0..2 {
+            let resp = client
+                .send_bytes(post_req(&small_uri, b"metrics"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(resp.body().is_empty());
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "8 KiB HTTP/1.1 500 error body must drain and keep the connection pooled"
+        );
+
+        for _ in 0..2 {
+            let resp = client
+                .send_bytes(post_req(&large_uri, b"metrics"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(resp.body().is_empty());
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "oversized HTTP/1.1 500 error body must stop at the 8 KiB cap and close the socket"
         );
     }
 }

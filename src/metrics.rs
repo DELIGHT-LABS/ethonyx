@@ -208,12 +208,13 @@ impl Default for ServerMetrics {
 
 impl ServerMetrics {
     pub(crate) fn new(otel: OtelMetrics) -> Self {
+        const _: () = assert!(!LATENCY_BUCKETS.is_empty());
         let prometheus = PrometheusBuilder::new()
             .set_buckets_for_metric(
                 Matcher::Full(PROXY_REQUEST_DURATION.to_owned()),
                 &LATENCY_BUCKETS,
             )
-            .expect("LATENCY_BUCKETS is non-empty")
+            .unwrap_or_else(|_| PrometheusBuilder::new())
             .build_recorder();
         let prometheus_handle = prometheus.handle();
         Self {

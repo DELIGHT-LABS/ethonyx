@@ -15,7 +15,7 @@ These rules govern all design, refactoring, and implementation work across the `
   - Never expose upstream credentials, secret URL paths/queries, internal stack details, or raw backend error bodies across logs (including third-party telemetry exporter logs), traces, metrics, or client-facing error responses; keep synthetic gateway errors opaque and static.
 - **Minimal TCB, Cross-Platform Portability & Capability-Additive Features Only**:
   - Minimize external dependencies and transitive surface; avoid adding crates where small, clear `std` or existing-crate primitives suffice. Keep all optional Cargo features strictly capability-additive (compiling cleanly with zero behavior change or dead-code warnings when disabled), and forbid security-weakening or test-backdoor features.
-  - Maintain cross-platform support across Linux, macOS, and Windows: isolate OS-specific socket or signal handling behind narrow helpers without leaking platform assumptions across modules, and keep module visibility tight (`#![warn(unreachable_pub)]`, minimal public library API, and `src/main.rs` as a thin entrypoint).
+  - Maintain cross-platform support across Linux, macOS, and Windows: isolate OS-specific socket or signal handling behind narrow helpers without leaking platform assumptions across modules, and keep module visibility tight (crate-wide `unreachable_pub` warnings, minimal public library API, and `src/main.rs` as a thin entrypoint).
 
 ## 2. Runtime Pipeline, Control Survivability & Transport Discipline
 - **Control Survivability & Plane Isolation**:
@@ -30,7 +30,7 @@ These rules govern all design, refactoring, and implementation work across the `
   - Prefer ownership moves (`into_*`, consuming `self`, `std::mem::take`), borrowed slices (`&[u8]`, `&str`), stack arrays, and refcounted byte slicing (`Bytes`); place all validation and early-return guards (`?`, `return`) **before** allocating owned buffers, building requests, or spawning tasks.
   - Keep per-connection and per-request async futures compact by separating cold/admin paths from hot data-plane loops and avoiding unnecessary stack bloat or redundant I/O and deserialization.
 - **Memory Safety, Async Lock & Panic Discipline**:
-  - Preserve `#![forbid(unsafe_code)]` across the crate and never hold `Mutex` / `RwLock` guards across `.await` points or heavy work; prefer lock-free atomics or brief critical sections.
+  - Forbid `unsafe_code` across the entire crate and never hold `Mutex` / `RwLock` guards across `.await` points or heavy work; prefer lock-free atomics or brief critical sections.
   - Release builds run with `panic = "abort"`: strictly forbid `.unwrap()`, `.expect()`, and unchecked indexing/arithmetic on any external, network, or configuration input path (eliminate internal invariant `.expect()` calls via types or pattern matching wherever practical; reserve `.unwrap()` / `.expect()` for tests).
   - Keep a single consolidated `impl` block per type, expressive `Option`/`Result`/iterator combinators, `Copy` on lightweight value types, and zero over-abstracted trait or macro gymnastics.
 - **Deterministic Testing & Verification Gates**:

@@ -70,17 +70,14 @@ impl ConnLimit {
     }
 
     /// Wait until a permit becomes available (resolves immediately when unlimited).
-    pub(crate) async fn acquire(&self) -> ConnPermitGuard {
+    pub(crate) async fn acquire(&self) -> Option<ConnPermitGuard> {
         let Some(bounded) = &self.0 else {
-            return ConnPermitGuard::unlimited();
+            return Some(ConnPermitGuard::unlimited());
         };
-        let permit = Arc::clone(&bounded.sem)
-            .acquire_owned()
-            .await
-            .expect("connection limit semaphore is never closed");
-        ConnPermitGuard {
+        let permit = Arc::clone(&bounded.sem).acquire_owned().await.ok()?;
+        Some(ConnPermitGuard {
             permit: Some(permit),
-        }
+        })
     }
 
     #[cfg(test)]

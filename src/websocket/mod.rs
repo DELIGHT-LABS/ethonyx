@@ -181,26 +181,26 @@ fn upstream_request(
     uri: http::Uri,
     upstream: &crate::upstream::WsUpstream,
     otel_enabled: bool,
-) -> Request<()> {
+) -> Result<Request<()>, http::header::InvalidHeaderValue> {
+    // RFC 6455: each WebSocket hop conducts an independent key/accept exchange,
+    // so always generate a fresh Sec-WebSocket-Key for the upstream HTTP/1 handshake.
+    let key = http::HeaderValue::try_from(
+        tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+    )?;
     if otel_enabled {
         crate::otel::propagate_context(req.headers_mut());
     }
     req.headers_mut()
         .insert(http::header::HOST, upstream.host_header().clone());
-    // RFC 6455: each WebSocket hop conducts an independent key/accept exchange,
-    // so always generate a fresh Sec-WebSocket-Key for the upstream HTTP/1 handshake.
-    let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
-    req.headers_mut().insert(
-        http::header::SEC_WEBSOCKET_KEY,
-        http::HeaderValue::try_from(key).expect("base64 key is valid header value"),
-    );
+    req.headers_mut()
+        .insert(http::header::SEC_WEBSOCKET_KEY, key);
     *req.uri_mut() = uri;
     *req.method_mut() = Method::GET;
     *req.version_mut() = Version::HTTP_11;
     // OnUpgrade was taken before consuming the request. Move its headers rather
     // than cloning the map, and reuse the parsed URI for the upstream request.
     req.extensions_mut().clear();
-    req
+    Ok(req)
 }
 
 fn is_valid_subprotocol_token(token: &str) -> bool {
@@ -292,7 +292,10 @@ pub(crate) async fn upgrade(
         return text_response(StatusCode::SERVICE_UNAVAILABLE, "connection limit reached");
     };
     let on_upgrade = hyper::upgrade::on(&mut req);
-    let ws_req = upstream_request(req, upstream_uri, &ws.upstream, state.opts.otel_enabled);
+    let Ok(ws_req) = upstream_request(req, upstream_uri, &ws.upstream, state.opts.otel_enabled)
+    else {
+        return text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+    };
     let io_timeout = state.opts.proxy_timeout;
     let dial = async {
         let tcp = tokio::net::TcpStream::connect(ws.upstream.dial_target())
@@ -593,7 +596,7 @@ mod tests {
             );
             let inbound_uri = std::mem::take(req.uri_mut());
             let uri = upstream.rewrite_uri(inbound_uri).unwrap();
-            let ws_req = upstream_request(req, uri, &upstream, false);
+            let ws_req = upstream_request(req, uri, &upstream, false).unwrap();
             let h = ws_req.headers();
             assert!(!h.contains_key("x-internal"));
             assert!(!h.contains_key("proxy-authorization"));

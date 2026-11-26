@@ -108,6 +108,12 @@ struct RpcResponse<'a> {
 }
 
 impl RpcResponse<'_> {
+    const EMPTY: Self = Self {
+        id: None,
+        result: None,
+        error: None,
+    };
+
     fn decode<T: serde::de::DeserializeOwned>(self) -> Result<T, HealthError> {
         if let Some(err) = self.error {
             return Err(HealthError::rpc_truncated(err.get()));
@@ -195,7 +201,8 @@ where
 
     let arr: [JsonObject<RpcResponse<'a>>; N] =
         serde_json::from_slice(trimmed).map_err(HealthError::decode)?;
-    let mut slots: [Option<RpcResponse<'a>>; N] = [const { None }; N];
+    let mut slots = [const { RpcResponse::EMPTY }; N];
+    let mut seen = [false; N];
     for JsonObject(resp) in arr {
         let Some(idx) = resp
             .id
@@ -207,13 +214,14 @@ where
                 "duplicate or unexpected response id",
             ));
         };
-        if slots[idx].replace(resp).is_some() {
+        if std::mem::replace(&mut seen[idx], true) {
             return Err(HealthError::decode_msg(
                 "duplicate or unexpected response id",
             ));
         }
+        slots[idx] = resp;
     }
-    Ok(slots.map(|slot| slot.expect("N distinct IDs in 1..=N fill every slot")))
+    Ok(slots)
 }
 
 fn parse_el_ref_batch(body: &[u8]) -> Result<(u64, u64), HealthError> {
