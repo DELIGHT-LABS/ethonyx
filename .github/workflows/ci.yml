@@ -40,11 +40,21 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --locked
+
       - name: cargo test
         run: cargo test --locked
 
       - name: cargo clippy (all features)
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: cargo doc (all features)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --all-features --locked
 
       - name: cargo test (all features)
         run: cargo test --all-features --locked
@@ -195,4 +205,4 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Coverage summary
-        run: cargo llvm-cov --locked --summary-only
+        run: cargo llvm-cov --all-features --locked --summary-only

@@ -2,11 +2,16 @@
 default:
     @just --list
 
-# Run all local quality checks (mirrors pre-commit + pre-push hooks).
+# Run local Rust quality, doc, test, and supply-chain checks (default & --all-features).
 check:
     cargo fmt --all -- --check
     cargo clippy --all-targets --locked -- -D warnings
+    cargo clippy --all-targets --all-features --locked -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
     cargo test --locked
+    cargo test --all-features --locked
+    cargo deny --all-features check
     cargo audit -D warnings
 
 # Apply rustfmt across the project.
@@ -32,8 +37,8 @@ release level='patch':
 
 # Run cargo-deny supply-chain checks.
 deny:
-    cargo deny check
+    cargo deny --all-features check
 
 # HTML coverage report under target/llvm-cov/html/.
 coverage:
-    cargo llvm-cov --locked --html
+    cargo llvm-cov --all-features --locked --html
