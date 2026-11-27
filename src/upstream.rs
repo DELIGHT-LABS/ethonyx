@@ -854,4 +854,35 @@ mod tests {
             assert_eq!(uri.authority(), base_uri.authority(), "base={base}");
         }
     }
+
+    #[test]
+    fn same_endpoint_normalizes_host_case_and_default_ports_while_distinguishing_schemes_and_paths()
+    {
+        let parse = |raw| HttpUpstream::parse("--el-http-url", raw).unwrap();
+
+        assert!(parse("http://rpc.example.com:80").same_endpoint(&parse("http://RPC.EXAMPLE.COM")));
+        assert!(
+            parse("https://rpc.example.com:443/v1?k=1")
+                .same_endpoint(&parse("https://RPC.EXAMPLE.COM/v1?k=1"))
+        );
+        // Same host and numeric port (443) with different schemes must NOT match.
+        assert!(
+            !parse("http://rpc.example.com:443").same_endpoint(&parse("https://rpc.example.com"))
+        );
+        assert!(
+            !parse("http://a.example.com:8545").same_endpoint(&parse("http://b.example.com:8545"))
+        );
+        assert!(
+            !parse("http://rpc.example.com:8545")
+                .same_endpoint(&parse("http://rpc.example.com:8546"))
+        );
+        assert!(
+            !parse("https://rpc.example.com/v1")
+                .same_endpoint(&parse("https://rpc.example.com/v1/"))
+        );
+        assert!(
+            !parse("https://rpc.example.com/v1?a=1")
+                .same_endpoint(&parse("https://rpc.example.com/v1?a=2"))
+        );
+    }
 }
