@@ -269,9 +269,9 @@ Structured JSON to stdout. Levels follow a sidecar-appropriate discipline:
 | Level   | What                                                                |
 |---------|---------------------------------------------------------------------|
 | `error` | genuine internal faults                                             |
-| `warn`  | readiness became **not-ready** (LB will deroute); upstream `502` proxy / WS dial errors; mid-stream upstream response body errors / idle timeouts; upstream `h2c → http/1.1` fallback; connection-limit saturation; `accept()` failed |
+| `warn`  | readiness became **not-ready** (LB will deroute); upstream `502` proxy / WS dial errors; mid-stream upstream response body errors / idle timeouts; upstream `h2c → http/1.1` fallback; connection-limit saturation; persistent `accept()` failures |
 | `info`  | lifecycle (start w/ version / listen / shutdown), readiness **recovered** |
-| `debug` | routine activity: each health poll, upstream `h2c` confirmation, client connection/body read errors, WS disconnects |
+| `debug` | routine activity: each health poll, upstream `h2c` confirmation, client connection/body read and transient `accept()` errors, WS disconnects |
 | `trace` | fine-grained internal flow (request routing, connection accept / close) |
 
 `info` is reserved for notable, low-frequency events, so a healthy sidecar is
