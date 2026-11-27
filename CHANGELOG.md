@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+## [0.3.0] - 2026-11-27
+
 ### Added
 
 - Add multi-endpoint Reference EL block-lag readiness gating (`--el-reference-url` / `ETHONYX_EL_REFERENCE_URL`, `--el-max-reference-lag` default `1`, `--el-reference-poll-interval` default `3s`) with shared ConfigMap self-URL stripping (`--el-http-url` matches excluded at startup), per-round `eth_chainId` verification and automatic recovery, causal `eth_blockNumber` pairing, unified two-strike fail-open (`Active` → `Retained` → `Unavailable`), `/healthz` `reference` snapshot, and `ethonyx_reference_{health_status,block_number,block_lag}` metrics while keeping data-plane queries unobstructed.
