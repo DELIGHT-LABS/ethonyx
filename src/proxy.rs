@@ -303,11 +303,69 @@ async fn route(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalMock {
     NodeHealth,
     ClSubscription,
     ElSyncing,
+}
+
+/// Pure Sans-IO classification of local mock eligibility for HTTP proxy requests.
+/// Requests carrying a non-`100-continue` `Expect` header bypass local mocks so
+/// upstream can enforce `417 Expectation Failed`.
+fn classify_local_mock(
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    mock_eth_syncing: bool,
+    cl: Option<&ClState>,
+) -> Option<LocalMock> {
+    let mock = match cl {
+        Some(cl)
+            if cl.mock_node_health
+                && matches!(*method, Method::GET | Method::HEAD)
+                && path == "/eth/v1/node/health" =>
+        {
+            LocalMock::NodeHealth
+        }
+        Some(cl)
+            if cl.mock_subscriptions
+                && *method == Method::POST
+                && matches!(
+                    path,
+                    "/eth/v1/validator/prepare_beacon_proposer"
+                        | "/eth/v1/validator/beacon_committee_subscriptions"
+                        | "/eth/v1/validator/sync_committee_subscriptions"
+                ) =>
+        {
+            LocalMock::ClSubscription
+        }
+        None if mock_eth_syncing && *method == Method::POST => LocalMock::ElSyncing,
+        _ => return None,
+    };
+    (!has_non_100_expect(headers)).then_some(mock)
+}
+
+fn resolve_http_target<'a>(
+    method: &Method,
+    path: &str,
+    state: &'a AppState,
+    cl: Option<&'a ClState>,
+) -> (&'a HttpTarget, UpstreamLayer, Option<&'static str>) {
+    match cl {
+        Some(cl) => {
+            let (target, path_override) = if let Some(mev) = &cl.mev_relay
+                && *method == Method::POST
+                && path == "/eth/v1/validator/register_validator"
+            {
+                (mev, Some("/eth/v1/builder/validators"))
+            } else {
+                (&cl.beacon, None)
+            };
+            (target, UpstreamLayer::Cl, path_override)
+        }
+        None => (&state.el, UpstreamLayer::El, None),
+    }
 }
 
 async fn proxy_http(
@@ -320,79 +378,45 @@ async fn proxy_http(
         return text_response(StatusCode::NOT_IMPLEMENTED, "unsupported transfer encoding");
     }
 
-    let mock = match cl {
-        Some(cl)
-            if cl.mock_node_health
-                && matches!(parts.method, Method::GET | Method::HEAD)
-                && parts.uri.path() == "/eth/v1/node/health" =>
-        {
-            Some(LocalMock::NodeHealth)
+    let (body, deadline) = match classify_local_mock(
+        &parts.method,
+        parts.uri.path(),
+        &parts.headers,
+        state.opts.mock_eth_syncing,
+        cl,
+    ) {
+        Some(LocalMock::NodeHealth) => return health::node_health(state, parts.uri.query()),
+        Some(LocalMock::ClSubscription) => {
+            drop(parts);
+            let deadline = tokio::time::Instant::now() + state.opts.proxy_timeout;
+            if let Err(err) = drain_body(body, MAX_MOCK_DRAIN_BYTES, deadline).await {
+                return body_read_error_response(err);
+            }
+            return raw_json_response(
+                StatusCode::OK,
+                Bytes::from_static(b"{\"code\":200,\"message\":\"success\"}"),
+            );
         }
-        Some(cl)
-            if cl.mock_subscriptions
-                && parts.method == Method::POST
-                && matches!(
-                    parts.uri.path(),
-                    "/eth/v1/validator/prepare_beacon_proposer"
-                        | "/eth/v1/validator/beacon_committee_subscriptions"
-                        | "/eth/v1/validator/sync_committee_subscriptions"
-                ) =>
-        {
-            Some(LocalMock::ClSubscription)
+        Some(LocalMock::ElSyncing) => {
+            let deadline = tokio::time::Instant::now() + state.opts.proxy_timeout;
+            match collect_prefix_or_stream(body, MAX_MOCK_INSPECT_BYTES, deadline).await {
+                Ok(PrefixBody::Complete(bytes)) => {
+                    if let Some(mock_res) = try_mock_eth_syncing(&bytes) {
+                        return mock_res;
+                    }
+                    (full_body(bytes), Some(deadline))
+                }
+                Ok(PrefixBody::Overflow { prefix, rest }) => {
+                    (ResBody::prefixed(prefix, rest), Some(deadline))
+                }
+                Err(err) => return body_read_error_response(err),
+            }
         }
-        None if state.opts.mock_eth_syncing && parts.method == Method::POST => {
-            Some(LocalMock::ElSyncing)
-        }
-        _ => None,
+        None => (ResBody::incoming(body), None),
     };
 
-    let (body, deadline) = match mock {
-        Some(mock) if !has_non_100_expect(&parts.headers) => match mock {
-            LocalMock::NodeHealth => return health::node_health(state, parts.uri.query()),
-            LocalMock::ClSubscription => {
-                drop(parts);
-                let deadline = tokio::time::Instant::now() + state.opts.proxy_timeout;
-                if let Err(err) = drain_body(body, MAX_MOCK_DRAIN_BYTES, deadline).await {
-                    return body_read_error_response(err);
-                }
-                return raw_json_response(
-                    StatusCode::OK,
-                    Bytes::from_static(b"{\"code\":200,\"message\":\"success\"}"),
-                );
-            }
-            LocalMock::ElSyncing => {
-                let deadline = tokio::time::Instant::now() + state.opts.proxy_timeout;
-                match collect_prefix_or_stream(body, MAX_MOCK_INSPECT_BYTES, deadline).await {
-                    Ok(PrefixBody::Complete(bytes)) => {
-                        if let Some(mock_res) = try_mock_eth_syncing(&bytes) {
-                            return mock_res;
-                        }
-                        (full_body(bytes), Some(deadline))
-                    }
-                    Ok(PrefixBody::Overflow { prefix, rest }) => {
-                        (ResBody::prefixed(prefix, rest), Some(deadline))
-                    }
-                    Err(err) => return body_read_error_response(err),
-                }
-            }
-        },
-        _ => (ResBody::incoming(body), None),
-    };
-
-    let (target, layer, path_override) = match cl {
-        Some(cl) => {
-            let (target, path_override) = if let Some(mev) = &cl.mev_relay
-                && parts.method == Method::POST
-                && parts.uri.path() == "/eth/v1/validator/register_validator"
-            {
-                (mev, Some("/eth/v1/builder/validators"))
-            } else {
-                (&cl.beacon, None)
-            };
-            (target, UpstreamLayer::Cl, path_override)
-        }
-        None => (&state.el, UpstreamLayer::El, None),
-    };
+    let (target, layer, path_override) =
+        resolve_http_target(&parts.method, parts.uri.path(), state, cl);
     // Select EL transport at dispatch, after any mock body inspection: local replies need
     // no transport lookup, and forwarded requests follow the latest verdict.
     execute_upstream(parts, body, state, target, layer, path_override, deadline).await
@@ -538,7 +562,9 @@ async fn execute_upstream(
             {
                 return bad_gateway(layer, "non-empty 205 upstream response");
             }
-            if let Err(err) = drain_body(resp_body, 0, deadline).await {
+            if !resp_body.is_end_stream()
+                && let Err(err) = Box::pin(drain_body(resp_body, 0, deadline)).await
+            {
                 return match err {
                     BodyReadError::TooLarge => {
                         bad_gateway(layer, "non-empty 205 upstream response")
@@ -954,5 +980,187 @@ mod tests {
             assert!(!get.body().is_end_stream(), "{probe:?}");
             assert!(head.body().is_end_stream(), "{probe:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn classify_local_mock_and_resolve_http_target_cover_all_branches() {
+        use clap::Parser;
+
+        let parsed = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--cl-beacon-url",
+            "http://127.0.0.1:5052",
+            "--cl-mev-relay-url",
+            "http://127.0.0.1:18550",
+            "--mock-eth-syncing",
+            "--mock-cl-node-health",
+            "--mock-cl-subscriptions",
+            "--trust-upstream",
+        ])
+        .parse_validated()
+        .unwrap();
+        let (state, _) = AppState::start(
+            parsed.opts,
+            parsed.max_connections,
+            parsed.upstreams,
+            parsed.health,
+            crate::metrics::ServerMetrics::default(),
+        )
+        .await;
+        let cl = state.cl.as_ref().expect("CL must be configured");
+        let empty = HeaderMap::new();
+        let mut expect_100 = HeaderMap::new();
+        expect_100.insert(http::header::EXPECT, "100-continue".parse().unwrap());
+        let mut expect_other = HeaderMap::new();
+        expect_other.insert(http::header::EXPECT, "custom-token".parse().unwrap());
+
+        // Local mock classification across CL node health, CL subscriptions, and EL syncing.
+        for method in [Method::GET, Method::HEAD] {
+            assert_eq!(
+                classify_local_mock(&method, "/eth/v1/node/health", &empty, true, Some(cl)),
+                Some(LocalMock::NodeHealth)
+            );
+            assert_eq!(
+                classify_local_mock(&method, "/eth/v1/node/health", &expect_100, true, Some(cl)),
+                Some(LocalMock::NodeHealth)
+            );
+            assert_eq!(
+                classify_local_mock(
+                    &method,
+                    "/eth/v1/node/health",
+                    &expect_other,
+                    true,
+                    Some(cl)
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            classify_local_mock(&Method::POST, "/eth/v1/node/health", &empty, true, Some(cl)),
+            None
+        );
+        for path in [
+            "/eth/v1/validator/prepare_beacon_proposer",
+            "/eth/v1/validator/beacon_committee_subscriptions",
+            "/eth/v1/validator/sync_committee_subscriptions",
+        ] {
+            assert_eq!(
+                classify_local_mock(&Method::POST, path, &empty, true, Some(cl)),
+                Some(LocalMock::ClSubscription)
+            );
+            assert_eq!(
+                classify_local_mock(&Method::POST, path, &expect_other, true, Some(cl)),
+                None
+            );
+            assert_eq!(
+                classify_local_mock(&Method::GET, path, &empty, true, Some(cl)),
+                None
+            );
+        }
+        assert_eq!(
+            classify_local_mock(&Method::POST, "/", &empty, true, None),
+            Some(LocalMock::ElSyncing)
+        );
+        assert_eq!(
+            classify_local_mock(&Method::POST, "/", &expect_100, true, None),
+            Some(LocalMock::ElSyncing)
+        );
+        assert_eq!(
+            classify_local_mock(&Method::POST, "/", &expect_other, true, None),
+            None
+        );
+        assert_eq!(
+            classify_local_mock(&Method::POST, "/", &empty, false, None),
+            None
+        );
+        assert_eq!(
+            classify_local_mock(&Method::GET, "/", &empty, true, None),
+            None
+        );
+
+        // HTTP target resolution: MEV relay rewrite on POST register_validator only;
+        // Beacon on all other CL methods/paths; EL when cl is None.
+        let (target, layer, override_path) = resolve_http_target(
+            &Method::POST,
+            "/eth/v1/validator/register_validator",
+            &state,
+            Some(cl),
+        );
+        assert!(std::ptr::eq(target, cl.mev_relay.as_ref().unwrap()));
+        assert_eq!(layer, UpstreamLayer::Cl);
+        assert_eq!(override_path, Some("/eth/v1/builder/validators"));
+
+        let (target, layer, override_path) = resolve_http_target(
+            &Method::GET,
+            "/eth/v1/validator/register_validator",
+            &state,
+            Some(cl),
+        );
+        assert!(std::ptr::eq(target, &cl.beacon));
+        assert_eq!(layer, UpstreamLayer::Cl);
+        assert_eq!(override_path, None);
+
+        let (target, layer, override_path) =
+            resolve_http_target(&Method::POST, "/eth/v1/beacon/blocks", &state, Some(cl));
+        assert!(std::ptr::eq(target, &cl.beacon));
+        assert_eq!(layer, UpstreamLayer::Cl);
+        assert_eq!(override_path, None);
+
+        let (target, layer, override_path) = resolve_http_target(&Method::POST, "/", &state, None);
+        assert!(std::ptr::eq(target, &state.el));
+        assert_eq!(layer, UpstreamLayer::El);
+        assert_eq!(override_path, None);
+
+        // Disabled CL mocks and absent MEV relay fall through to Beacon without mocking.
+        let default_cl = crate::Config::parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--cl-beacon-url",
+            "http://127.0.0.1:5052",
+            "--trust-upstream",
+        ])
+        .parse_validated()
+        .unwrap();
+        let (default_state, _) = AppState::start(
+            default_cl.opts,
+            default_cl.max_connections,
+            default_cl.upstreams,
+            default_cl.health,
+            crate::metrics::ServerMetrics::default(),
+        )
+        .await;
+        let plain_cl = default_state.cl.as_ref().expect("CL must be configured");
+        assert_eq!(
+            classify_local_mock(
+                &Method::GET,
+                "/eth/v1/node/health",
+                &empty,
+                false,
+                Some(plain_cl),
+            ),
+            None
+        );
+        assert_eq!(
+            classify_local_mock(
+                &Method::POST,
+                "/eth/v1/validator/prepare_beacon_proposer",
+                &empty,
+                false,
+                Some(plain_cl),
+            ),
+            None
+        );
+        let (target, layer, override_path) = resolve_http_target(
+            &Method::POST,
+            "/eth/v1/validator/register_validator",
+            &default_state,
+            Some(plain_cl),
+        );
+        assert!(std::ptr::eq(target, &plain_cl.beacon));
+        assert_eq!(layer, UpstreamLayer::Cl);
+        assert_eq!(override_path, None);
     }
 }
