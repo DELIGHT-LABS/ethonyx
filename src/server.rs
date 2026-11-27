@@ -501,6 +501,13 @@ impl AcceptTarget {
         }
     }
 
+    fn log_transient_accept_error(&self, error: &std::io::Error) {
+        match self {
+            Self::Data(_) => debug!(%error, "transient accept error; retrying"),
+            Self::Admin(_) => debug!(%error, "transient admin accept error; retrying"),
+        }
+    }
+
     fn log_saturated(&self, state: &AppState) {
         match self {
             Self::Data(_) => warn!(
@@ -553,6 +560,21 @@ impl AcceptTarget {
     }
 }
 
+/// Classify per-connection or signal-interrupted `accept()` errors that are safe
+/// to retry immediately without the 100ms backoff reserved for persistent OS /
+/// file-descriptor exhaustion (`EMFILE`/`ENFILE` are never one of the four kinds
+/// below, whatever `ErrorKind` the toolchain reports for them, so they always fail
+/// closed into backoff).
+fn is_transient_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
 async fn run_accept_loop(
     listeners: &[TcpListener],
     state: Arc<AppState>,
@@ -572,6 +594,10 @@ async fn run_accept_loop(
             _ = &mut shutdown => return,
             accept = accept_round_robin(listeners, &mut next_idx) => match accept {
                 Ok(pair) => pair,
+                Err(e) if is_transient_accept_error(&e) => {
+                    target.log_transient_accept_error(&e);
+                    continue;
+                }
                 Err(e) => {
                     target.log_accept_error(&e);
                     // Back off so a persistent error (e.g. fd exhaustion)
@@ -1107,5 +1133,45 @@ mod tests {
         );
         drop(z_builders);
         z_drain.wait().await;
+    }
+
+    #[test]
+    fn transient_accept_errors_retry_while_resource_and_unknown_errors_back_off() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(
+                is_transient_accept_error(&Error::from(kind)),
+                "{kind:?} must retry immediately"
+            );
+        }
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::OutOfMemory,
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+            ErrorKind::InvalidInput,
+            ErrorKind::WouldBlock,
+            ErrorKind::BrokenPipe,
+        ] {
+            assert!(
+                !is_transient_accept_error(&Error::from(kind)),
+                "{kind:?} must back off instead of tight-looping"
+            );
+        }
+        // What `accept()` really returns when descriptors run out (`EMFILE` / `ENFILE`,
+        // the same numbers on Linux and macOS); their `ErrorKind` is toolchain-dependent.
+        #[cfg(unix)]
+        for code in [24, 23] {
+            assert!(
+                !is_transient_accept_error(&Error::from_raw_os_error(code)),
+                "os error {code} must back off instead of tight-looping"
+            );
+        }
     }
 }
