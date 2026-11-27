@@ -20,7 +20,7 @@ struct TelemetryProviders {
     // cannot spawn a helper thread) signal `ShutdownTx::drop` (`Instant::now()`)
     // before `traces`/`metrics` run blocking drops.
     shutdown_tx: crate::lifecycle::ShutdownTx,
-    traces: opentelemetry_sdk::trace::SdkTracerProvider,
+    traces: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     metrics: opentelemetry_sdk::metrics::SdkMeterProvider,
 }
 
@@ -38,6 +38,12 @@ impl TelemetryProviders {
         // sequential fallback budget against `std::time::Instant` so it never
         // reads `tokio::time::Instant::now()` outside a Tokio runtime context.
         shutdown_tx.send(tokio_deadline);
+        let Some(traces) = traces else {
+            if let Err(error) = metrics.shutdown_with_timeout(timeout) {
+                tracing::warn!(%error, "OTel meter provider shutdown failed");
+            }
+            return;
+        };
         let wall_now = std::time::Instant::now();
         let wall_deadline = wall_now.checked_add(timeout).unwrap_or(wall_now);
         std::thread::scope(|s| {
@@ -79,7 +85,10 @@ pub(crate) struct Telemetry(Option<TelemetryProviders>);
 impl Telemetry {
     pub(crate) fn tracer(&self) -> Option<opentelemetry_sdk::trace::SdkTracer> {
         use opentelemetry::trace::TracerProvider as _;
-        self.0.as_ref().map(|p| p.traces.tracer(SERVICE_NAME))
+        self.0
+            .as_ref()
+            .and_then(|p| p.traces.as_ref())
+            .map(|t| t.tracer(SERVICE_NAME))
     }
 
     /// Typed OpenTelemetry metric instruments mirroring this server's metrics.
@@ -176,12 +185,15 @@ impl OtelEndpoints {
     }
 }
 
-/// Start the OTLP trace and metric providers for validated endpoints.
-pub(crate) fn start(endpoints: Option<OtelEndpoints>) -> Result<Telemetry, crate::BoxError> {
+/// Start the OTLP metric (and optionally trace) providers for validated endpoints.
+pub(crate) fn start(
+    endpoints: Option<OtelEndpoints>,
+    enable_traces: bool,
+) -> Result<Telemetry, crate::BoxError> {
     let Some(endpoints) = endpoints else {
         return Ok(Telemetry(None));
     };
-    init_otel(endpoints, tokio::runtime::Handle::current())
+    init_otel(endpoints, enable_traces, tokio::runtime::Handle::current())
 }
 
 pub(crate) fn parse_config_endpoint(
@@ -217,18 +229,12 @@ fn build_resource_with(
 
 fn init_otel(
     endpoints: OtelEndpoints,
+    enable_traces: bool,
     rt: tokio::runtime::Handle,
 ) -> Result<Telemetry, crate::BoxError> {
     let (shutdown_tx, shutdown) = crate::lifecycle::shutdown_channel();
-    let (trace_client, metric_client) = client::build_signal_clients(rt, shutdown);
-    let trace_timeout = trace_client.timeout();
+    let (trace_client, metric_client) = client::build_signal_clients(rt, shutdown, enable_traces);
     let metric_timeout = metric_client.timeout();
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_http_client(trace_client)
-        .with_endpoint(endpoints.traces)
-        .with_timeout(trace_timeout)
-        .build()?;
     let meter_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
         .with_http_client(metric_client)
@@ -237,10 +243,24 @@ fn init_otel(
         .build()?;
 
     let resource = build_resource();
-    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(resource.clone())
-        .build();
+    let traces = match trace_client {
+        Some(trace_client) => {
+            let trace_timeout = trace_client.timeout();
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_http_client(trace_client)
+                .with_endpoint(endpoints.traces)
+                .with_timeout(trace_timeout)
+                .build()?;
+            Some(
+                opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .with_batch_exporter(exporter)
+                    .with_resource(resource.clone())
+                    .build(),
+            )
+        }
+        None => None,
+    };
 
     let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
         .with_resource(resource)
@@ -248,7 +268,7 @@ fn init_otel(
         .build();
 
     Ok(Telemetry(Some(TelemetryProviders {
-        traces: tracer_provider,
+        traces,
         metrics: meter_provider,
         shutdown_tx,
     })))
@@ -362,7 +382,7 @@ mod tests {
 
         let (shutdown_tx, _shutdown) = crate::lifecycle::shutdown_channel();
         let telemetry = Telemetry(Some(TelemetryProviders {
-            traces,
+            traces: Some(traces),
             metrics,
             shutdown_tx,
         }));
@@ -428,7 +448,7 @@ mod tests {
         let traces = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
         let (shutdown_tx, shutdown) = crate::lifecycle::shutdown_channel();
         let telemetry = Telemetry(Some(TelemetryProviders {
-            traces,
+            traces: Some(traces),
             metrics,
             shutdown_tx,
         }));
@@ -452,5 +472,32 @@ mod tests {
             .expect("shutdown thread must publish the export deadline");
         // Unblock the detached shutdown thread cleanly before the test returns.
         let _ = release_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn metrics_only_telemetry_skips_tracer_and_flushes_metrics_on_shutdown() {
+        let metric_exporter = SnapshotExporter::default();
+        let metrics = SdkMeterProvider::builder()
+            .with_periodic_exporter(metric_exporter.clone())
+            .build();
+        let (shutdown_tx, shutdown) = crate::lifecycle::shutdown_channel();
+        let telemetry = Telemetry(Some(TelemetryProviders {
+            traces: None,
+            metrics,
+            shutdown_tx,
+        }));
+        assert!(telemetry.tracer().is_none());
+        telemetry.metrics().set_health(
+            crate::metrics::HealthInstrument::UpstreamHealth,
+            Some(crate::metrics::UpstreamLayer::El),
+            1.0,
+        );
+        telemetry.shutdown().await;
+
+        assert!(shutdown.current_deadline().is_some());
+        assert!(metric_exporter.has_metric("ethonyx_upstream_health_status"));
+        assert!(!metric_exporter.has_metric(crate::metrics::ACTIVE_CONNECTIONS));
+        assert!(!metric_exporter.has_metric(crate::metrics::PROXY_REQUEST_DURATION));
+        assert!(!metric_exporter.has_metric(crate::metrics::PROXY_REQUESTS_TOTAL));
     }
 }

@@ -549,7 +549,7 @@ async fn trusted_h1_upstream_and_http_notifications() {
 async fn mock_body_stall_has_a_deadline() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let proxy = EthonyxHandle::start_trusted_tuned(&["--mock-eth-syncing"], |cfg| {
-        cfg.proxy_timeout = Duration::from_millis(200);
+        cfg.proxy_timeout = Some(Duration::from_millis(200));
     })
     .await;
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
@@ -793,7 +793,7 @@ async fn mock_cl_subscriptions_drains_body_over_keep_alive_and_times_out_stalled
             "http://127.0.0.1:5052",
             "--mock-cl-subscriptions",
         ],
-        |cfg| cfg.proxy_timeout = Duration::from_millis(250),
+        |cfg| cfg.proxy_timeout = Some(Duration::from_millis(250)),
     )
     .await;
 
@@ -936,7 +936,7 @@ async fn sse_event_stream_survives_past_proxy_timeout_while_stalled_json_aborts(
             "--el-http-url",
             &upstream_url,
         ],
-        |cfg| cfg.proxy_timeout = Duration::from_millis(220),
+        |cfg| cfg.proxy_timeout = Some(Duration::from_millis(220)),
     )
     .await;
     let c = client();
@@ -1532,7 +1532,7 @@ async fn upstream_that_never_answers_is_a_502_after_proxy_timeout() {
     let silent = StubPort::silent().await;
     let url = silent.http_url();
     let proxy = EthonyxHandle::start_tuned(&["--trust-upstream", "--el-http-url", &url], |cfg| {
-        cfg.proxy_timeout = Duration::from_millis(200);
+        cfg.proxy_timeout = Some(Duration::from_millis(200));
     })
     .await;
     let started = tokio::time::Instant::now();

@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, trace, warn};
 
-use crate::state::{AppState, ConnLimit, ConnPermitGuard};
+use crate::state::{ConnLimit, ConnPermitGuard, CoreState, ProxyState};
 use crate::{BoxError, lifecycle, proxy, transport};
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -394,11 +394,11 @@ async fn serve_connection(
     builders: Arc<ServerBuilders>,
     stream: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
-    state: Arc<AppState>,
+    state: Arc<ProxyState>,
     permit: ConnPermitGuard,
     probes: proxy::ListenProbes,
 ) {
-    let _guard = state.metrics.active_tcp();
+    let _guard = state.core.metrics.active_tcp();
     let Some((proto, prefixed)) =
         read_initial_preface(stream, INITIAL_READ_TIMEOUT, &builders.lifecycle).await
     else {
@@ -421,7 +421,7 @@ async fn serve_admin_io<I>(
     builders: &ServerBuilders,
     stream: I,
     peer: std::net::SocketAddr,
-    state: Arc<AppState>,
+    state: Arc<CoreState>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -468,53 +468,59 @@ async fn serve_admin_connection(
     builders: Arc<ServerBuilders>,
     stream: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
-    state: Arc<AppState>,
+    state: Arc<CoreState>,
     _permit: ConnPermitGuard,
 ) {
     serve_admin_io(&builders, stream, peer, state).await;
 }
 
 enum AcceptTarget {
-    Data(proxy::ListenProbes),
-    Admin(ConnLimit),
+    Data {
+        state: Arc<ProxyState>,
+        probes: proxy::ListenProbes,
+    },
+    Admin {
+        state: Arc<CoreState>,
+        limit: ConnLimit,
+    },
 }
 
 impl AcceptTarget {
-    fn try_acquire(&self, state: &AppState) -> Option<ConnPermitGuard> {
+    fn try_acquire(&self) -> Option<ConnPermitGuard> {
         match self {
-            Self::Data(_) => state.try_acquire_permit(),
-            Self::Admin(limit) => limit.try_acquire(),
+            Self::Data { state, .. } => state.try_acquire_permit(),
+            Self::Admin { limit, .. } => limit.try_acquire(),
         }
     }
 
-    async fn acquire(&self, state: &AppState) -> Option<ConnPermitGuard> {
+    async fn acquire(&self) -> Option<ConnPermitGuard> {
         match self {
-            Self::Data(_) => state.conn_limit.acquire().await,
-            Self::Admin(limit) => limit.acquire().await,
+            Self::Data { state, .. } => state.conn_limit.acquire().await,
+            Self::Admin { limit, .. } => limit.acquire().await,
         }
     }
 
     fn log_accept_error(&self, error: &std::io::Error) {
         match self {
-            Self::Data(_) => warn!(%error, "accept failed"),
-            Self::Admin(_) => warn!(%error, "admin accept failed"),
+            Self::Data { .. } => warn!(%error, "accept failed"),
+            Self::Admin { .. } => warn!(%error, "admin accept failed"),
         }
     }
 
     fn log_transient_accept_error(&self, error: &std::io::Error) {
         match self {
-            Self::Data(_) => debug!(%error, "transient accept error; retrying"),
-            Self::Admin(_) => debug!(%error, "transient admin accept error; retrying"),
+            Self::Data { .. } => debug!(%error, "transient accept error; retrying"),
+            Self::Admin { .. } => debug!(%error, "transient admin accept error; retrying"),
         }
     }
 
-    fn log_saturated(&self, state: &AppState) {
+    fn log_saturated(&self) {
         match self {
-            Self::Data(_) => warn!(
+            Self::Data { state, .. } => warn!(
                 max_connections = state.conn_limit.max().map(NonZeroUsize::get),
                 "connection limit reached; queueing accepts"
             ),
-            Self::Admin(limit) => warn!(
+            Self::Admin { limit, .. } => warn!(
                 max_connections = limit.max().map(NonZeroUsize::get),
                 "admin connection limit reached; queueing accepts"
             ),
@@ -526,11 +532,10 @@ impl AcceptTarget {
         builders: &Arc<ServerBuilders>,
         stream: tokio::net::TcpStream,
         peer: std::net::SocketAddr,
-        state: &Arc<AppState>,
         permit: ConnPermitGuard,
     ) {
         match self {
-            Self::Data(probes) => {
+            Self::Data { state, probes } => {
                 // Connection lifecycle is fine-grained, high-frequency detail, so
                 // it lives at trace (accept/close) and on a dedicated `access_log`
                 // target (per-request peer, version, method, path, upstream, status,
@@ -546,7 +551,7 @@ impl AcceptTarget {
                     *probes,
                 ));
             }
-            Self::Admin(_) => {
+            Self::Admin { state, .. } => {
                 trace!(%peer, "admin connection accepted");
                 tokio::spawn(serve_admin_connection(
                     Arc::clone(builders),
@@ -577,7 +582,6 @@ fn is_transient_accept_error(error: &std::io::Error) -> bool {
 
 async fn run_accept_loop(
     listeners: &[TcpListener],
-    state: Arc<AppState>,
     builders: Arc<ServerBuilders>,
     target: AcceptTarget,
 ) {
@@ -613,7 +617,7 @@ async fn run_accept_loop(
         // Acquire a permit AFTER accepting an actual TCP connection so idle listeners
         // never pre-hoard permits needed by HTTP/2 Extended CONNECT streams or inflate
         // `ethonyx_connection_limit_saturated_total` before real contention occurs.
-        let permit = match target.try_acquire(&state) {
+        let permit = match target.try_acquire() {
             Some(permit) => {
                 saturated = false;
                 permit
@@ -621,12 +625,12 @@ async fn run_accept_loop(
             None => {
                 if !saturated {
                     saturated = true;
-                    target.log_saturated(&state);
+                    target.log_saturated();
                 }
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => return,
-                    permit = target.acquire(&state) => match permit {
+                    permit = target.acquire() => match permit {
                         Some(permit) => permit,
                         None => return,
                     },
@@ -634,34 +638,33 @@ async fn run_accept_loop(
             }
         };
         transport::configure_tcp_stream(&stream);
-        target.spawn(&builders, stream, peer, &state, permit);
+        target.spawn(&builders, stream, peer, permit);
     }
 }
 
 pub(crate) async fn accept_loop(
     listeners: Vec<TcpListener>,
-    state: Arc<AppState>,
+    state: Arc<ProxyState>,
     lifecycle: lifecycle::Lifecycle,
     probes: proxy::ListenProbes,
 ) {
     let builders = Arc::new(ServerBuilders::new_data(lifecycle, state.el_ws.is_some()));
-    run_accept_loop(&listeners, state, builders, AcceptTarget::Data(probes)).await;
+    run_accept_loop(&listeners, builders, AcceptTarget::Data { state, probes }).await;
 }
 
 /// Dedicated accept loop for `--admin-listen` with its own bounded concurrency pool,
 /// isolated from `--max-connections` saturation and data-plane TCP gauges.
 pub(crate) async fn accept_admin_loop(
     listener: TcpListener,
-    state: Arc<AppState>,
+    state: Arc<CoreState>,
     lifecycle: lifecycle::Lifecycle,
 ) {
     let builders = Arc::new(ServerBuilders::new_admin(lifecycle));
     let limit = ConnLimit::new(Some(ADMIN_MAX_CONNECTIONS));
     run_accept_loop(
         std::slice::from_ref(&listener),
-        state,
         builders,
-        AcceptTarget::Admin(limit),
+        AcceptTarget::Admin { state, limit },
     )
     .await;
 }
@@ -794,23 +797,19 @@ mod tests {
         early_drain.wait().await;
     }
 
-    async fn admin_test_state() -> Arc<AppState> {
+    async fn admin_test_state() -> Arc<CoreState> {
         use clap::Parser;
         let cfg = crate::Config::parse_from([
             "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
             "--el-http-url",
             "http://127.0.0.1:8545",
             "--trust-upstream",
         ]);
         let validated = cfg.parse_validated().unwrap();
-        let (state, _poller) = AppState::start(
-            validated.opts,
-            validated.max_connections,
-            validated.upstreams,
-            validated.health,
-            crate::metrics::ServerMetrics::disabled(),
-        )
-        .await;
+        let (state, _poller) =
+            CoreState::start(validated.core, crate::metrics::ServerMetrics::disabled()).await;
         state
     }
 

@@ -209,10 +209,10 @@ LB / service mesh in front.
 
 ## Usage
 
-`--el-http-url` is required; all other optional endpoints (`--admin-listen`,
-`--el-ws-url`, `--cl-beacon-url`, `--cl-mev-relay-url`, `--el-reference-url`,
-`--otel-endpoint`) have no implicit defaults and are enabled only when explicitly
-provided (`--listen` defaults to `0.0.0.0:8547`):
+`--el-http-url` and at least one of `--listen` or `--admin-listen` are required;
+no listener or upstream URL carries an implicit default, and every optional endpoint
+(`--listen`, `--admin-listen`, `--el-ws-url`, `--cl-beacon-url`, `--cl-mev-relay-url`,
+`--el-reference-url`, `--otel-endpoint`) is enabled only when explicitly provided:
 
 ```sh
 ethonyx \
@@ -224,22 +224,32 @@ ethonyx \
 ```
 
 Every flag also accepts an `ETHONYX_*` env var (see `ethonyx --help`). To disable an
-optional endpoint (`ETHONYX_ADMIN_LISTEN`, `ETHONYX_EL_WS_URL`, etc.) via environment
+optional endpoint (`ETHONYX_LISTEN`, `ETHONYX_ADMIN_LISTEN`, `ETHONYX_EL_WS_URL`, etc.) via environment
 variables, leave the variable unset rather than setting an empty string (`""`), which
 is rejected as invalid; if a reference
 URL's query string itself contains a comma, pass repeated `--el-reference-url` CLI
 flags rather than comma-delimiting.
 
-### Dedicated admin/probe listener (`--admin-listen`)
+### Dedicated admin/probe listener (`--admin-listen`) & probe-only mode
 
-In Kubernetes and high-traffic production deployments, pass `--admin-listen`
-(`ETHONYX_ADMIN_LISTEN`, e.g. `0.0.0.0:9090`) to isolate `/livez`, `/readyz`,
-`/healthz`, and `/metrics` onto a dedicated TCP listener with its own 64-connection
+Pass `--admin-listen` (`ETHONYX_ADMIN_LISTEN`, e.g. `0.0.0.0:9090`) to serve `/livez`,
+`/readyz`, `/healthz`, and `/metrics` on a dedicated TCP listener with its own 64-connection
 pool and tight connection limits:
 - **Saturation resilience**: Kubelet probes and Prometheus scrapes remain responsive even when client traffic saturates `--max-connections` on `--listen`. To prevent idle clients from wedging the 64-slot admin pool, `--admin-listen` enforces a `5s` initial-preface and HTTP/1.1 header timeout, disables HTTP/1.1 keep-alive (`Connection: close`), caps HTTP/2 concurrency at `32` streams, bounds total connection lifetime to `10s` (sending a graceful HTTP/2 `GOAWAY` at `9s`), and caps admin shutdown drain at `1s` (or immediately under `--shutdown-grace 0`). Because pool saturation queues subsequent accepts until in-flight slots drain (up to `5s` for silent TCP clients or `10s` for slow/stalled HTTP/1.1 and HTTP/2 connections), restrict `--admin-listen` to cluster-internal or network-policy-scoped traffic rather than exposing it publicly.
-- **Surface isolation**: All valid requests (including `GET`, `HEAD`, `POST`, HTTP/1.1 WebSocket upgrades, and HTTP/2 Extended `CONNECT` WebSockets) to the four probe paths return `404 Not Found` on `--listen` (never forwarded to `--el-http-url` or `--el-ws-url`), while non-WebSocket `CONNECT` and non-origin request targets still return `400 Bad Request`. `--admin-listen` serves only those four paths (`405` with `Allow: GET, HEAD` on unsupported methods; `400` on `CONNECT` or non-origin request targets; `404` on all other paths, including `/eth/v1/node/health`, which remains a Beacon API route on `--listen`).
+- **Surface isolation**: When paired with `--listen`, all valid requests (including `GET`, `HEAD`, `POST`, HTTP/1.1 WebSocket upgrades, and HTTP/2 Extended `CONNECT` WebSockets) to the four probe paths return `404 Not Found` on `--listen` (never forwarded to `--el-http-url` or `--el-ws-url`), while non-WebSocket `CONNECT` and non-origin request targets still return `400 Bad Request`. `--admin-listen` serves only those four paths (`405` with `Allow: GET, HEAD` on unsupported methods; `400` on `CONNECT` or non-origin request targets; `404` on all other paths, including `/eth/v1/node/health`, which remains a Beacon API route on `--listen`).
 - **Metric hygiene**: Connections on `--admin-listen` do not consume `--max-connections`, increment `ethonyx_active_connections{protocol="tcp"}`, or trigger `ethonyx_connection_limit_saturated_total`.
-- When `--admin-listen` is omitted, `--listen` serves probes and data-plane routes together as before.
+- **Probe-only mode (`--admin-listen` without `--listen`)**: Omit `--listen` to run `ethonyx` purely as a health-check and observability sidecar with zero data-plane sockets, zero proxy state, and (when `--otel-endpoint` is set) metrics-only OTLP export. Data-plane-only flags (`--el-ws-url`, `--cl-mev-relay-url`, `--mock-eth-syncing`, `--mock-cl-subscriptions`, `--mock-cl-node-health`, `--proxy-timeout`, `--sse-idle-timeout`, `--max-connections`, `--access-log`, `--trust-upstream`) fail closed at startup when `--listen` is omitted:
+
+```sh
+ethonyx \
+  --admin-listen 0.0.0.0:9099 \
+  --network mainnet \
+  --el-http-url    http://127.0.0.1:8545 \
+  --cl-beacon-url  http://127.0.0.1:5052 \
+  --el-reference-url http://10.0.1.11:8545
+```
+
+- When `--admin-listen` is omitted (with `--listen` set), `--listen` serves probes and data-plane routes together.
 
 ### Multi-port listen
 
@@ -341,11 +351,12 @@ The following metrics are exposed:
 If built with the `otel` feature, ethonyx supports exporting traces and metrics to an OTLP endpoint (HTTP protocol). Passing `--otel-endpoint` / `ETHONYX_OTEL_ENDPOINT` (including an empty string) to a default (non-`otel`) build fails fast at startup rather than silently ignoring telemetry configuration.
 
 Pass an HTTP(S) **base URL**, optionally with a path prefix and without a query or fragment.
-Ethonyx appends `/v1/traces` and `/v1/metrics` for the respective signals. The
-exporters use `hyper-util` + Rustls with bundled `webpki-roots` (working out of the box
+Ethonyx appends `/v1/traces` and `/v1/metrics` for the respective signals (in probe-only mode
+without `--listen`, only the `/v1/metrics` provider is started and `Prepared::tracer()` returns
+`None`). The exporters use `hyper-util` + Rustls with bundled `webpki-roots` (working out of the box
 in `FROM scratch` containers; OS/private CA stores and `HTTP_PROXY`/`HTTPS_PROXY`
 environment variables are not loaded) and run their blocking work outside Tokio
-workers. Both providers flush on orderly shutdown (Ctrl-C, or SIGTERM on Unix).
+workers. Active providers flush on orderly shutdown (Ctrl-C, or SIGTERM on Unix).
 
 ```sh
 # Build with OpenTelemetry support

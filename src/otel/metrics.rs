@@ -13,20 +13,39 @@ use crate::metrics::{
 
 struct OtelMetricsInner {
     meter: opentelemetry::metrics::Meter,
-    active_connections: opentelemetry::metrics::UpDownCounter<i64>,
     // Kept lazy: `opentelemetry_sdk` pre-allocates ~135 KiB per built instrument,
-    // so unused saturation/body-error/health instruments (e.g. EL-only or `--trust-upstream`) stay zero-cost.
+    // so unused proxy/saturation/body-error/health instruments (e.g. probe-only,
+    // EL-only, or `--trust-upstream`) stay zero-cost.
+    active_connections: OnceLock<opentelemetry::metrics::UpDownCounter<i64>>,
     saturated: OnceLock<opentelemetry::metrics::Counter<u64>>,
     body_errors: OnceLock<opentelemetry::metrics::Counter<u64>>,
-    duration: opentelemetry::metrics::Histogram<f64>,
-    requests: opentelemetry::metrics::Counter<u64>,
+    duration: OnceLock<opentelemetry::metrics::Histogram<f64>>,
+    requests: OnceLock<opentelemetry::metrics::Counter<u64>>,
     health: [OnceLock<opentelemetry::metrics::Gauge<f64>>; HealthInstrument::COUNT],
+}
+
+impl OtelMetricsInner {
+    fn duration(&self) -> &opentelemetry::metrics::Histogram<f64> {
+        self.duration.get_or_init(|| {
+            self.meter
+                .f64_histogram(PROXY_REQUEST_DURATION)
+                .with_unit("s")
+                .with_boundaries(
+                    LATENCY_BUCKET_BOUNDS
+                        .iter()
+                        .map(Duration::as_secs_f64)
+                        .collect(),
+                )
+                .build()
+        })
+    }
 }
 
 /// Typed OpenTelemetry metric fanout owned directly by [`crate::metrics::ServerMetrics`].
 ///
-/// Builds one OTel instrument per metric name (zero per-series wrapper allocations or
-/// `Recorder` virtual dispatch), lazily creating saturation, body-error, and health instruments on first use.
+/// Builds one OTel instrument per metric name lazily on first use (zero per-series
+/// wrapper allocations or `Recorder` virtual dispatch, and zero unused proxy instruments
+/// in probe-only mode).
 pub(crate) struct OtelMetrics(Option<Box<OtelMetricsInner>>);
 
 impl OtelMetrics {
@@ -35,25 +54,13 @@ impl OtelMetrics {
     }
 
     pub(super) fn from_meter(meter: opentelemetry::metrics::Meter) -> Self {
-        let active_connections = meter.i64_up_down_counter(ACTIVE_CONNECTIONS).build();
-        let duration = meter
-            .f64_histogram(PROXY_REQUEST_DURATION)
-            .with_unit("s")
-            .with_boundaries(
-                LATENCY_BUCKET_BOUNDS
-                    .iter()
-                    .map(Duration::as_secs_f64)
-                    .collect(),
-            )
-            .build();
-        let requests = meter.u64_counter(PROXY_REQUESTS_TOTAL).build();
         Self(Some(Box::new(OtelMetricsInner {
             meter,
-            active_connections,
+            active_connections: OnceLock::new(),
             saturated: OnceLock::new(),
             body_errors: OnceLock::new(),
-            duration,
-            requests,
+            duration: OnceLock::new(),
+            requests: OnceLock::new(),
             health: [const { OnceLock::new() }; HealthInstrument::COUNT],
         })))
     }
@@ -61,6 +68,7 @@ impl OtelMetrics {
     pub(crate) fn add_active(&self, protocol: ConnProtocol, delta: i64) {
         if let Some(m) = &self.0 {
             m.active_connections
+                .get_or_init(|| m.meter.i64_up_down_counter(ACTIVE_CONNECTIONS).build())
                 .add(delta, &[KeyValue::new("protocol", protocol.as_str())]);
         }
     }
@@ -82,20 +90,22 @@ impl OtelMetrics {
     ) {
         if let Some(m) = &self.0 {
             let upstream = layer.as_str();
-            m.duration.record(
+            m.duration().record(
                 elapsed.as_secs_f64(),
                 &[KeyValue::new("upstream", upstream)],
             );
             // Keep keys sorted ascending so `opentelemetry_sdk`'s `ValueMap` retains one
             // `Vec<KeyValue>` entry per series instead of both unsorted and sorted copies.
-            m.requests.add(
-                1,
-                &[
-                    KeyValue::new("method", method.as_str()),
-                    KeyValue::new("status", status.as_str()),
-                    KeyValue::new("upstream", upstream),
-                ],
-            );
+            m.requests
+                .get_or_init(|| m.meter.u64_counter(PROXY_REQUESTS_TOTAL).build())
+                .add(
+                    1,
+                    &[
+                        KeyValue::new("method", method.as_str()),
+                        KeyValue::new("status", status.as_str()),
+                        KeyValue::new("upstream", upstream),
+                    ],
+                );
         }
     }
 

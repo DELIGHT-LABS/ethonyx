@@ -68,19 +68,21 @@ impl fmt::Debug for OtlpHyperClient {
     }
 }
 
-/// Build per-signal trace and metric OTLP clients sharing one pooled HTTPS client
-/// and one single-shot shutdown deadline handle.
+/// Build per-signal OTLP clients sharing one pooled HTTPS client and one
+/// single-shot shutdown deadline handle. When `enable_traces` is `false`
+/// (probe-only mode), skips creating the trace client and env timeout lookup.
 pub(super) fn build_signal_clients(
     rt: tokio::runtime::Handle,
     shutdown: Shutdown,
-) -> (OtlpHyperClient, OtlpHyperClient) {
+    enable_traces: bool,
+) -> (Option<OtlpHyperClient>, OtlpHyperClient) {
     let client = crate::transport::build_otlp_client();
-    let trace_client = OtlpHyperClient {
+    let trace_client = enable_traces.then(|| OtlpHyperClient {
         client: client.clone(),
         rt: rt.clone(),
         timeout: resolve_timeout("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT"),
         shutdown: shutdown.clone(),
-    };
+    });
     let metric_client = OtlpHyperClient {
         client,
         rt,

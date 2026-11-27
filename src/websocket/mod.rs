@@ -6,7 +6,7 @@ mod relay;
 use crate::lifecycle::Lifecycle;
 use crate::metrics::UpstreamLayer;
 use crate::response::{ResBody, empty_body, text_response, uri_too_long_response};
-use crate::state::{AppState, ConnPermitGuard};
+use crate::state::{ConnPermitGuard, ProxyState};
 use crate::transport::{WsTarget, configure_tcp_stream};
 use http::{Method, Request, Response, StatusCode, Version};
 use hyper::body::{Body as _, Incoming};
@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 
 /// Shared TCP permit + single reusable WebSocket slot, allocated only for
 /// WS-enabled servers with a bounded `--max-connections` after protocol preface
-/// succeeds so detached WS relays never retain `Arc<Connection>` / `Arc<AppState>`.
+/// succeeds so detached WS relays never retain `Arc<Connection>` / `Arc<ProxyState>`.
 struct SharedPermit {
     _permit: OwnedSemaphorePermit,
     ws_slot_in_use: AtomicBool,
@@ -71,7 +71,7 @@ impl WsConn {
     ///   share the TCP connection's existing permit via `ws_slot_in_use`.
     /// - Additional concurrent HTTP/2 Extended `CONNECT` streams acquire dedicated
     ///   permits from `--max-connections` so multiplex amplification is bounded.
-    fn acquire_permit(&self, state: &AppState) -> Option<WsPermit> {
+    fn acquire_permit(&self, state: &ProxyState) -> Option<WsPermit> {
         let Some(shared) = &self.permit else {
             return Some(WsPermit::Direct {
                 _guard: ConnPermitGuard::unlimited(),
@@ -261,7 +261,7 @@ pub(crate) async fn upgrade(
     req: Request<Incoming>,
     mode: WsMode,
     ws: &WsTarget,
-    state: &AppState,
+    state: &ProxyState,
     ws_conn: &WsConn,
 ) -> Response<ResBody> {
     if matches!(mode, WsMode::Upgrade) && !req.body().is_end_stream() {
@@ -361,7 +361,7 @@ pub(crate) async fn upgrade(
     }
     let lifecycle = ws_conn.lifecycle.clone();
     let mock_enabled = state.opts.mock_eth_syncing;
-    let ws_slot = state.metrics.ws_slot();
+    let ws_slot = state.core.metrics.ws_slot();
     tokio::spawn(lifecycle.run_with(move |shutdown| async move {
         let _permit = permit;
         match shutdown.bound(on_upgrade).await {
@@ -628,6 +628,8 @@ mod tests {
 
         let parsed = crate::Config::parse_from([
             "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
             "--el-http-url",
             "http://127.0.0.1:8545",
             "--el-ws-url",
@@ -638,11 +640,9 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        let (state, _) = AppState::start(
-            parsed.opts,
-            parsed.max_connections,
-            parsed.upstreams,
-            parsed.health,
+        let (state, _) = ProxyState::start(
+            parsed.core,
+            parsed.mode.into_proxy().unwrap(),
             crate::metrics::ServerMetrics::disabled(),
         )
         .await;
@@ -652,7 +652,7 @@ mod tests {
         let state_refs_before = Arc::strong_count(&state);
 
         // 1st WebSocket stream reuses the connection's own permit (1 left in sem)
-        // without retaining `Arc<AppState>`.
+        // without retaining `Arc<ProxyState>`.
         let p1 = ws_conn.acquire_permit(&state);
         assert!(matches!(p1, Some(WsPermit::Shared(_))));
         assert_eq!(state.conn_limit.available_permits(), Some(1));
@@ -685,6 +685,8 @@ mod tests {
         // Unlimited `--max-connections 0` skips `Arc<SharedPermit>` allocation and CAS.
         let unlimited = crate::Config::parse_from([
             "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
             "--el-http-url",
             "http://127.0.0.1:8545",
             "--el-ws-url",
@@ -695,11 +697,9 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        let (unlimited_state, _) = AppState::start(
-            unlimited.opts,
-            unlimited.max_connections,
-            unlimited.upstreams,
-            unlimited.health,
+        let (unlimited_state, _) = ProxyState::start(
+            unlimited.core,
+            unlimited.mode.into_proxy().unwrap(),
             crate::metrics::ServerMetrics::disabled(),
         )
         .await;

@@ -2192,3 +2192,276 @@ async fn admin_listen_isolates_probes_under_max_connections_saturation_and_hides
         .expect("idle h2c admin connection must drain gracefully before 3s shutdown_grace");
     drop(h2);
 }
+
+#[tokio::test]
+async fn probe_only_mode_serves_health_ready_metrics_without_data_plane_or_forwarding() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    async fn get_json(c: &TestClient, url: &str) -> (StatusCode, Value) {
+        let (st, body) = get(c, url).await;
+        (st, serde_json::from_slice(&body).unwrap())
+    }
+
+    let now = now_unix();
+    let block_ts_hex = format!("0x{:x}", now.saturating_sub(2));
+    let genesis = 1_606_824_023u64;
+    let head_slot = now.saturating_sub(genesis) / 12;
+    let non_probe_hits = Arc::new(AtomicUsize::new(0));
+    let el_lagging = Arc::new(AtomicBool::new(false));
+
+    let el_hits = Arc::clone(&non_probe_hits);
+    let el_lag = Arc::clone(&el_lagging);
+    let el = MockServer::start(jsonrpc_mock(move |method| {
+        let block_num = if el_lag.load(Ordering::Relaxed) {
+            "0x60" // 96 -> lags reference 100 by 4 > max_lag 1
+        } else {
+            "0x64" // 100
+        };
+        match method {
+            "eth_syncing" => RpcMockReply::Result(json!(false)),
+            "net_peerCount" => RpcMockReply::Result(json!("0x12")),
+            "eth_getBlockByNumber" => RpcMockReply::Result(json!({
+                "number": block_num,
+                "timestamp": block_ts_hex,
+            })),
+            "eth_chainId" => RpcMockReply::Result(json!("0x1")),
+            "eth_blockNumber" => RpcMockReply::Result(json!(block_num)),
+            _ => {
+                el_hits.fetch_add(1, Ordering::Relaxed);
+                RpcMockReply::Result(Value::Null)
+            }
+        }
+    }))
+    .await;
+
+    let cl_hits = Arc::clone(&non_probe_hits);
+    let cl = MockServer::start(Arc::new(move |req| match req.path.as_str() {
+        "/eth/v1/node/syncing" => (
+            StatusCode::OK,
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "data": {
+                        "head_slot": head_slot.to_string(),
+                        "sync_distance": "0",
+                        "is_syncing": false,
+                        "is_optimistic": false,
+                        "el_offline": false,
+                    }
+                }))
+                .unwrap(),
+            ),
+        ),
+        "/eth/v1/node/peer_count" => (
+            StatusCode::OK,
+            Bytes::from_static(br#"{"data":{"connected":"42"}}"#),
+        ),
+        _ => {
+            cl_hits.fetch_add(1, Ordering::Relaxed);
+            (StatusCode::OK, Bytes::from_static(b"unexpected"))
+        }
+    }))
+    .await;
+
+    let reference = MockServer::start(jsonrpc_mock(|method| {
+        RpcMockReply::Result(match method {
+            "eth_chainId" => json!("0x1"),
+            "eth_blockNumber" => json!("0x64"),
+            _ => Value::Null,
+        })
+    }))
+    .await;
+
+    let mut cfg = Config::try_parse_from([
+        "ethonyx",
+        "--admin-listen",
+        "127.0.0.1:0",
+        "--el-http-url",
+        &el.url,
+        "--cl-beacon-url",
+        &cl.url,
+        "--el-reference-url",
+        &reference.url,
+        "--el-max-reference-lag",
+        "1",
+        "--shutdown-grace",
+        "3",
+    ])
+    .expect("clap parse");
+    cfg.health_poll_interval = Duration::from_millis(40);
+    cfg.el_reference_poll_interval = Some(Duration::from_millis(40));
+
+    let bound = Prepared::new(cfg)
+        .await
+        .expect("prepare")
+        .bind()
+        .await
+        .expect("bind");
+    assert!(bound.local_addrs().is_empty());
+    let admin_addr = bound.admin_addr().expect("admin_addr must be bound");
+    let admin_port = admin_addr.port();
+
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let serve_task = tokio::spawn(bound.serve(async move {
+        let _ = stop_rx.await;
+    }));
+
+    let c = client();
+    let admin_url = |path: &str| format!("http://127.0.0.1:{admin_port}{path}");
+
+    // 1. Probes succeed on `--admin-listen` with complete EL/CL/Reference data and zero proxy metrics.
+    let (live_st, live_body) = get(&c, &admin_url("/livez")).await;
+    assert_eq!(live_st, StatusCode::OK);
+    assert_eq!(live_body.as_ref(), b"ok");
+
+    let (ready_st, ready_json) = get_json(&c, &admin_url("/readyz")).await;
+    assert_eq!(ready_st, StatusCode::OK);
+    assert_eq!(ready_json["status"], "ready");
+    assert_eq!(ready_json["el_reference_lag"]["ok"], true);
+
+    let (health_st, health_json) = get_json(&c, &admin_url("/healthz")).await;
+    assert_eq!(health_st, StatusCode::OK);
+    assert_eq!(health_json["mode"], "probed");
+    assert_eq!(health_json["el"]["block_number"], 100);
+    assert_eq!(health_json["cl"]["peers"], 42);
+    assert_eq!(health_json["reference"]["block_lag"], 0);
+
+    let (metrics_st, metrics_raw) = get(&c, &admin_url("/metrics")).await;
+    assert_eq!(metrics_st, StatusCode::OK);
+    let metrics_text = std::str::from_utf8(&metrics_raw).unwrap();
+    assert_eq!(
+        prom_metric_sum(
+            metrics_text,
+            "ethonyx_upstream_health_status",
+            &["layer=\"el\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        prom_metric_sum(
+            metrics_text,
+            "ethonyx_upstream_health_status",
+            &["layer=\"cl\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        prom_metric_sum(metrics_text, "ethonyx_reference_health_status", &[]),
+        1.0
+    );
+    for absent_proxy_metric in [
+        "ethonyx_active_connections",
+        "ethonyx_connection_limit_saturated_total",
+        "ethonyx_proxy_requests_total",
+        "ethonyx_proxy_request_duration_seconds",
+        "ethonyx_response_body_errors_total",
+    ] {
+        assert!(
+            !metrics_text.contains(absent_proxy_metric),
+            "probe-only /metrics must not emit {absent_proxy_metric}:\n{metrics_text}"
+        );
+    }
+
+    // 2. Non-GET/HEAD on probe paths returns 405 + Allow; proxy paths return 404 without hitting upstream.
+    let post_ready = c
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(admin_url("/readyz"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_ready.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(post_ready.headers()[http::header::ALLOW], "GET, HEAD");
+
+    let (rpc_st, _) = post_json(
+        &c,
+        &admin_url("/"),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "eth_gasPrice", "params": []}),
+    )
+    .await;
+    assert_eq!(rpc_st, StatusCode::NOT_FOUND);
+    let (cl_st, _) = get(&c, &admin_url("/eth/v1/node/version")).await;
+    assert_eq!(cl_st, StatusCode::NOT_FOUND);
+    assert_eq!(non_probe_hits.load(Ordering::Relaxed), 0);
+
+    // 3. Readiness reacts live to reference lag transitions.
+    el_lagging.store(true, Ordering::Relaxed);
+    wait_for(|| async {
+        let (st, j) = get_json(&c, &admin_url("/readyz")).await;
+        if st == StatusCode::SERVICE_UNAVAILABLE && j["el_reference_lag"]["ok"] == false {
+            Ok(())
+        } else {
+            Err(format!("expected 503 lag, got {st} {j}"))
+        }
+    })
+    .await;
+
+    // 4. Open idle HTTP/2 (`h2c`) admin connection drains gracefully via GOAWAY well before 3s grace.
+    let h2_stream = tokio::net::TcpStream::connect(admin_addr).await.unwrap();
+    let (mut h2_sender, h2_conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, TestBody>(TokioIo::new(h2_stream))
+        .await
+        .unwrap();
+    let _h2_driver = AbortOnDrop(tokio::spawn(async move {
+        let _ = h2_conn.await;
+    }));
+    let h2_resp = h2_sender
+        .send_request(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .method(Method::GET)
+                .uri(admin_url("/livez"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(h2_resp.status(), StatusCode::OK);
+    let _ = h2_resp.into_body().collect().await.unwrap();
+
+    let _ = stop_tx.send(());
+    tokio::time::timeout(Duration::from_secs(1), serve_task)
+        .await
+        .expect("probe-only mode must drain idle h2c admin connection promptly")
+        .unwrap()
+        .unwrap();
+
+    // 5. Degraded startup (unreachable EL) still binds `--admin-listen` and reports 503 readyz / 200 healthz.
+    let dead = StubPort::dead().await;
+    let dead_url = dead.http_url();
+    let dead_cfg = Config::try_parse_from([
+        "ethonyx",
+        "--admin-listen",
+        "127.0.0.1:0",
+        "--el-http-url",
+        &dead_url,
+        "--health-timeout",
+        "1",
+        "--shutdown-grace",
+        "0",
+    ])
+    .expect("clap parse");
+    let dead_bound = Prepared::new(dead_cfg).await.unwrap().bind().await.unwrap();
+    assert!(dead_bound.local_addrs().is_empty());
+    let dead_admin_port = dead_bound.admin_addr().unwrap().port();
+    let (dtx, drx) = oneshot::channel::<()>();
+    let dead_task = tokio::spawn(dead_bound.serve(async move {
+        let _ = drx.await;
+    }));
+
+    let (st_live, _) = get(&c, &format!("http://127.0.0.1:{dead_admin_port}/livez")).await;
+    assert_eq!(st_live, StatusCode::OK);
+    let (st_ready, _) = get(&c, &format!("http://127.0.0.1:{dead_admin_port}/readyz")).await;
+    assert_eq!(st_ready, StatusCode::SERVICE_UNAVAILABLE);
+    let (st_health, j_health) =
+        get_json(&c, &format!("http://127.0.0.1:{dead_admin_port}/healthz")).await;
+    assert_eq!(st_health, StatusCode::OK);
+    assert!(
+        !j_health["el"]["errors"].as_array().unwrap().is_empty(),
+        "expected el.errors in degraded probe-only /healthz: {j_health}"
+    );
+    let _ = dtx.send(());
+    dead_task.await.unwrap().unwrap();
+}

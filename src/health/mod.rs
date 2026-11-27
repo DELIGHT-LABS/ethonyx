@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::config::SlotClock;
 use crate::response::{ResBody, empty_json_response, raw_json_response};
-use crate::state::AppState;
+use crate::state::CoreState;
 
 use el::ElSyncingResult;
 use eval::{
@@ -169,7 +169,7 @@ fn trusted_ready(has_cl: bool) -> ReadyReport<'static, &'static str, &'static st
 /// Serves the latest background poll; block / slot ages are recomputed live per
 /// request. Under `--trust-upstream`, reports `mode: "trusted"` and omits unpolled
 /// fields instead of fabricating placeholder metrics.
-pub(crate) fn report(state: &AppState, head: bool) -> Response<ResBody> {
+pub(crate) fn report(state: &CoreState, head: bool) -> Response<ResBody> {
     if head {
         return empty_json_response(StatusCode::OK);
     }
@@ -222,7 +222,7 @@ const fn ready_status(ready: bool) -> StatusCode {
 }
 
 /// `/readyz` — load-balancer readiness gate. 200 when ready, else 503.
-pub(crate) fn ready(state: &AppState, head: bool) -> Response<ResBody> {
+pub(crate) fn ready(state: &CoreState, head: bool) -> Response<ResBody> {
     match (&state.health, head) {
         (HealthSource::Trusted, true) => empty_json_response(StatusCode::OK),
         (HealthSource::Trusted, false) => {
@@ -252,7 +252,7 @@ pub(crate) fn ready(state: &AppState, head: bool) -> Response<ResBody> {
 ///   lagging behind reference RPCs, or stale under `--readyz-strict`.
 ///
 /// Serves an empty body with `content-type: application/json` in compliance with the spec.
-pub(crate) fn node_health(state: &AppState, query: Option<&str>) -> Response<ResBody> {
+pub(crate) fn node_health(state: &CoreState, query: Option<&str>) -> Response<ResBody> {
     let Ok(syncing_status) = parse_syncing_status(query) else {
         return crate::response::text_response(
             StatusCode::BAD_REQUEST,

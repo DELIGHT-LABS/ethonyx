@@ -33,7 +33,7 @@ use futures_util::future::OptionFuture;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use crate::state::AppState;
+use crate::state::{CoreState, ProxyState};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -52,9 +52,11 @@ pub struct Prepared {
 
 impl Prepared {
     /// Validate `cfg` and start the OTLP providers when an endpoint is configured.
+    /// In probe-only mode (`--admin-listen` without `--listen`), only the OTLP
+    /// metrics provider is started (`Prepared::tracer` returns `None`).
     pub async fn new(cfg: Config) -> Result<Self, BoxError> {
         let (parsed, otel_endpoint) = cfg.parse_with_otel()?;
-        let telemetry = otel::start(otel_endpoint)?;
+        let telemetry = otel::start(otel_endpoint, !parsed.mode.is_probe_only())?;
         Ok(Self {
             cfg,
             parsed,
@@ -67,14 +69,15 @@ impl Prepared {
         &self.cfg
     }
 
-    /// Tracer for the caller's `tracing-opentelemetry` layer, if telemetry started.
+    /// Tracer for the caller's `tracing-opentelemetry` layer, if trace telemetry started
+    /// (`None` when `--otel-endpoint` is unset or in probe-only mode without `--listen`).
     #[cfg(feature = "otel")]
     pub fn tracer(&self) -> Option<opentelemetry_sdk::trace::SdkTracer> {
         self.telemetry.tracer()
     }
 
     /// Warm the initial health snapshot (unless `--trust-upstream` is set) and bind
-    /// every `--listen` TCP socket (plus optional `--admin-listen`), returning a
+    /// every configured `--listen` and/or `--admin-listen` TCP socket, returning a
     /// [`Bound`] server ready to [`Bound::serve`].
     ///
     /// Background health polling and connection acceptance start when [`Bound::serve`]
@@ -85,16 +88,14 @@ impl Prepared {
             cfg,
             parsed:
                 config::ParsedConfig {
-                    listen,
-                    opts,
-                    max_connections,
-                    upstreams,
-                    health,
+                    core,
+                    mode,
                     shutdown_grace,
                 },
             telemetry,
         } = self;
-        let el_references = health.reference_count();
+        let el_references = core.health.reference_count();
+        let mode_label = mode.mode_label();
 
         info!(
             version = concat!("v", env!("CARGO_PKG_VERSION")),
@@ -106,91 +107,65 @@ impl Prepared {
 
         // `Prepared::run` cancels this warm-up poll by dropping the `bind` future
         // when shutdown arrives before listeners are bound.
-        let (state, poller) = AppState::start(
-            opts,
-            max_connections,
-            upstreams,
-            health,
-            metrics::ServerMetrics::new(telemetry.metrics()),
-        )
-        .await;
-
-        let startup_msg = state.health.startup_message();
-        let el_ws = state.el_ws.as_ref().map(|ws| ws.upstream.redacted());
-        let cl_beacon = state.cl.as_ref().map(|cl| cl.beacon.upstream.redacted());
-        let cl_mev_relay = state
-            .cl
-            .as_ref()
-            .and_then(|cl| cl.mev_relay.as_ref())
-            .map(|mev| mev.upstream.redacted());
-        let cl_proto = state
-            .cl
-            .as_ref()
-            .map_or("none", |cl| cl.beacon.transport.startup_proto_label());
-        info!(
-            el_http = %state.el.upstream.redacted(),
-            el_http_proto = %state.el.transport.startup_proto_label(),
-            el_ws = %upstream::RedactedOptUri(el_ws),
-            el_references,
-            cl_beacon = %upstream::RedactedOptUri(cl_beacon),
-            cl_mev_relay = %upstream::RedactedOptUri(cl_mev_relay),
-            cl_proto = %cl_proto,
-            "{startup_msg}"
-        );
-
-        // No `.await` follows a failed bind: `Prepared::run` races `self.bind()`
-        // against `shutdown`, so returning immediately via `?` ensures a concurrent
-        // shutdown signal can never overtake and swallow a bind error.
-        let (listen, admin_listen) = listen.into_parts();
-        let mut resolved_listen = Vec::with_capacity(listen.len());
-        for addr in listen {
-            resolved_listen.push(resolve_listener("--listen", addr).await?);
-        }
-        let mut resolved_admin = match admin_listen {
-            Some(addr) => Some(resolve_listener("--admin-listen", addr).await?),
-            None => None,
-        };
-        config::validate_resolved_addrs(&resolved_listen, resolved_admin.as_ref())?;
-
-        let mut listeners = Vec::with_capacity(resolved_listen.len());
-        let mut local_addrs = Vec::with_capacity(resolved_listen.len());
-        for resolved in &mut resolved_listen {
-            let (listener, local_addr) = bind_listener("--listen", resolved).await?;
-            resolved.set_bound_addr(local_addr);
-            listeners.push(listener);
-            local_addrs.push(local_addr);
-        }
-        let admin = match &mut resolved_admin {
-            Some(resolved) => {
-                let (listener, local_addr) = bind_listener("--admin-listen", resolved).await?;
-                resolved.set_bound_addr(local_addr);
-                Some((listener, local_addr))
+        let metrics = metrics::ServerMetrics::new(telemetry.metrics());
+        let (bound_mode, poller) = match mode {
+            config::RuntimePlan::ProbeOnly { admin } => {
+                let (state, poller) = CoreState::start(core, metrics).await;
+                log_startup(mode_label, &state, None, None, el_references);
+                // No `.await` follows a failed bind: `Prepared::run` races `self.bind()`
+                // against `shutdown`, so returning immediately via `?` ensures a concurrent
+                // shutdown signal can never overtake and swallow a bind error.
+                let resolved = resolve_listener("--admin-listen", admin).await?;
+                let (listener, admin_addr) = bind_listener("--admin-listen", &resolved).await?;
+                info!(admin_listen = %admin_addr, "listening");
+                (
+                    BoundMode::ProbeOnly {
+                        admin: (listener, admin_addr),
+                        state,
+                    },
+                    poller,
+                )
             }
-            None => None,
+            config::RuntimePlan::Proxy { listeners, proxy } => {
+                let (state, poller) = ProxyState::start(core, *proxy, metrics).await;
+                log_startup(
+                    mode_label,
+                    &state.core,
+                    state.el_ws.as_ref(),
+                    state.cl_proxy.mev_relay.as_ref(),
+                    el_references,
+                );
+                let bound = bind_proxy_listeners(listeners, None, state).await?;
+                (bound, poller)
+            }
+            config::RuntimePlan::ProxyWithAdmin {
+                listeners,
+                admin,
+                proxy,
+            } => {
+                let (state, poller) = ProxyState::start(core, *proxy, metrics).await;
+                log_startup(
+                    mode_label,
+                    &state.core,
+                    state.el_ws.as_ref(),
+                    state.cl_proxy.mev_relay.as_ref(),
+                    el_references,
+                );
+                let bound = bind_proxy_listeners(listeners, Some(admin), state).await?;
+                (bound, poller)
+            }
         };
-        config::validate_resolved_addrs(&resolved_listen, resolved_admin.as_ref())?;
-        // Emit `"listening"` only after every listener bind and post-bind overlap check succeeds
-        // so a failed `--admin-listen` bind never leaves misleading `"listening"` logs for dropped sockets.
-        for local_addr in &local_addrs {
-            info!(listen = %local_addr, "listening");
-        }
-        if let Some((_, admin_addr)) = &admin {
-            info!(admin_listen = %admin_addr, "listening");
-        }
 
         Ok(Bound {
-            listeners,
-            local_addrs,
-            admin,
-            state,
+            mode: bound_mode,
             poller,
             shutdown_grace,
             telemetry,
         })
     }
 
-    /// Bind every `cfg.listen` address (and optional `cfg.admin_listen`), serve all
-    /// routes, and wait for `shutdown` before draining for `cfg.shutdown_grace`
+    /// Bind every configured `cfg.listen` and/or `cfg.admin_listen` address, serve all
+    /// enabled routes, and wait for `shutdown` before draining for `cfg.shutdown_grace`
     /// seconds and flushing telemetry.
     ///
     /// If `shutdown` resolves before [`Prepared::bind`] completes, returns `Ok(())`
@@ -216,30 +191,55 @@ impl Prepared {
     }
 }
 
+enum BoundMode {
+    Proxy {
+        listeners: Vec<TcpListener>,
+        local_addrs: Vec<std::net::SocketAddr>,
+        state: Arc<ProxyState>,
+    },
+    ProxyWithAdmin {
+        listeners: Vec<TcpListener>,
+        local_addrs: Vec<std::net::SocketAddr>,
+        admin: (TcpListener, std::net::SocketAddr),
+        state: Arc<ProxyState>,
+    },
+    ProbeOnly {
+        admin: (TcpListener, std::net::SocketAddr),
+        state: Arc<CoreState>,
+    },
+}
+
 /// A [`Prepared`] server whose initial health snapshot is warm and whose TCP
 /// listeners are bound and ready to accept connections.
 #[must_use = "Bound does nothing unless `.serve(shutdown).await` is called"]
 pub struct Bound {
-    listeners: Vec<TcpListener>,
-    local_addrs: Vec<std::net::SocketAddr>,
-    admin: Option<(TcpListener, std::net::SocketAddr)>,
-    state: Arc<AppState>,
+    mode: BoundMode,
     poller: Option<health::HealthPoller>,
     shutdown_grace: Duration,
     telemetry: otel::Telemetry,
 }
 
 impl Bound {
-    /// Actual bound socket addresses in the same order as [`Config::listen`].
+    /// Actual bound data-plane socket addresses in the same order as [`Config::listen`]
+    /// (empty in probe-only mode when `--listen` is omitted).
     pub fn local_addrs(&self) -> &[std::net::SocketAddr] {
-        &self.local_addrs
+        match &self.mode {
+            BoundMode::Proxy { local_addrs, .. }
+            | BoundMode::ProxyWithAdmin { local_addrs, .. } => local_addrs,
+            BoundMode::ProbeOnly { .. } => &[],
+        }
     }
 
     /// Actual bound socket address for [`Config::admin_listen`], if configured.
     pub const fn admin_addr(&self) -> Option<std::net::SocketAddr> {
-        match &self.admin {
-            Some((_, addr)) => Some(*addr),
-            None => None,
+        match &self.mode {
+            BoundMode::Proxy { .. } => None,
+            BoundMode::ProxyWithAdmin {
+                admin: (_, addr), ..
+            }
+            | BoundMode::ProbeOnly {
+                admin: (_, addr), ..
+            } => Some(*addr),
         }
     }
 
@@ -250,32 +250,58 @@ impl Bound {
         F: Future<Output = ()> + Send,
     {
         let Self {
-            listeners,
-            local_addrs: _,
-            admin,
-            state,
+            mode,
             poller,
             shutdown_grace,
             telemetry,
         } = self;
 
         let (shutdown_tx, lifecycle, drain) = lifecycle::channel();
-        let mut poller = poller.map(|p| p.spawn(Arc::clone(&state), lifecycle.shutdown()));
-        let probes = if admin.is_some() {
-            proxy::ListenProbes::Hidden
-        } else {
-            proxy::ListenProbes::Serve
+        let (mut poller, mut accept_handle, mut admin_handle) = match mode {
+            BoundMode::Proxy {
+                listeners,
+                local_addrs: _,
+                state,
+            } => {
+                let poller = poller.map(|p| p.spawn(Arc::clone(&state.core), lifecycle.shutdown()));
+                let accept = tokio::spawn(server::accept_loop(
+                    listeners,
+                    state,
+                    lifecycle,
+                    proxy::ListenProbes::Serve,
+                ));
+                (poller, Some(accept), None)
+            }
+            BoundMode::ProxyWithAdmin {
+                listeners,
+                local_addrs: _,
+                admin: (admin_listener, _),
+                state,
+            } => {
+                let poller = poller.map(|p| p.spawn(Arc::clone(&state.core), lifecycle.shutdown()));
+                let admin = tokio::spawn(server::accept_admin_loop(
+                    admin_listener,
+                    Arc::clone(&state.core),
+                    lifecycle.clone(),
+                ));
+                let accept = tokio::spawn(server::accept_loop(
+                    listeners,
+                    state,
+                    lifecycle,
+                    proxy::ListenProbes::Hidden,
+                ));
+                (poller, Some(accept), Some(admin))
+            }
+            BoundMode::ProbeOnly {
+                admin: (admin_listener, _),
+                state,
+            } => {
+                let poller = poller.map(|p| p.spawn(Arc::clone(&state), lifecycle.shutdown()));
+                let admin =
+                    tokio::spawn(server::accept_admin_loop(admin_listener, state, lifecycle));
+                (poller, None, Some(admin))
+            }
         };
-        let mut admin_handle = admin.map(|(listener, _)| {
-            tokio::spawn(server::accept_admin_loop(
-                listener,
-                Arc::clone(&state),
-                lifecycle.clone(),
-            ))
-        });
-        let mut accept_handle = Some(tokio::spawn(server::accept_loop(
-            listeners, state, lifecycle, probes,
-        )));
 
         tokio::pin!(shutdown);
         let (first_res, unexpected) = tokio::select! {
@@ -284,7 +310,7 @@ impl Bound {
                 info!("shutdown signal received");
                 (Ok(()), None)
             }
-            Some(res) = OptionFuture::from(accept_handle.as_mut()) => {
+            Some(res) = OptionFuture::from(accept_handle.as_mut()), if accept_handle.is_some() => {
                 accept_handle = None;
                 warn!("accept loop exited unexpectedly; shutting down");
                 (res, Some("accept loop exited unexpectedly"))
@@ -328,6 +354,92 @@ impl Bound {
         telemetry.shutdown().await;
         outcome
     }
+}
+
+fn log_startup(
+    mode: &'static str,
+    core: &CoreState,
+    el_ws: Option<&transport::WsTarget>,
+    cl_mev_relay: Option<&transport::HttpTarget>,
+    el_references: usize,
+) {
+    let startup_msg = core.health.startup_message();
+    let el_ws = el_ws.map(|ws| ws.upstream.redacted());
+    let cl_beacon = core.cl.as_ref().map(|cl| cl.beacon.upstream.redacted());
+    let cl_mev_relay = cl_mev_relay.map(|mev| mev.upstream.redacted());
+    let cl_proto = core
+        .cl
+        .as_ref()
+        .map_or("none", |cl| cl.beacon.transport.startup_proto_label());
+    info!(
+        mode,
+        el_http = %core.el.upstream.redacted(),
+        el_http_proto = %core.el.transport.startup_proto_label(),
+        el_ws = %upstream::RedactedOptUri(el_ws),
+        el_references,
+        cl_beacon = %upstream::RedactedOptUri(cl_beacon),
+        cl_mev_relay = %upstream::RedactedOptUri(cl_mev_relay),
+        cl_proto = %cl_proto,
+        "{startup_msg}"
+    );
+}
+
+async fn bind_proxy_listeners(
+    listen: Vec<config::ListenAddr>,
+    admin_listen: Option<config::ListenAddr>,
+    state: Arc<ProxyState>,
+) -> Result<BoundMode, BoxError> {
+    // No `.await` follows a failed bind: `Prepared::run` races `self.bind()`
+    // against `shutdown`, so returning immediately via `?` ensures a concurrent
+    // shutdown signal can never overtake and swallow a bind error.
+    let mut resolved_listen = Vec::with_capacity(listen.len());
+    for addr in listen {
+        resolved_listen.push(resolve_listener("--listen", addr).await?);
+    }
+    let mut resolved_admin = match admin_listen {
+        Some(addr) => Some(resolve_listener("--admin-listen", addr).await?),
+        None => None,
+    };
+    config::validate_resolved_addrs(&resolved_listen, resolved_admin.as_ref())?;
+
+    let mut listeners = Vec::with_capacity(resolved_listen.len());
+    let mut local_addrs = Vec::with_capacity(resolved_listen.len());
+    for resolved in &mut resolved_listen {
+        let (listener, local_addr) = bind_listener("--listen", resolved).await?;
+        resolved.set_bound_addr(local_addr);
+        listeners.push(listener);
+        local_addrs.push(local_addr);
+    }
+    let admin = match &mut resolved_admin {
+        Some(resolved) => {
+            let (listener, local_addr) = bind_listener("--admin-listen", resolved).await?;
+            resolved.set_bound_addr(local_addr);
+            Some((listener, local_addr))
+        }
+        None => None,
+    };
+    config::validate_resolved_addrs(&resolved_listen, resolved_admin.as_ref())?;
+    // Emit `"listening"` only after every listener bind and post-bind overlap check succeeds
+    // so a failed `--admin-listen` bind never leaves misleading `"listening"` logs for dropped sockets.
+    for local_addr in &local_addrs {
+        info!(listen = %local_addr, "listening");
+    }
+    if let Some((_, admin_addr)) = &admin {
+        info!(admin_listen = %admin_addr, "listening");
+    }
+    Ok(match admin {
+        Some(admin) => BoundMode::ProxyWithAdmin {
+            listeners,
+            local_addrs,
+            admin,
+            state,
+        },
+        None => BoundMode::Proxy {
+            listeners,
+            local_addrs,
+            state,
+        },
+    })
 }
 
 async fn resolve_listener(
@@ -688,9 +800,11 @@ mod tests {
         let free_addr = free_probe.local_addr().unwrap();
         drop(free_probe);
 
-        let (mut parsed, _) = config::ListenPlan::parse(&["localhost:8547".to_owned()], None)
-            .unwrap()
-            .into_parts();
+        let config::ListenPlan::DataOnly(mut parsed) =
+            config::ListenPlan::parse(&["localhost:8547".to_owned()], None).unwrap()
+        else {
+            panic!("expected DataOnly plan");
+        };
         let resolved =
             config::ResolvedListen::many(parsed.pop().unwrap(), vec![occupied_addr, free_addr]);
         let err = bind_listener("--admin-listen", &resolved)
@@ -707,9 +821,11 @@ mod tests {
         // unassignable address (`AddrNotAvailable`) to the subsequent loopback candidate.
         let unroutable: std::net::SocketAddr = "192.0.2.1:0".parse().unwrap();
         if TcpListener::bind(unroutable).await.is_err() {
-            let (mut parsed, _) = config::ListenPlan::parse(&["localhost:0".to_owned()], None)
-                .unwrap()
-                .into_parts();
+            let config::ListenPlan::DataOnly(mut parsed) =
+                config::ListenPlan::parse(&["localhost:0".to_owned()], None).unwrap()
+            else {
+                panic!("expected DataOnly plan");
+            };
             let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
             let resolved =
                 config::ResolvedListen::many(parsed.pop().unwrap(), vec![unroutable, loopback]);
@@ -719,5 +835,72 @@ mod tests {
             assert!(local.ip().is_loopback());
             assert_ne!(local.port(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_bind_and_serve_support_probe_only_mode_without_data_listeners() {
+        use clap::Parser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (el_addr, _el_mock) = test_util::spawn_http_mock(|_req| async {
+            response::raw_json_response(
+                http::StatusCode::OK,
+                bytes::Bytes::from_static(
+                    br#"[{"jsonrpc":"2.0","id":1,"result":false},{"jsonrpc":"2.0","id":2,"result":"0x5"},{"jsonrpc":"2.0","id":3,"result":{"number":"0x64","timestamp":"0x65000000"}}]"#,
+                ),
+            )
+        })
+        .await;
+
+        let cfg = Config::parse_from([
+            "ethonyx",
+            "--admin-listen",
+            "127.0.0.1:0",
+            "--el-http-url",
+            &format!("http://{el_addr}"),
+            "--shutdown-grace",
+            "0",
+        ]);
+        let prepared = Prepared::new(cfg).await.unwrap();
+        #[cfg(feature = "otel")]
+        assert!(prepared.tracer().is_none());
+        let bound = prepared.bind().await.unwrap();
+        assert!(bound.local_addrs().is_empty());
+        let admin_addr = bound.admin_addr().expect("probe-only must bind admin_addr");
+        assert_ne!(admin_addr.port(), 0);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(bound.serve(async move {
+            let _ = rx.await;
+        }));
+
+        for (req, expected_prefix) in [
+            (
+                "GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "HTTP/1.1 200 OK",
+            ),
+            (
+                "GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "HTTP/1.1 200 OK",
+            ),
+            (
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+                "HTTP/1.1 404 Not Found",
+            ),
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(admin_addr).await.unwrap();
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).await.unwrap();
+            let text = String::from_utf8_lossy(&resp);
+            assert!(text.starts_with(expected_prefix), "req={req:?} got={text}");
+        }
+
+        let _ = tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("probe-only serve must drain cleanly without deadlock")
+            .unwrap()
+            .unwrap();
     }
 }

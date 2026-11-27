@@ -61,7 +61,10 @@ pub(crate) fn parse_config_endpoint(
     Ok(None)
 }
 
-pub(crate) fn start(_endpoints: Option<OtelEndpoints>) -> Result<Telemetry, crate::BoxError> {
+pub(crate) fn start(
+    _endpoints: Option<OtelEndpoints>,
+    _enable_traces: bool,
+) -> Result<Telemetry, crate::BoxError> {
     Ok(Telemetry)
 }
 

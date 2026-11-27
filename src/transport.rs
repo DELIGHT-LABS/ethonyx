@@ -95,7 +95,6 @@ fn wrap_https_connector(tls: rustls::ClientConfig) -> Https {
 }
 
 /// Build an HTTPS-capable HTTP/1.1+HTTP/2 connector using WebPKI roots.
-#[cfg(test)]
 pub(crate) fn build_https_connector() -> Https {
     wrap_https_connector(build_tls_config())
 }

@@ -127,7 +127,7 @@ impl fmt::Display for MethodError<'_> {
 
 /// Opaque borrowed transport and target-URI context shared by EL, CL, and reference health
 /// probes, constructing and sending bounded HTTP requests so leaf probe modules stay
-/// independent of [`crate::state::AppState`], [`HttpTransport`], and `http` request builders.
+/// independent of [`crate::state::CoreState`], [`HttpTransport`], and `http` request builders.
 #[derive(Clone, Copy)]
 pub(super) struct ProbeTarget<'a> {
     client: &'a ProxyClient,

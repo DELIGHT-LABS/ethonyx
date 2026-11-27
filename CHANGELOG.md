@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Changed
+
+- **BREAKING**: Remove the implicit `0.0.0.0:8547` default on `--listen` (`ETHONYX_LISTEN`) so at least one of `--listen` or `--admin-listen` must be specified, enabling native **probe-only mode** when `--admin-listen` is configured without `--listen` (serving `/livez`, `/readyz`, `/healthz`, and `/metrics` with zero data-plane sockets, no proxy runtime state, and metrics-only OpenTelemetry export without starting a trace provider or eager proxy instruments); reject all data-plane-only flags (`--el-ws-url`, `--cl-mev-relay-url`, `--mock-eth-syncing`, `--mock-cl-subscriptions`, `--mock-cl-node-health`, `--proxy-timeout`, `--sse-idle-timeout`, `--max-connections`, `--access-log`, `--trust-upstream`) at startup when `--listen` is omitted (changing `Config::{proxy_timeout, sse_idle_timeout, max_connections}` to `Option`), split runtime state into `CoreState` and `ProxyState` for compile-time control/data-plane isolation, and include `mode` (`"proxy"` | `"proxy+admin"` | `"probe-only"`) in startup logs.
+
 ## [0.3.0] - 2026-11-27
 
 ### Added
