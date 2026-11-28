@@ -2468,6 +2468,9 @@ async fn probe_only_mode_serves_health_ready_metrics_without_data_plane_or_forwa
 
 #[test]
 fn empty_ethonyx_listen_env_var_is_rejected_even_with_admin_listen() {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ethonyx"));
     // Remove only ethonyx/OTel/log env vars so OS essentials (`SystemRoot`, `PATH`) and
     // coverage instrumentation (`LLVM_PROFILE_FILE`) stay intact across Linux/macOS/Windows.
@@ -2478,17 +2481,41 @@ fn empty_ethonyx_listen_env_var_is_rejected_even_with_admin_listen() {
             cmd.env_remove(&key);
         }
     }
-    let output = cmd
+    let mut child = cmd
         .env("ETHONYX_EL_HTTP_URL", "http://127.0.0.1:8545")
         .env("ETHONYX_LISTEN", "")
-        .env("ETHONYX_ADMIN_LISTEN", "127.0.0.1:9099")
-        .output()
+        .env("ETHONYX_ADMIN_LISTEN", "127.0.0.1:0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn ethonyx binary");
+
+    // Bound the wait so a regression that starts probe-only mode fails fast instead of hanging CI.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll ethonyx child") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "ETHONYX_LISTEN=\"\" did not fail fast; binary remained running instead of exiting"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert!(
-        !output.status.success(),
+        !status.success(),
         "ETHONYX_LISTEN=\"\" must fail closed instead of silently entering probe-only mode"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read stderr");
     assert!(
         stderr.contains("invalid --listen address: entry must not be empty"),
         "unexpected stderr: {stderr}"

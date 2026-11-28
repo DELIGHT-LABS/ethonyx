@@ -486,6 +486,13 @@ enum AcceptTarget {
 }
 
 impl AcceptTarget {
+    fn admin(state: Arc<CoreState>) -> Self {
+        Self::Admin {
+            state,
+            limit: ConnLimit::new(Some(ADMIN_MAX_CONNECTIONS)),
+        }
+    }
+
     fn try_acquire(&self) -> Option<ConnPermitGuard> {
         match self {
             Self::Data { state, .. } => state.try_acquire_permit(),
@@ -660,11 +667,10 @@ pub(crate) async fn accept_admin_loop(
     lifecycle: lifecycle::Lifecycle,
 ) {
     let builders = Arc::new(ServerBuilders::new_admin(lifecycle));
-    let limit = ConnLimit::new(Some(ADMIN_MAX_CONNECTIONS));
     run_accept_loop(
         std::slice::from_ref(&listener),
         builders,
-        AcceptTarget::Admin { state, limit },
+        AcceptTarget::admin(state),
     )
     .await;
 }
@@ -1136,10 +1142,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_accept_target_caps_permits_at_admin_max_connections() {
-        let target = AcceptTarget::Admin {
-            state: admin_test_state().await,
-            limit: ConnLimit::new(Some(ADMIN_MAX_CONNECTIONS)),
-        };
+        let target = AcceptTarget::admin(admin_test_state().await);
         let mut held: Vec<_> = (0..ADMIN_MAX_CONNECTIONS.get())
             .map(|_| target.try_acquire().expect("permit within the admin cap"))
             .collect();

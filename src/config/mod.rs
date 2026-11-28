@@ -570,12 +570,12 @@ impl Config {
         Ok(())
     }
 
-    fn validate_flag_combinations(&self, is_probe_only: bool) -> Result<(), BoxError> {
+    fn validate_flag_combinations(&self, listen: &ListenPlan) -> Result<(), BoxError> {
         // Check `--listen` prerequisites first so flags requiring both `--listen` and
         // `--cl-beacon-url` (e.g. `--cl-mev-relay-url`, `--mock-cl-*`) report `requires --listen`
         // directly in probe-only mode instead of steering operators into a dead-end `--cl-beacon-url` hint.
         reject_flags_when(
-            is_probe_only,
+            matches!(listen, ListenPlan::ProbeOnly { .. }),
             &[
                 ("--el-ws-url", self.el_ws_url.is_some()),
                 ("--cl-mev-relay-url", self.cl_mev_relay_url.is_some()),
@@ -747,7 +747,7 @@ impl Config {
     ) -> Result<(ParsedConfig, Option<crate::otel::OtelEndpoints>), BoxError> {
         self.validate_scalars_and_durations()?;
         let listen = ListenPlan::parse(&self.listen, self.admin_listen.as_deref())?;
-        self.validate_flag_combinations(matches!(listen, ListenPlan::ProbeOnly { .. }))?;
+        self.validate_flag_combinations(&listen)?;
         let el_http = HttpUpstream::parse("--el-http-url", &self.el_http_url)?;
         let cl = self.parse_cl_probe()?;
         let health = self.parse_health_mode(&el_http, cl.is_some())?;
@@ -1600,6 +1600,8 @@ mod tests {
 
     #[test]
     fn scalar_range_errors_take_precedence_over_listener_and_requires_listen_errors() {
+        // Individual value-domain validation runs before listener and cross-flag combination checks
+        // (matching `clap` value parsing and existing `--el-reference-poll-interval 0` precedence).
         let err = parse(&["--admin-listen", "127.0.0.1:9099", "--proxy-timeout", "0"])
             .validate()
             .unwrap_err()

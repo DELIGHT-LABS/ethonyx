@@ -978,10 +978,11 @@ mod tests {
             err.contains("failed to bind --admin-listen address"),
             "unexpected error: {err}"
         );
-        drop(occupied);
 
         // 2. Shutdown arriving during a slow initial health probe cancels probe-only startup
-        // cleanly without waiting for `--health-timeout` or binding `--admin-listen`.
+        // cleanly without waiting for `--health-timeout` or attempting to bind `--admin-listen`
+        // (reusing the still-held `occupied_addr` proves bind was never reached, since binding it
+        // would fail with `AddrInUse` instead of returning `Ok(())`).
         let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let silent_addr = silent.local_addr().unwrap();
         let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<()>();
@@ -995,14 +996,11 @@ mod tests {
                 }
             }
         }));
-        let probe_port = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let free_admin_addr = probe_port.local_addr().unwrap();
-        drop(probe_port);
 
         let cancel_cfg = Config::parse_from([
             "ethonyx",
             "--admin-listen",
-            &free_admin_addr.to_string(),
+            &occupied_addr.to_string(),
             "--el-http-url",
             &format!("http://{silent_addr}"),
             "--health-timeout",
@@ -1017,9 +1015,6 @@ mod tests {
         .await
         .expect("startup shutdown must cancel slow probe-only warm-up immediately")
         .unwrap();
-        assert!(
-            TcpListener::bind(free_admin_addr).await.is_ok(),
-            "cancelled probe-only startup must not bind --admin-listen"
-        );
+        drop(occupied);
     }
 }
