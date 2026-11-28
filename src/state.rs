@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::config::{ClProbeUris, HealthMode, ProxyOpts, ValidatedUpstreams};
+use crate::config::{ClProbeUris, CoreConfig, HealthMode, ProxyConfig, ProxyOpts};
 use crate::health::{self, HealthPoller, HealthSource};
 use crate::metrics::ServerMetrics;
-use crate::transport::{HttpTarget, ProxyClient, WsTarget, build_client, build_connectors};
+use crate::transport::{
+    HttpTarget, Https, ProxyClient, WsTarget, build_client, build_connectors, build_https_connector,
+};
 use crate::upstream::WsUpstream;
 
 struct BoundedLimit {
@@ -86,67 +88,119 @@ impl ConnLimit {
     }
 }
 
-pub(crate) struct ClState {
+pub(crate) struct ClProbeTarget {
     pub(crate) beacon: HttpTarget,
     pub(crate) probe_uris: ClProbeUris,
+}
+
+pub(crate) struct ClProxyOpts {
     pub(crate) mev_relay: Option<HttpTarget>,
     pub(crate) mock_subscriptions: bool,
     pub(crate) mock_node_health: bool,
 }
 
-pub(crate) struct AppState {
-    pub(crate) opts: ProxyOpts,
+/// Shared upstream-client, health, and metrics core used by background polling,
+/// `--admin-listen` probes, and (via [`ProxyState`]) the data plane.
+pub(crate) struct CoreState {
     /// Default client: HTTP/1.1 for cleartext, h2 via ALPN for `https`. Serves
     /// the CL Beacon/MEV/Reference hops, and the EL hop unless cleartext `h2c` is active.
     pub(crate) client: ProxyClient,
     pub(crate) el: HttpTarget,
-    pub(crate) el_ws: Option<WsTarget>,
-    pub(crate) cl: Option<ClState>,
-    pub(crate) conn_limit: ConnLimit,
+    pub(crate) cl: Option<ClProbeTarget>,
     pub(crate) health: HealthSource,
     pub(crate) metrics: Arc<ServerMetrics>,
 }
 
-impl AppState {
-    /// Build runtime state and warm the initial health snapshot (unless `--trust-upstream`
-    /// is set).
+impl CoreState {
+    /// Build core runtime state and warm the initial health snapshot (unless
+    /// `--trust-upstream` is set).
     pub(crate) async fn start(
-        opts: ProxyOpts,
-        max_connections: Option<NonZeroUsize>,
-        upstreams: ValidatedUpstreams,
-        health: HealthMode,
+        core: CoreConfig,
         metrics: Arc<ServerMetrics>,
     ) -> (Arc<Self>, Option<HealthPoller>) {
-        let ValidatedUpstreams { el_http, el_ws, cl } = upstreams;
+        Self::start_with_https(build_https_connector(), core, metrics).await
+    }
+
+    async fn start_with_https(
+        https: Https,
+        core: CoreConfig,
+        metrics: Arc<ServerMetrics>,
+    ) -> (Arc<Self>, Option<HealthPoller>) {
+        let CoreConfig {
+            el_http,
+            cl,
+            health,
+        } = core;
         let trust_upstream = matches!(health, HealthMode::Trusted);
 
-        let (https, ws_tls) = build_connectors(el_ws.as_ref().is_some_and(WsUpstream::is_tls));
         let el = HttpTarget::new_el(el_http, trust_upstream, &https);
         let client = build_client(https);
+        let cl = cl.map(|cl| ClProbeTarget {
+            beacon: HttpTarget::new_standard(cl.beacon),
+            probe_uris: cl.probe_uris,
+        });
+        let (health, poller) = health::warm(health, &client, &el, cl.as_ref(), &metrics).await;
+
+        (
+            Arc::new(Self {
+                client,
+                el,
+                cl,
+                health,
+                metrics,
+            }),
+            poller,
+        )
+    }
+}
+
+/// Data-plane proxy state layered over [`CoreState`]; instantiated only when at least
+/// one `--listen` listener is configured.
+pub(crate) struct ProxyState {
+    pub(crate) core: Arc<CoreState>,
+    pub(crate) opts: ProxyOpts,
+    pub(crate) el_ws: Option<WsTarget>,
+    pub(crate) cl_proxy: ClProxyOpts,
+    pub(crate) conn_limit: ConnLimit,
+}
+
+impl ProxyState {
+    /// Build both [`CoreState`] (sharing one WebPKI TLS configuration with `wss://` when
+    /// configured) and the data-plane [`ProxyState`], warming the initial health snapshot.
+    pub(crate) async fn start(
+        core: CoreConfig,
+        proxy: ProxyConfig,
+        metrics: Arc<ServerMetrics>,
+    ) -> (Arc<Self>, Option<HealthPoller>) {
+        let ProxyConfig {
+            opts,
+            max_connections,
+            el_ws,
+            cl_mev_relay,
+            mock_cl_subscriptions,
+            mock_cl_node_health,
+        } = proxy;
+
+        let (https, ws_tls) = build_connectors(el_ws.as_ref().is_some_and(WsUpstream::is_tls));
+        let (core, poller) = CoreState::start_with_https(https, core, metrics).await;
         let el_ws = el_ws.map(|upstream| WsTarget {
             upstream,
             tls: ws_tls,
         });
-        let cl = cl.map(|cl| ClState {
-            beacon: HttpTarget::new_standard(cl.beacon),
-            probe_uris: cl.probe_uris,
-            mev_relay: cl.mev_relay.map(HttpTarget::new_untracked),
-            mock_subscriptions: cl.mock_subscriptions,
-            mock_node_health: cl.mock_node_health,
-        });
-        let (health, poller) = health::warm(health, &client, &el, cl.as_ref(), &metrics).await;
+        let cl_proxy = ClProxyOpts {
+            mev_relay: cl_mev_relay.map(HttpTarget::new_untracked),
+            mock_subscriptions: mock_cl_subscriptions,
+            mock_node_health: mock_cl_node_health,
+        };
         let conn_limit = ConnLimit::new(max_connections);
 
         (
             Arc::new(Self {
+                core,
                 opts,
-                client,
-                el,
                 el_ws,
-                cl,
+                cl_proxy,
                 conn_limit,
-                health,
-                metrics,
             }),
             poller,
         )
@@ -157,7 +211,7 @@ impl AppState {
     pub(crate) fn try_acquire_permit(&self) -> Option<ConnPermitGuard> {
         let permit = self.conn_limit.try_acquire();
         if permit.is_none() {
-            self.metrics.inc_saturated();
+            self.core.metrics.inc_saturated();
         }
         permit
     }

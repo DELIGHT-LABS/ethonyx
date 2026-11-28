@@ -97,7 +97,7 @@ impl ActiveSlot {
 /// Unarmed Prometheus + OpenTelemetry active-connection handle.
 ///
 /// Captured before `tokio::spawn` for WebSocket relays so sessions activate the `ws`
-/// gauge only after `on_upgrade` succeeds without retaining `Arc<AppState>`.
+/// gauge only after `on_upgrade` succeeds without retaining `Arc<ProxyState>`.
 #[must_use]
 pub(crate) struct ActiveGauge {
     metrics: Arc<ServerMetrics>,

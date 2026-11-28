@@ -543,3 +543,65 @@ async fn traceparent_survives_connection_nomination_and_propagates_to_websocket(
 
     ws_server.await.unwrap();
 }
+
+#[tokio::test]
+async fn probe_only_otel_exports_health_metrics_without_starting_tracer() {
+    let collector = MockServer::start(ok_handler()).await;
+    let el = MockServer::start(jsonrpc_mock(|method| {
+        RpcMockReply::Result(match method {
+            "eth_syncing" => json!(false),
+            "net_peerCount" => json!("0x7"),
+            "eth_getBlockByNumber" => json!({"number": "0x64", "timestamp": "0x65000000"}),
+            _ => Value::Null,
+        })
+    }))
+    .await;
+
+    let cfg = Config::parse_from([
+        "ethonyx",
+        "--admin-listen",
+        "127.0.0.1:0",
+        "--el-http-url",
+        &el.url,
+        "--otel-endpoint",
+        &collector.url,
+        "--shutdown-grace",
+        "0",
+    ]);
+    let prepared = Prepared::new(cfg).await.unwrap();
+    assert!(
+        prepared.tracer().is_none(),
+        "probe-only mode must not start an OTLP trace provider"
+    );
+    let bound = prepared.bind().await.unwrap();
+    assert!(bound.local_addrs().is_empty());
+    let admin_addr = bound.admin_addr().expect("admin_addr must be bound");
+
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let serve = tokio::spawn(bound.serve(async move {
+        let _ = stop_rx.await;
+    }));
+
+    let c = client();
+    let (status, _) = get(&c, &format!("http://{admin_addr}/readyz")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let _ = stop_tx.send(());
+    serve.await.unwrap().unwrap();
+
+    let paths: Vec<String> = collector
+        .recorded
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.path.clone())
+        .collect();
+    assert!(
+        paths.iter().any(|p| p == "/v1/metrics"),
+        "expected OTLP /v1/metrics export in probe-only mode, got: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p == "/v1/traces"),
+        "probe-only mode must never export to /v1/traces, got: {paths:?}"
+    );
+}

@@ -52,7 +52,7 @@ async fn ws_upstream_that_never_answers_is_a_502_after_proxy_timeout() {
     let silent = StubPort::silent().await;
     let ws_url = silent.ws_url();
     let proxy = EthonyxHandle::start_trusted_tuned(&["--el-ws-url", &ws_url], |cfg| {
-        cfg.proxy_timeout = Duration::from_millis(200);
+        cfg.proxy_timeout = Some(Duration::from_millis(200));
     })
     .await;
     let started = tokio::time::Instant::now();
@@ -1235,7 +1235,7 @@ async fn http2_extended_connect_large_frame_slow_reader_completes_past_proxy_tim
     });
 
     let proxy = EthonyxHandle::start_trusted_tuned(&["--el-ws-url", &ws_url], |cfg| {
-        cfg.proxy_timeout = Duration::from_secs(1);
+        cfg.proxy_timeout = Some(Duration::from_secs(1));
     })
     .await;
 

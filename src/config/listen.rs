@@ -58,18 +58,20 @@ impl fmt::Display for ListenAddr {
     }
 }
 
-/// Validated data-plane and optional admin-plane listen addresses.
+/// Validated data-plane and/or admin-plane listen addresses.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ListenPlan {
-    data: Vec<ListenAddr>,
-    admin: Option<ListenAddr>,
+pub(crate) enum ListenPlan {
+    /// Data-plane listeners (`--listen`), optionally paired with an isolated `--admin-listen`.
+    Proxy {
+        listeners: Vec<ListenAddr>,
+        admin: Option<ListenAddr>,
+    },
+    /// Control/probe plane only (`--admin-listen` without `--listen`); no data-plane sockets.
+    ProbeOnly { admin: ListenAddr },
 }
 
 impl ListenPlan {
     pub(crate) fn parse(listen: &[String], admin_listen: Option<&str>) -> Result<Self, BoxError> {
-        if listen.is_empty() {
-            return Err("no listen addresses configured".into());
-        }
         let mut parsed = Vec::with_capacity(listen.len());
         for raw in listen {
             parsed.push(ParsedListen::parse("--listen", raw)?);
@@ -80,27 +82,19 @@ impl ListenPlan {
         check_conflicts(&parsed, admin.as_ref(), |a, b, scope| {
             a.conflict_with(*b, scope)
         })?;
-        Ok(Self {
-            data: parsed
-                .into_iter()
-                .map(ParsedListen::into_listen_addr)
-                .collect(),
-            admin: admin.map(ParsedListen::into_listen_addr),
-        })
-    }
-
-    pub(crate) fn into_parts(self) -> (Vec<ListenAddr>, Option<ListenAddr>) {
-        (self.data, self.admin)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn data(&self) -> &[ListenAddr] {
-        &self.data
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn admin(&self) -> Option<&ListenAddr> {
-        self.admin.as_ref()
+        let data: Vec<_> = parsed
+            .into_iter()
+            .map(ParsedListen::into_listen_addr)
+            .collect();
+        let admin = admin.map(ParsedListen::into_listen_addr);
+        match (data.is_empty(), admin) {
+            (true, None) => Err("at least one of --listen or --admin-listen is required".into()),
+            (true, Some(admin)) => Ok(Self::ProbeOnly { admin }),
+            (false, admin) => Ok(Self::Proxy {
+                listeners: data,
+                admin,
+            }),
+        }
     }
 }
 
@@ -746,5 +740,35 @@ mod tests {
                 assert!(matches!(local, SocketAddr::V6(v6) if v6.scope_id() != 0));
             }
         }
+    }
+
+    #[test]
+    fn listen_plan_parse_covers_all_listener_combinations() {
+        let err = ListenPlan::parse(&[], None).unwrap_err().to_string();
+        assert!(
+            err.contains("at least one of --listen or --admin-listen is required"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(
+            ListenPlan::parse(&[], Some("127.0.0.1:9099")).unwrap(),
+            ListenPlan::ProbeOnly {
+                admin: parsed_addr("127.0.0.1:9099"),
+            }
+        );
+        assert_eq!(
+            ListenPlan::parse(&["0.0.0.0:8545".to_owned()], None).unwrap(),
+            ListenPlan::Proxy {
+                listeners: vec![parsed_addr("0.0.0.0:8545")],
+                admin: None,
+            }
+        );
+        assert_eq!(
+            ListenPlan::parse(&["0.0.0.0:8545".to_owned()], Some("0.0.0.0:9099")).unwrap(),
+            ListenPlan::Proxy {
+                listeners: vec![parsed_addr("0.0.0.0:8545")],
+                admin: Some(parsed_addr("0.0.0.0:9099")),
+            }
+        );
     }
 }

@@ -20,7 +20,7 @@ use crate::response::{
     full_body, prometheus_response, raw_json_response, status_response, text_response,
     uri_too_long_response,
 };
-use crate::state::{AppState, ClState, ConnPermitGuard};
+use crate::state::{ClProxyOpts, ConnPermitGuard, CoreState, ProxyState};
 use crate::transport::{HttpTarget, WsTarget};
 use crate::websocket::{WsConn, WsMode};
 
@@ -45,9 +45,9 @@ pub(crate) enum ListenProbes {
 }
 
 /// Connection-owned state. Requests clone one Arc; detached WebSocket relays
-/// retain only the shared lifecycle token and permit (never `Arc<AppState>`).
+/// retain only the shared lifecycle token and permit (never `Arc<ProxyState>`).
 pub(crate) struct Connection {
-    state: Arc<AppState>,
+    state: Arc<ProxyState>,
     peer: SocketAddr,
     permit: ConnPermit,
     probes: ListenProbes,
@@ -55,7 +55,7 @@ pub(crate) struct Connection {
 
 impl Connection {
     pub(crate) fn new(
-        state: Arc<AppState>,
+        state: Arc<ProxyState>,
         lifecycle: &crate::lifecycle::Lifecycle,
         peer: SocketAddr,
         permit: ConnPermitGuard,
@@ -89,7 +89,7 @@ impl Connection {
         // is set), unconfigured CL/WS routes, and invalid targets return locally
         // without upstream metrics/spans.
         let forward = match classify_request(&req, self.probes) {
-            Route::Probe(probe) => return Ok(probe.response(is_head, &self.state)),
+            Route::Probe(probe) => return Ok(probe.response(is_head, &self.state.core)),
             Route::NotFound => return finish(text_response(StatusCode::NOT_FOUND, "not found")),
             Route::Reject => {
                 return finish(text_response(
@@ -163,6 +163,7 @@ impl Connection {
             );
         }
         self.state
+            .core
             .metrics
             .record_request(layer, method_bucket, status, elapsed);
         finish(response)
@@ -182,7 +183,7 @@ fn strip_h2_head_body(is_head: bool, version: Version, resp: &mut Response<ResBo
 /// Synchronous dispatcher for the optional dedicated `--admin-listen` listener,
 /// serving only `/livez`, `/readyz`, `/healthz`, and `/metrics` without proxy
 /// metrics, OTel spans, or access logs.
-pub(crate) fn dispatch_admin<B>(state: &AppState, req: &Request<B>) -> Response<ResBody> {
+pub(crate) fn dispatch_admin<B>(state: &CoreState, req: &Request<B>) -> Response<ResBody> {
     let is_head = req.method() == Method::HEAD;
     let path = req.uri().path();
     let mut resp = if !path.starts_with('/') || req.method() == Method::CONNECT {
@@ -236,7 +237,7 @@ impl Probe {
         }
     }
 
-    fn response(self, head: bool, state: &AppState) -> Response<ResBody> {
+    fn response(self, head: bool, state: &CoreState) -> Response<ResBody> {
         match self {
             Self::Health => health::report(state, head),
             Self::Ready => health::ready(state, head),
@@ -309,7 +310,7 @@ impl UpstreamProto {
 /// A [`Target`] bound to the configured upstream and connection resources it requires.
 #[derive(Clone, Copy)]
 enum Forward<'a> {
-    Cl(&'a ClState),
+    Cl(&'a HttpTarget),
     El,
     WebSocket(WsMode, &'a WsTarget, &'a WsConn),
 }
@@ -317,7 +318,7 @@ enum Forward<'a> {
 impl<'a> Forward<'a> {
     fn resolve(target: Target, conn: &'a Connection) -> Option<Self> {
         Some(match target {
-            Target::Cl => Self::Cl(conn.state.cl.as_ref()?),
+            Target::Cl => Self::Cl(&conn.state.core.cl.as_ref()?.beacon),
             Target::El => Self::El,
             Target::WebSocket(mode) => match (&conn.state.el_ws, &conn.permit) {
                 (Some(ws), ConnPermit::Shared(ws_conn)) => Self::WebSocket(mode, ws, ws_conn),
@@ -337,12 +338,12 @@ impl<'a> Forward<'a> {
 
 async fn route(
     req: Request<Incoming>,
-    state: &AppState,
+    state: &ProxyState,
     forward: Forward<'_>,
 ) -> Response<ResBody> {
     trace!(method = %req.method(), path = req.uri().path(), "routing request");
     match forward {
-        Forward::Cl(cl) => proxy_http(req, state, Some(cl)).await,
+        Forward::Cl(beacon) => proxy_http(req, state, Some(beacon)).await,
         Forward::El => proxy_http(req, state, None).await,
         Forward::WebSocket(mode, ws, ws_conn) => {
             Box::pin(crate::websocket::upgrade(req, mode, ws, state, ws_conn)).await
@@ -365,7 +366,7 @@ fn classify_local_mock(
     path: &str,
     headers: &HeaderMap,
     mock_eth_syncing: bool,
-    cl: Option<&ClState>,
+    cl: Option<&ClProxyOpts>,
 ) -> Option<LocalMock> {
     let mock = match cl {
         Some(cl)
@@ -396,43 +397,44 @@ fn classify_local_mock(
 fn resolve_http_target<'a>(
     method: &Method,
     path: &str,
-    state: &'a AppState,
-    cl: Option<&'a ClState>,
+    state: &'a ProxyState,
+    cl_beacon: Option<&'a HttpTarget>,
 ) -> (&'a HttpTarget, UpstreamLayer, Option<&'static str>) {
-    match cl {
-        Some(cl) => {
-            let (target, path_override) = if let Some(mev) = &cl.mev_relay
+    match cl_beacon {
+        Some(beacon) => {
+            let (target, path_override) = if let Some(mev) = &state.cl_proxy.mev_relay
                 && *method == Method::POST
                 && path == "/eth/v1/validator/register_validator"
             {
                 (mev, Some("/eth/v1/builder/validators"))
             } else {
-                (&cl.beacon, None)
+                (beacon, None)
             };
             (target, UpstreamLayer::Cl, path_override)
         }
-        None => (&state.el, UpstreamLayer::El, None),
+        None => (&state.core.el, UpstreamLayer::El, None),
     }
 }
 
 async fn proxy_http(
     req: Request<Incoming>,
-    state: &AppState,
-    cl: Option<&ClState>,
+    state: &ProxyState,
+    cl_beacon: Option<&HttpTarget>,
 ) -> Response<ResBody> {
     let (parts, body) = req.into_parts();
     if has_unsupported_transfer_encoding(&parts.headers) {
         return text_response(StatusCode::NOT_IMPLEMENTED, "unsupported transfer encoding");
     }
 
+    let cl_proxy = cl_beacon.map(|_| &state.cl_proxy);
     let (body, deadline) = match classify_local_mock(
         &parts.method,
         parts.uri.path(),
         &parts.headers,
         state.opts.mock_eth_syncing,
-        cl,
+        cl_proxy,
     ) {
-        Some(LocalMock::NodeHealth) => return health::node_health(state, parts.uri.query()),
+        Some(LocalMock::NodeHealth) => return health::node_health(&state.core, parts.uri.query()),
         Some(LocalMock::ClSubscription) => {
             drop(parts);
             let deadline = tokio::time::Instant::now() + state.opts.proxy_timeout;
@@ -463,7 +465,7 @@ async fn proxy_http(
     };
 
     let (target, layer, path_override) =
-        resolve_http_target(&parts.method, parts.uri.path(), state, cl);
+        resolve_http_target(&parts.method, parts.uri.path(), state, cl_beacon);
     // Select EL transport at dispatch, after any mock body inspection: local replies need
     // no transport lookup, and forwarded requests follow the latest verdict.
     execute_upstream(parts, body, state, target, layer, path_override, deadline).await
@@ -526,7 +528,7 @@ impl RespFraming {
 async fn execute_upstream(
     mut parts: http::request::Parts,
     body: ResBody,
-    state: &AppState,
+    state: &ProxyState,
     target: &HttpTarget,
     layer: UpstreamLayer,
     path_override: Option<&'static str>,
@@ -566,7 +568,7 @@ async fn execute_upstream(
         deadline.unwrap_or_else(|| tokio::time::Instant::now() + state.opts.proxy_timeout);
     let resp = match tokio::time::timeout_at(
         deadline,
-        target.transport.request(&state.client, upstream_req),
+        target.transport.request(&state.core.client, upstream_req),
     )
     .await
     {
@@ -637,7 +639,7 @@ async fn execute_upstream(
                 state.opts.proxy_timeout,
                 state.opts.sse_idle_timeout,
             ),
-            &state.metrics,
+            &state.core.metrics,
             layer,
         ),
     };
@@ -979,6 +981,8 @@ mod tests {
         // cloning `Lifecycle` per connection.
         let http_only = crate::Config::parse_from([
             "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
             "--el-http-url",
             "http://127.0.0.1:8545",
             "--trust-upstream",
@@ -987,11 +991,9 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        let (http_state, _) = AppState::start(
-            http_only.opts,
-            http_only.max_connections,
-            http_only.upstreams,
-            http_only.health,
+        let (http_state, _) = ProxyState::start(
+            http_only.core,
+            http_only.mode.into_proxy().unwrap(),
             crate::metrics::ServerMetrics::disabled(),
         )
         .await;
@@ -1013,6 +1015,8 @@ mod tests {
         // Unlimited `--max-connections 0` bypasses the semaphore completely.
         let unlimited = crate::Config::parse_from([
             "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
             "--el-http-url",
             "http://127.0.0.1:8545",
             "--trust-upstream",
@@ -1021,11 +1025,9 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        let (unlimited_state, _) = AppState::start(
-            unlimited.opts,
-            unlimited.max_connections,
-            unlimited.upstreams,
-            unlimited.health,
+        let (unlimited_state, _) = ProxyState::start(
+            unlimited.core,
+            unlimited.mode.into_proxy().unwrap(),
             crate::metrics::ServerMetrics::disabled(),
         )
         .await;
@@ -1041,19 +1043,15 @@ mod tests {
 
         let cfg = crate::Config::parse_from([
             "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
             "--el-http-url",
             "http://127.0.0.1:8545",
             "--trust-upstream",
         ]);
         let parsed = cfg.parse_validated().unwrap();
-        let (state, _) = AppState::start(
-            parsed.opts,
-            parsed.max_connections,
-            parsed.upstreams,
-            parsed.health,
-            crate::metrics::ServerMetrics::disabled(),
-        )
-        .await;
+        let (state, _) =
+            CoreState::start(parsed.core, crate::metrics::ServerMetrics::disabled()).await;
         state.metrics.inc_saturated();
 
         for (head, has_body) in [(false, true), (true, false)] {
@@ -1083,20 +1081,16 @@ mod tests {
 
         let parsed = crate::Config::parse_from([
             "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
             "--el-http-url",
             "http://127.0.0.1:8545",
             "--trust-upstream",
         ])
         .parse_validated()
         .unwrap();
-        let (state, _) = AppState::start(
-            parsed.opts,
-            parsed.max_connections,
-            parsed.upstreams,
-            parsed.health,
-            crate::metrics::ServerMetrics::disabled(),
-        )
-        .await;
+        let (state, _) =
+            CoreState::start(parsed.core, crate::metrics::ServerMetrics::disabled()).await;
         state.metrics.inc_saturated();
 
         // GET/HEAD probes (including query strings) succeed on H1 and H2.
@@ -1184,6 +1178,8 @@ mod tests {
 
         let parsed = crate::Config::parse_from([
             "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
             "--el-http-url",
             "http://127.0.0.1:8545",
             "--cl-beacon-url",
@@ -1197,15 +1193,19 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        let (state, _) = AppState::start(
-            parsed.opts,
-            parsed.max_connections,
-            parsed.upstreams,
-            parsed.health,
+        let (state, _) = ProxyState::start(
+            parsed.core,
+            parsed.mode.into_proxy().unwrap(),
             crate::metrics::ServerMetrics::disabled(),
         )
         .await;
-        let cl = state.cl.as_ref().expect("CL must be configured");
+        let cl_beacon = &state
+            .core
+            .cl
+            .as_ref()
+            .expect("CL must be configured")
+            .beacon;
+        let cl_proxy = &state.cl_proxy;
         let empty = HeaderMap::new();
         let mut expect_100 = HeaderMap::new();
         expect_100.insert(http::header::EXPECT, "100-continue".parse().unwrap());
@@ -1215,11 +1215,17 @@ mod tests {
         // Local mock classification across CL node health, CL subscriptions, and EL syncing.
         for method in [Method::GET, Method::HEAD] {
             assert_eq!(
-                classify_local_mock(&method, "/eth/v1/node/health", &empty, true, Some(cl)),
+                classify_local_mock(&method, "/eth/v1/node/health", &empty, true, Some(cl_proxy)),
                 Some(LocalMock::NodeHealth)
             );
             assert_eq!(
-                classify_local_mock(&method, "/eth/v1/node/health", &expect_100, true, Some(cl)),
+                classify_local_mock(
+                    &method,
+                    "/eth/v1/node/health",
+                    &expect_100,
+                    true,
+                    Some(cl_proxy)
+                ),
                 Some(LocalMock::NodeHealth)
             );
             assert_eq!(
@@ -1228,13 +1234,19 @@ mod tests {
                     "/eth/v1/node/health",
                     &expect_other,
                     true,
-                    Some(cl)
+                    Some(cl_proxy)
                 ),
                 None
             );
         }
         assert_eq!(
-            classify_local_mock(&Method::POST, "/eth/v1/node/health", &empty, true, Some(cl)),
+            classify_local_mock(
+                &Method::POST,
+                "/eth/v1/node/health",
+                &empty,
+                true,
+                Some(cl_proxy)
+            ),
             None
         );
         for path in [
@@ -1243,15 +1255,15 @@ mod tests {
             "/eth/v1/validator/sync_committee_subscriptions",
         ] {
             assert_eq!(
-                classify_local_mock(&Method::POST, path, &empty, true, Some(cl)),
+                classify_local_mock(&Method::POST, path, &empty, true, Some(cl_proxy)),
                 Some(LocalMock::ClSubscription)
             );
             assert_eq!(
-                classify_local_mock(&Method::POST, path, &expect_other, true, Some(cl)),
+                classify_local_mock(&Method::POST, path, &expect_other, true, Some(cl_proxy)),
                 None
             );
             assert_eq!(
-                classify_local_mock(&Method::GET, path, &empty, true, Some(cl)),
+                classify_local_mock(&Method::GET, path, &empty, true, Some(cl_proxy)),
                 None
             );
         }
@@ -1282,9 +1294,9 @@ mod tests {
             &Method::POST,
             "/eth/v1/validator/register_validator",
             &state,
-            Some(cl),
+            Some(cl_beacon),
         );
-        assert!(std::ptr::eq(target, cl.mev_relay.as_ref().unwrap()));
+        assert!(std::ptr::eq(target, cl_proxy.mev_relay.as_ref().unwrap()));
         assert_eq!(layer, UpstreamLayer::Cl);
         assert_eq!(override_path, Some("/eth/v1/builder/validators"));
 
@@ -1292,26 +1304,32 @@ mod tests {
             &Method::GET,
             "/eth/v1/validator/register_validator",
             &state,
-            Some(cl),
+            Some(cl_beacon),
         );
-        assert!(std::ptr::eq(target, &cl.beacon));
+        assert!(std::ptr::eq(target, cl_beacon));
         assert_eq!(layer, UpstreamLayer::Cl);
         assert_eq!(override_path, None);
 
-        let (target, layer, override_path) =
-            resolve_http_target(&Method::POST, "/eth/v1/beacon/blocks", &state, Some(cl));
-        assert!(std::ptr::eq(target, &cl.beacon));
+        let (target, layer, override_path) = resolve_http_target(
+            &Method::POST,
+            "/eth/v1/beacon/blocks",
+            &state,
+            Some(cl_beacon),
+        );
+        assert!(std::ptr::eq(target, cl_beacon));
         assert_eq!(layer, UpstreamLayer::Cl);
         assert_eq!(override_path, None);
 
         let (target, layer, override_path) = resolve_http_target(&Method::POST, "/", &state, None);
-        assert!(std::ptr::eq(target, &state.el));
+        assert!(std::ptr::eq(target, &state.core.el));
         assert_eq!(layer, UpstreamLayer::El);
         assert_eq!(override_path, None);
 
         // Disabled CL mocks and absent MEV relay fall through to Beacon without mocking.
         let default_cl = crate::Config::parse_from([
             "ethonyx",
+            "--listen",
+            "127.0.0.1:0",
             "--el-http-url",
             "http://127.0.0.1:8545",
             "--cl-beacon-url",
@@ -1320,22 +1338,26 @@ mod tests {
         ])
         .parse_validated()
         .unwrap();
-        let (default_state, _) = AppState::start(
-            default_cl.opts,
-            default_cl.max_connections,
-            default_cl.upstreams,
-            default_cl.health,
+        let (default_state, _) = ProxyState::start(
+            default_cl.core,
+            default_cl.mode.into_proxy().unwrap(),
             crate::metrics::ServerMetrics::disabled(),
         )
         .await;
-        let plain_cl = default_state.cl.as_ref().expect("CL must be configured");
+        let plain_beacon = &default_state
+            .core
+            .cl
+            .as_ref()
+            .expect("CL must be configured")
+            .beacon;
+        let plain_proxy = &default_state.cl_proxy;
         assert_eq!(
             classify_local_mock(
                 &Method::GET,
                 "/eth/v1/node/health",
                 &empty,
                 false,
-                Some(plain_cl),
+                Some(plain_proxy),
             ),
             None
         );
@@ -1345,7 +1367,7 @@ mod tests {
                 "/eth/v1/validator/prepare_beacon_proposer",
                 &empty,
                 false,
-                Some(plain_cl),
+                Some(plain_proxy),
             ),
             None
         );
@@ -1353,9 +1375,9 @@ mod tests {
             &Method::POST,
             "/eth/v1/validator/register_validator",
             &default_state,
-            Some(plain_cl),
+            Some(plain_beacon),
         );
-        assert!(std::ptr::eq(target, &plain_cl.beacon));
+        assert!(std::ptr::eq(target, plain_beacon));
         assert_eq!(layer, UpstreamLayer::Cl);
         assert_eq!(override_path, None);
     }

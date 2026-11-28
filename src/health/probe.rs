@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{HealthMode, HealthPolicy, PolledHealth};
 use crate::metrics::{HealthGauge, ServerMetrics};
-use crate::state::{AppState, ClState};
+use crate::state::{ClProbeTarget, CoreState};
 use crate::transport::{HttpTarget, ProxyClient};
 
 use super::cl::{cl_peer_count, cl_syncing_status};
@@ -168,7 +168,7 @@ impl Publisher {
         now: impl FnOnce() -> Option<u64>,
     ) {
         self.observer.observe(metrics, &probe, now);
-        // `AppState` holds a receiver and the poller task holds `Arc<AppState>`.
+        // `CoreState` holds a receiver and the poller task holds `Arc<CoreState>`.
         self.tx.send_replace(probe);
     }
 }
@@ -186,7 +186,7 @@ pub(crate) async fn warm(
     mode: HealthMode,
     client: &ProxyClient,
     el: &HttpTarget,
-    cl: Option<&ClState>,
+    cl: Option<&ClProbeTarget>,
     metrics: &ServerMetrics,
 ) -> (HealthSource, Option<HealthPoller>) {
     let HealthMode::Polled(polled) = mode else {
@@ -224,7 +224,7 @@ pub(crate) async fn warm(
 impl HealthPoller {
     pub(crate) fn spawn(
         self,
-        state: Arc<AppState>,
+        state: Arc<CoreState>,
         shutdown: crate::lifecycle::Shutdown,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -240,7 +240,7 @@ impl HealthPoller {
     /// interval after a completed poll, so a slow upstream gets a full breather and a
     /// shorter reference interval never delays local polling. Both cadences run
     /// concurrently as streams and publish through `&mut Publisher` one at a time.
-    async fn run(self, state: Arc<AppState>) {
+    async fn run(self, state: Arc<CoreState>) {
         let Self {
             mut publisher,
             interval,
@@ -285,7 +285,7 @@ impl HealthPoller {
 async fn probe_local(
     client: &ProxyClient,
     el: &HttpTarget,
-    cl: Option<&ClState>,
+    cl: Option<&ClProbeTarget>,
     timeout: Duration,
 ) -> Arc<LocalProbe> {
     let el_target = ProbeTarget::from_target(client, el, timeout);
