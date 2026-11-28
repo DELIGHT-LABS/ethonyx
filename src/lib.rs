@@ -107,7 +107,7 @@ impl Prepared {
 
         // `Prepared::run` cancels this warm-up poll by dropping the `bind` future
         // when shutdown arrives before listeners are bound.
-        let metrics = metrics::ServerMetrics::new(telemetry.metrics());
+        let metrics = metrics::ServerMetrics::new(telemetry.metrics(!mode.is_probe_only()));
         let (bound_mode, poller) = match mode {
             config::RuntimePlan::ProbeOnly { admin } => {
                 let (state, poller) = CoreState::start(core, metrics).await;
@@ -126,19 +126,7 @@ impl Prepared {
                     poller,
                 )
             }
-            config::RuntimePlan::Proxy { listeners, proxy } => {
-                let (state, poller) = ProxyState::start(core, *proxy, metrics).await;
-                log_startup(
-                    mode_label,
-                    &state.core,
-                    state.el_ws.as_ref(),
-                    state.cl_proxy.mev_relay.as_ref(),
-                    el_references,
-                );
-                let bound = bind_proxy_listeners(listeners, None, state).await?;
-                (bound, poller)
-            }
-            config::RuntimePlan::ProxyWithAdmin {
+            config::RuntimePlan::Proxy {
                 listeners,
                 admin,
                 proxy,
@@ -151,7 +139,7 @@ impl Prepared {
                     state.cl_proxy.mev_relay.as_ref(),
                     el_references,
                 );
-                let bound = bind_proxy_listeners(listeners, Some(admin), state).await?;
+                let bound = bind_proxy_listeners(listeners, admin, state).await?;
                 (bound, poller)
             }
         };
@@ -166,7 +154,7 @@ impl Prepared {
 
     /// Bind every configured `cfg.listen` and/or `cfg.admin_listen` address, serve all
     /// enabled routes, and wait for `shutdown` before draining for `cfg.shutdown_grace`
-    /// seconds and flushing telemetry.
+    /// seconds (capped at 1s in probe-only mode) and flushing telemetry.
     ///
     /// If `shutdown` resolves before [`Prepared::bind`] completes, returns `Ok(())`
     /// immediately without binding any listener or awaiting telemetry flush (any
@@ -195,12 +183,7 @@ enum BoundMode {
     Proxy {
         listeners: Vec<TcpListener>,
         local_addrs: Vec<std::net::SocketAddr>,
-        state: Arc<ProxyState>,
-    },
-    ProxyWithAdmin {
-        listeners: Vec<TcpListener>,
-        local_addrs: Vec<std::net::SocketAddr>,
-        admin: (TcpListener, std::net::SocketAddr),
+        admin: Option<(TcpListener, std::net::SocketAddr)>,
         state: Arc<ProxyState>,
     },
     ProbeOnly {
@@ -224,8 +207,7 @@ impl Bound {
     /// (empty in probe-only mode when `--listen` is omitted).
     pub fn local_addrs(&self) -> &[std::net::SocketAddr] {
         match &self.mode {
-            BoundMode::Proxy { local_addrs, .. }
-            | BoundMode::ProxyWithAdmin { local_addrs, .. } => local_addrs,
+            BoundMode::Proxy { local_addrs, .. } => local_addrs,
             BoundMode::ProbeOnly { .. } => &[],
         }
     }
@@ -233,18 +215,20 @@ impl Bound {
     /// Actual bound socket address for [`Config::admin_listen`], if configured.
     pub const fn admin_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.mode {
-            BoundMode::Proxy { .. } => None,
-            BoundMode::ProxyWithAdmin {
-                admin: (_, addr), ..
+            BoundMode::Proxy {
+                admin: Some((_, addr)),
+                ..
             }
             | BoundMode::ProbeOnly {
                 admin: (_, addr), ..
             } => Some(*addr),
+            BoundMode::Proxy { admin: None, .. } => None,
         }
     }
 
     /// Serve all bound listeners until `shutdown` resolves, then drain active
-    /// connections for `cfg.shutdown_grace` seconds and shut down telemetry.
+    /// connections for `cfg.shutdown_grace` seconds (capped at 1s in probe-only mode)
+    /// and shut down telemetry.
     pub async fn serve<F>(self, shutdown: F) -> Result<(), BoxError>
     where
         F: Future<Output = ()> + Send,
@@ -256,41 +240,32 @@ impl Bound {
             telemetry,
         } = self;
 
+        let effective_grace = match &mode {
+            BoundMode::Proxy { .. } => shutdown_grace,
+            BoundMode::ProbeOnly { .. } => shutdown_grace.min(server::ADMIN_CLOSE_GRACE),
+        };
         let (shutdown_tx, lifecycle, drain) = lifecycle::channel();
         let (mut poller, mut accept_handle, mut admin_handle) = match mode {
             BoundMode::Proxy {
                 listeners,
                 local_addrs: _,
+                admin,
                 state,
             } => {
                 let poller = poller.map(|p| p.spawn(Arc::clone(&state.core), lifecycle.shutdown()));
-                let accept = tokio::spawn(server::accept_loop(
-                    listeners,
-                    state,
-                    lifecycle,
-                    proxy::ListenProbes::Serve,
-                ));
-                (poller, Some(accept), None)
-            }
-            BoundMode::ProxyWithAdmin {
-                listeners,
-                local_addrs: _,
-                admin: (admin_listener, _),
-                state,
-            } => {
-                let poller = poller.map(|p| p.spawn(Arc::clone(&state.core), lifecycle.shutdown()));
-                let admin = tokio::spawn(server::accept_admin_loop(
-                    admin_listener,
-                    Arc::clone(&state.core),
-                    lifecycle.clone(),
-                ));
-                let accept = tokio::spawn(server::accept_loop(
-                    listeners,
-                    state,
-                    lifecycle,
-                    proxy::ListenProbes::Hidden,
-                ));
-                (poller, Some(accept), Some(admin))
+                let (probes, admin_handle) = match admin {
+                    Some((admin_listener, _)) => (
+                        proxy::ListenProbes::Hidden,
+                        Some(tokio::spawn(server::accept_admin_loop(
+                            admin_listener,
+                            Arc::clone(&state.core),
+                            lifecycle.clone(),
+                        ))),
+                    ),
+                    None => (proxy::ListenProbes::Serve, None),
+                };
+                let accept = tokio::spawn(server::accept_loop(listeners, state, lifecycle, probes));
+                (poller, Some(accept), admin_handle)
             }
             BoundMode::ProbeOnly {
                 admin: (admin_listener, _),
@@ -327,7 +302,7 @@ impl Bound {
             }
         };
 
-        let deadline = tokio::time::Instant::now() + shutdown_grace;
+        let deadline = tokio::time::Instant::now() + effective_grace;
         shutdown_tx.send(deadline);
 
         let (accept_res, admin_res, poller_res) = tokio::join!(
@@ -345,7 +320,7 @@ impl Bound {
                 None => Ok(()),
             });
 
-        info!(grace = ?shutdown_grace, "draining connections");
+        info!(grace = ?effective_grace, "draining connections");
         // Each connection, HTTP/2 request and relay uses the same deadline. Wait for
         // their futures to be dropped even with zero grace; timing out this barrier
         // would let serve() return before sockets and request tasks are released.
@@ -427,18 +402,11 @@ async fn bind_proxy_listeners(
     if let Some((_, admin_addr)) = &admin {
         info!(admin_listen = %admin_addr, "listening");
     }
-    Ok(match admin {
-        Some(admin) => BoundMode::ProxyWithAdmin {
-            listeners,
-            local_addrs,
-            admin,
-            state,
-        },
-        None => BoundMode::Proxy {
-            listeners,
-            local_addrs,
-            state,
-        },
+    Ok(BoundMode::Proxy {
+        listeners,
+        local_addrs,
+        admin,
+        state,
     })
 }
 
@@ -800,10 +768,12 @@ mod tests {
         let free_addr = free_probe.local_addr().unwrap();
         drop(free_probe);
 
-        let config::ListenPlan::DataOnly(mut parsed) =
-            config::ListenPlan::parse(&["localhost:8547".to_owned()], None).unwrap()
+        let config::ListenPlan::Proxy {
+            listeners: mut parsed,
+            admin: None,
+        } = config::ListenPlan::parse(&["localhost:8547".to_owned()], None).unwrap()
         else {
-            panic!("expected DataOnly plan");
+            panic!("expected Proxy plan");
         };
         let resolved =
             config::ResolvedListen::many(parsed.pop().unwrap(), vec![occupied_addr, free_addr]);
@@ -821,10 +791,12 @@ mod tests {
         // unassignable address (`AddrNotAvailable`) to the subsequent loopback candidate.
         let unroutable: std::net::SocketAddr = "192.0.2.1:0".parse().unwrap();
         if TcpListener::bind(unroutable).await.is_err() {
-            let config::ListenPlan::DataOnly(mut parsed) =
-                config::ListenPlan::parse(&["localhost:0".to_owned()], None).unwrap()
+            let config::ListenPlan::Proxy {
+                listeners: mut parsed,
+                admin: None,
+            } = config::ListenPlan::parse(&["localhost:0".to_owned()], None).unwrap()
             else {
-                panic!("expected DataOnly plan");
+                panic!("expected Proxy plan");
             };
             let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
             let resolved =
@@ -861,10 +833,7 @@ mod tests {
             "--shutdown-grace",
             "0",
         ]);
-        let prepared = Prepared::new(cfg).await.unwrap();
-        #[cfg(feature = "otel")]
-        assert!(prepared.tracer().is_none());
-        let bound = prepared.bind().await.unwrap();
+        let bound = Prepared::new(cfg).await.unwrap().bind().await.unwrap();
         assert!(bound.local_addrs().is_empty());
         let admin_addr = bound.admin_addr().expect("probe-only must bind admin_addr");
         assert_ne!(admin_addr.port(), 0);
@@ -902,5 +871,155 @@ mod tests {
             .expect("probe-only serve must drain cleanly without deadlock")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_bind_logs_probe_only_mode_and_effective_drain_grace() {
+        use clap::Parser;
+        use tracing::instrument::WithSubscriber as _;
+
+        struct Sink(Arc<std::sync::Mutex<String>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(buf));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (el_addr, _el_mock) = test_util::spawn_http_mock(|_req| async {
+            response::raw_json_response(
+                http::StatusCode::OK,
+                bytes::Bytes::from_static(
+                    br#"[{"jsonrpc":"2.0","id":1,"result":false},{"jsonrpc":"2.0","id":2,"result":"0x5"},{"jsonrpc":"2.0","id":3,"result":{"number":"0x64","timestamp":"0x65000000"}}]"#,
+                ),
+            )
+        })
+        .await;
+        // Default `--shutdown-grace` is 10s, which probe-only mode clamps to `ADMIN_CLOSE_GRACE` (1s).
+        let cfg = Config::parse_from([
+            "ethonyx",
+            "--admin-listen",
+            "127.0.0.1:0",
+            "--el-http-url",
+            &format!("http://{el_addr}"),
+        ]);
+
+        let log = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = Arc::clone(&log);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || Sink(Arc::clone(&sink)))
+            .finish();
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            let bound = Prepared::new(cfg).await.unwrap().bind().await.unwrap();
+            bound.serve(async {}).await.unwrap();
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let text = std::mem::take(&mut *log.lock().unwrap());
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let modes: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e["fields"]["mode"].as_str())
+            .collect();
+        assert_eq!(modes, ["probe-only"], "startup log: {text}");
+        let graces: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e["fields"]["grace"].as_str())
+            .collect();
+        assert_eq!(graces, ["1s"], "drain log: {text}");
+    }
+
+    #[tokio::test]
+    async fn probe_only_bind_fails_on_occupied_admin_port_and_cancels_cleanly_on_startup_shutdown()
+    {
+        use clap::Parser;
+
+        let (el_addr, _el_mock) = test_util::spawn_http_mock(|_req| async {
+            response::raw_json_response(
+                http::StatusCode::OK,
+                bytes::Bytes::from_static(
+                    br#"[{"jsonrpc":"2.0","id":1,"result":false},{"jsonrpc":"2.0","id":2,"result":"0x5"},{"jsonrpc":"2.0","id":3,"result":{"number":"0x64","timestamp":"0x65000000"}}]"#,
+                ),
+            )
+        })
+        .await;
+
+        // 1. Occupied `--admin-listen` port fails bind with `--admin-listen` in the error.
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let cfg = Config::parse_from([
+            "ethonyx",
+            "--admin-listen",
+            &occupied_addr.to_string(),
+            "--el-http-url",
+            &format!("http://{el_addr}"),
+        ]);
+        let err = Prepared::new(cfg)
+            .await
+            .unwrap()
+            .bind()
+            .await
+            .err()
+            .expect("occupied admin port must fail probe-only bind")
+            .to_string();
+        assert!(
+            err.contains("failed to bind --admin-listen address"),
+            "unexpected error: {err}"
+        );
+        drop(occupied);
+
+        // 2. Shutdown arriving during a slow initial health probe cancels probe-only startup
+        // cleanly without waiting for `--health-timeout` or binding `--admin-listen`.
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let _silent_task = test_util::AbortOnDrop(tokio::spawn(async move {
+            let mut tx = Some(accepted_tx);
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = silent.accept().await {
+                held.push(stream);
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }));
+        let probe_port = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let free_admin_addr = probe_port.local_addr().unwrap();
+        drop(probe_port);
+
+        let cancel_cfg = Config::parse_from([
+            "ethonyx",
+            "--admin-listen",
+            &free_admin_addr.to_string(),
+            "--el-http-url",
+            &format!("http://{silent_addr}"),
+            "--health-timeout",
+            "30",
+        ]);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            Prepared::new(cancel_cfg).await.unwrap().run(async move {
+                let _ = accepted_rx.await;
+            }),
+        )
+        .await
+        .expect("startup shutdown must cancel slow probe-only warm-up immediately")
+        .unwrap();
+        assert!(
+            TcpListener::bind(free_admin_addr).await.is_ok(),
+            "cancelled probe-only startup must not bind --admin-listen"
+        );
     }
 }

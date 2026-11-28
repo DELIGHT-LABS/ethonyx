@@ -92,10 +92,12 @@ impl Telemetry {
     }
 
     /// Typed OpenTelemetry metric instruments mirroring this server's metrics.
-    pub(crate) fn metrics(&self) -> OtelMetrics {
+    pub(crate) fn metrics(&self, enable_proxy: bool) -> OtelMetrics {
         use opentelemetry::metrics::MeterProvider as _;
         match &self.0 {
-            Some(providers) => OtelMetrics::from_meter(providers.metrics.meter(SERVICE_NAME)),
+            Some(providers) => {
+                OtelMetrics::from_meter(providers.metrics.meter(SERVICE_NAME), enable_proxy)
+            }
             None => OtelMetrics::disabled(),
         }
     }
@@ -386,7 +388,7 @@ mod tests {
             metrics,
             shutdown_tx,
         }));
-        telemetry.metrics().inc_saturated();
+        telemetry.metrics(true).inc_saturated();
         let mut span = telemetry.tracer().unwrap().start("dropped_span");
         span.end();
         drop(telemetry);
@@ -452,7 +454,7 @@ mod tests {
             metrics,
             shutdown_tx,
         }));
-        telemetry.metrics().inc_saturated();
+        telemetry.metrics(true).inc_saturated();
 
         let started = tokio::time::Instant::now();
         telemetry
@@ -487,7 +489,7 @@ mod tests {
             shutdown_tx,
         }));
         assert!(telemetry.tracer().is_none());
-        telemetry.metrics().set_health(
+        telemetry.metrics(false).set_health(
             crate::metrics::HealthInstrument::UpstreamHealth,
             Some(crate::metrics::UpstreamLayer::El),
             1.0,
@@ -499,5 +501,87 @@ mod tests {
         assert!(!metric_exporter.has_metric(crate::metrics::ACTIVE_CONNECTIONS));
         assert!(!metric_exporter.has_metric(crate::metrics::PROXY_REQUEST_DURATION));
         assert!(!metric_exporter.has_metric(crate::metrics::PROXY_REQUESTS_TOTAL));
+    }
+
+    #[tokio::test]
+    async fn metrics_only_telemetry_publishes_shutdown_deadline_before_blocked_export_returns() {
+        use opentelemetry_sdk::metrics::PeriodicReader;
+        use opentelemetry_sdk::metrics::data::ResourceMetrics;
+        use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+        use std::sync::{Arc, Mutex, mpsc};
+
+        #[derive(Clone)]
+        struct GatedMetricExporter {
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<Mutex<mpsc::Receiver<()>>>,
+        }
+
+        impl PushMetricExporter for GatedMetricExporter {
+            async fn export(
+                &self,
+                _metrics: &ResourceMetrics,
+            ) -> opentelemetry_sdk::error::OTelSdkResult {
+                self.started.notify_one();
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30));
+                Ok(())
+            }
+
+            fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+                Ok(())
+            }
+
+            fn shutdown_with_timeout(
+                &self,
+                _timeout: Duration,
+            ) -> opentelemetry_sdk::error::OTelSdkResult {
+                Ok(())
+            }
+
+            fn temporality(&self) -> opentelemetry_sdk::metrics::Temporality {
+                opentelemetry_sdk::metrics::Temporality::Cumulative
+            }
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // Explicit 1-hour interval prevents ambient `OTEL_METRIC_EXPORT_INTERVAL` from
+        // triggering a background export before `shutdown_with_timeout`.
+        let reader = PeriodicReader::builder(GatedMetricExporter {
+            started: Arc::clone(&started),
+            release: Arc::new(Mutex::new(release_rx)),
+        })
+        .with_interval(Duration::from_secs(3600))
+        .build();
+        let metrics = SdkMeterProvider::builder().with_reader(reader).build();
+        let (shutdown_tx, shutdown) = crate::lifecycle::shutdown_channel();
+        let telemetry = Telemetry(Some(TelemetryProviders {
+            traces: None,
+            metrics,
+            shutdown_tx,
+        }));
+        telemetry.metrics(false).set_health(
+            crate::metrics::HealthInstrument::UpstreamHealth,
+            Some(crate::metrics::UpstreamLayer::El),
+            1.0,
+        );
+
+        let before_shutdown = tokio::time::Instant::now();
+        let shutting_down = tokio::spawn(telemetry.shutdown_with_timeout(Duration::from_secs(30)));
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .expect("metrics-only shutdown must export the pending metrics");
+        // The export is still blocked, so `ShutdownTx` has not dropped yet (its drop would set
+        // `Instant::now()`): only a deadline published before the export can be visible here.
+        let deadline = shutdown.current_deadline();
+        let _ = release_tx.send(());
+        shutting_down.await.unwrap();
+        assert!(
+            deadline.is_some_and(|at| at > before_shutdown + Duration::from_secs(10)),
+            "shutdown deadline must be published before the metrics export (got {deadline:?})"
+        );
     }
 }

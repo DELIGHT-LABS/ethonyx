@@ -61,15 +61,13 @@ impl fmt::Display for ListenAddr {
 /// Validated data-plane and/or admin-plane listen addresses.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ListenPlan {
-    /// Data-plane listeners only (`--listen`); probes are served alongside proxy routes.
-    DataOnly(Vec<ListenAddr>),
-    /// Data-plane listeners (`--listen`) paired with an isolated `--admin-listen` listener.
-    DataAndAdmin {
-        data: Vec<ListenAddr>,
-        admin: ListenAddr,
+    /// Data-plane listeners (`--listen`), optionally paired with an isolated `--admin-listen`.
+    Proxy {
+        listeners: Vec<ListenAddr>,
+        admin: Option<ListenAddr>,
     },
     /// Control/probe plane only (`--admin-listen` without `--listen`); no data-plane sockets.
-    ProbeOnly(ListenAddr),
+    ProbeOnly { admin: ListenAddr },
 }
 
 impl ListenPlan {
@@ -91,9 +89,11 @@ impl ListenPlan {
         let admin = admin.map(ParsedListen::into_listen_addr);
         match (data.is_empty(), admin) {
             (true, None) => Err("at least one of --listen or --admin-listen is required".into()),
-            (true, Some(admin)) => Ok(Self::ProbeOnly(admin)),
-            (false, None) => Ok(Self::DataOnly(data)),
-            (false, Some(admin)) => Ok(Self::DataAndAdmin { data, admin }),
+            (true, Some(admin)) => Ok(Self::ProbeOnly { admin }),
+            (false, admin) => Ok(Self::Proxy {
+                listeners: data,
+                admin,
+            }),
         }
     }
 }
@@ -752,17 +752,22 @@ mod tests {
 
         assert_eq!(
             ListenPlan::parse(&[], Some("127.0.0.1:9099")).unwrap(),
-            ListenPlan::ProbeOnly(parsed_addr("127.0.0.1:9099"))
+            ListenPlan::ProbeOnly {
+                admin: parsed_addr("127.0.0.1:9099"),
+            }
         );
         assert_eq!(
             ListenPlan::parse(&["0.0.0.0:8545".to_owned()], None).unwrap(),
-            ListenPlan::DataOnly(vec![parsed_addr("0.0.0.0:8545")])
+            ListenPlan::Proxy {
+                listeners: vec![parsed_addr("0.0.0.0:8545")],
+                admin: None,
+            }
         );
         assert_eq!(
             ListenPlan::parse(&["0.0.0.0:8545".to_owned()], Some("0.0.0.0:9099")).unwrap(),
-            ListenPlan::DataAndAdmin {
-                data: vec![parsed_addr("0.0.0.0:8545")],
-                admin: parsed_addr("0.0.0.0:9099"),
+            ListenPlan::Proxy {
+                listeners: vec![parsed_addr("0.0.0.0:8545")],
+                admin: Some(parsed_addr("0.0.0.0:9099")),
             }
         );
     }

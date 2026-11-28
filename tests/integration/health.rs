@@ -2465,3 +2465,32 @@ async fn probe_only_mode_serves_health_ready_metrics_without_data_plane_or_forwa
     let _ = dtx.send(());
     dead_task.await.unwrap().unwrap();
 }
+
+#[test]
+fn empty_ethonyx_listen_env_var_is_rejected_even_with_admin_listen() {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ethonyx"));
+    // Remove only ethonyx/OTel/log env vars so OS essentials (`SystemRoot`, `PATH`) and
+    // coverage instrumentation (`LLVM_PROFILE_FILE`) stay intact across Linux/macOS/Windows.
+    for (key, _) in std::env::vars_os() {
+        if let Some(name) = key.to_str()
+            && (name.starts_with("ETHONYX_") || name.starts_with("OTEL_") || name == "RUST_LOG")
+        {
+            cmd.env_remove(&key);
+        }
+    }
+    let output = cmd
+        .env("ETHONYX_EL_HTTP_URL", "http://127.0.0.1:8545")
+        .env("ETHONYX_LISTEN", "")
+        .env("ETHONYX_ADMIN_LISTEN", "127.0.0.1:9099")
+        .output()
+        .expect("spawn ethonyx binary");
+    assert!(
+        !output.status.success(),
+        "ETHONYX_LISTEN=\"\" must fail closed instead of silently entering probe-only mode"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid --listen address: entry must not be empty"),
+        "unexpected stderr: {stderr}"
+    );
+}

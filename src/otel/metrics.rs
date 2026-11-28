@@ -11,23 +11,17 @@ use crate::metrics::{
     PROXY_REQUESTS_TOTAL, RESPONSE_BODY_ERRORS_TOTAL, StatusSlot, UpstreamLayer,
 };
 
-struct OtelMetricsInner {
-    meter: opentelemetry::metrics::Meter,
-    // Kept lazy: `opentelemetry_sdk` pre-allocates ~135 KiB per built instrument,
-    // so unused proxy/saturation/body-error/health instruments (e.g. probe-only,
-    // EL-only, or `--trust-upstream`) stay zero-cost.
-    active_connections: OnceLock<opentelemetry::metrics::UpDownCounter<i64>>,
-    saturated: OnceLock<opentelemetry::metrics::Counter<u64>>,
-    body_errors: OnceLock<opentelemetry::metrics::Counter<u64>>,
-    duration: OnceLock<opentelemetry::metrics::Histogram<f64>>,
-    requests: OnceLock<opentelemetry::metrics::Counter<u64>>,
-    health: [OnceLock<opentelemetry::metrics::Gauge<f64>>; HealthInstrument::COUNT],
+struct OtelProxyMetrics {
+    active_connections: opentelemetry::metrics::UpDownCounter<i64>,
+    duration: opentelemetry::metrics::Histogram<f64>,
+    requests: opentelemetry::metrics::Counter<u64>,
 }
 
-impl OtelMetricsInner {
-    fn duration(&self) -> &opentelemetry::metrics::Histogram<f64> {
-        self.duration.get_or_init(|| {
-            self.meter
+impl OtelProxyMetrics {
+    fn new(meter: &opentelemetry::metrics::Meter) -> Self {
+        Self {
+            active_connections: meter.i64_up_down_counter(ACTIVE_CONNECTIONS).build(),
+            duration: meter
                 .f64_histogram(PROXY_REQUEST_DURATION)
                 .with_unit("s")
                 .with_boundaries(
@@ -36,39 +30,55 @@ impl OtelMetricsInner {
                         .map(Duration::as_secs_f64)
                         .collect(),
                 )
-                .build()
-        })
+                .build(),
+            requests: meter.u64_counter(PROXY_REQUESTS_TOTAL).build(),
+        }
     }
+}
+
+struct OtelMetricsInner {
+    meter: opentelemetry::metrics::Meter,
+    /// Built eagerly at startup in proxy mode (avoiding first-request `OnceLock`
+    /// allocation on Tokio workers and preserving startup cumulative timestamps);
+    /// `None` in probe-only mode to skip ~405 KiB of unused SDK instrument state.
+    proxy: Option<OtelProxyMetrics>,
+    // Rare error counters and conditional health gauges stay lazy (~135 KiB each
+    // in `opentelemetry_sdk`), so unused saturation/body-error counters and
+    // disabled-layer health gauges stay zero-cost.
+    saturated: OnceLock<opentelemetry::metrics::Counter<u64>>,
+    body_errors: OnceLock<opentelemetry::metrics::Counter<u64>>,
+    health: [OnceLock<opentelemetry::metrics::Gauge<f64>>; HealthInstrument::COUNT],
 }
 
 /// Typed OpenTelemetry metric fanout owned directly by [`crate::metrics::ServerMetrics`].
 ///
-/// Builds one OTel instrument per metric name lazily on first use (zero per-series
-/// wrapper allocations or `Recorder` virtual dispatch, and zero unused proxy instruments
-/// in probe-only mode).
+/// Eagerly builds hot-path proxy instruments in proxy mode (omitting them in probe-only
+/// mode) while keeping rare error counters and conditional health gauges lazy (zero
+/// per-series wrapper allocations or `Recorder` virtual dispatch).
 pub(crate) struct OtelMetrics(Option<Box<OtelMetricsInner>>);
+
+const _: () = assert!(std::mem::size_of::<OtelMetrics>() == std::mem::size_of::<usize>());
 
 impl OtelMetrics {
     pub(crate) const fn disabled() -> Self {
         Self(None)
     }
 
-    pub(super) fn from_meter(meter: opentelemetry::metrics::Meter) -> Self {
+    pub(super) fn from_meter(meter: opentelemetry::metrics::Meter, enable_proxy: bool) -> Self {
+        let proxy = enable_proxy.then(|| OtelProxyMetrics::new(&meter));
         Self(Some(Box::new(OtelMetricsInner {
             meter,
-            active_connections: OnceLock::new(),
+            proxy,
             saturated: OnceLock::new(),
             body_errors: OnceLock::new(),
-            duration: OnceLock::new(),
-            requests: OnceLock::new(),
             health: [const { OnceLock::new() }; HealthInstrument::COUNT],
         })))
     }
 
     pub(crate) fn add_active(&self, protocol: ConnProtocol, delta: i64) {
-        if let Some(m) = &self.0 {
-            m.active_connections
-                .get_or_init(|| m.meter.i64_up_down_counter(ACTIVE_CONNECTIONS).build())
+        if let Some(proxy) = self.0.as_deref().and_then(|m| m.proxy.as_ref()) {
+            proxy
+                .active_connections
                 .add(delta, &[KeyValue::new("protocol", protocol.as_str())]);
         }
     }
@@ -88,24 +98,22 @@ impl OtelMetrics {
         status: StatusSlot,
         elapsed: Duration,
     ) {
-        if let Some(m) = &self.0 {
+        if let Some(proxy) = self.0.as_deref().and_then(|m| m.proxy.as_ref()) {
             let upstream = layer.as_str();
-            m.duration().record(
+            proxy.duration.record(
                 elapsed.as_secs_f64(),
                 &[KeyValue::new("upstream", upstream)],
             );
             // Keep keys sorted ascending so `opentelemetry_sdk`'s `ValueMap` retains one
             // `Vec<KeyValue>` entry per series instead of both unsorted and sorted copies.
-            m.requests
-                .get_or_init(|| m.meter.u64_counter(PROXY_REQUESTS_TOTAL).build())
-                .add(
-                    1,
-                    &[
-                        KeyValue::new("method", method.as_str()),
-                        KeyValue::new("status", status.as_str()),
-                        KeyValue::new("upstream", upstream),
-                    ],
-                );
+            proxy.requests.add(
+                1,
+                &[
+                    KeyValue::new("method", method.as_str()),
+                    KeyValue::new("status", status.as_str()),
+                    KeyValue::new("upstream", upstream),
+                ],
+            );
         }
     }
 
@@ -269,7 +277,7 @@ mod tests {
         let provider = SdkMeterProvider::builder()
             .with_reader(PeriodicReader::builder(exporter.clone()).build())
             .build();
-        let otel_metrics = OtelMetrics::from_meter(provider.meter(SERVICE_NAME));
+        let otel_metrics = OtelMetrics::from_meter(provider.meter(SERVICE_NAME), true);
         let server_metrics = crate::metrics::ServerMetrics::new(otel_metrics);
 
         let tcp_guard = server_metrics.active_tcp();
@@ -512,5 +520,33 @@ mod tests {
         assert!(prom.contains(
             r#"ethonyx_response_body_errors_total{upstream="CL",reason="upstream_error"} 1"#
         ));
+    }
+
+    #[test]
+    fn probe_only_otel_metrics_omits_proxy_instruments_while_exporting_health_gauges() {
+        let exporter = SnapshotExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        let otel_metrics = OtelMetrics::from_meter(provider.meter(SERVICE_NAME), false);
+        let server_metrics = crate::metrics::ServerMetrics::new(otel_metrics);
+
+        // Even if proxy metric helpers were invoked directly, probe-only `OtelMetrics`
+        // keeps `proxy: None` and never builds or exports proxy instruments.
+        drop(server_metrics.active_tcp());
+        server_metrics.record_request(
+            crate::metrics::UpstreamLayer::El,
+            crate::metrics::MethodBucket::Post,
+            200,
+            Duration::from_millis(5),
+        );
+        server_metrics.set_health(crate::metrics::HealthGauge::ElHealth, 1.0);
+        provider.force_flush().unwrap();
+        provider.shutdown().unwrap();
+
+        assert!(exporter.has_metric("ethonyx_upstream_health_status"));
+        assert!(!exporter.has_metric(crate::metrics::ACTIVE_CONNECTIONS));
+        assert!(!exporter.has_metric(crate::metrics::PROXY_REQUEST_DURATION));
+        assert!(!exporter.has_metric(crate::metrics::PROXY_REQUESTS_TOTAL));
     }
 }

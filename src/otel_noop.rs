@@ -43,7 +43,7 @@ impl OtelMetrics {
 pub(crate) struct Telemetry;
 
 impl Telemetry {
-    pub(crate) const fn metrics(&self) -> OtelMetrics {
+    pub(crate) const fn metrics(&self, _enable_proxy: bool) -> OtelMetrics {
         OtelMetrics::disabled()
     }
 

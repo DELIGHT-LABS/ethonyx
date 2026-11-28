@@ -108,7 +108,7 @@ pub struct Config {
     pub el_http_url: UrlArg,
 
     /// Optional Execution-layer JSON-RPC over WebSocket upstream URL.
-    /// Omit to disable WebSocket forwarding (HTTP-only EL mode).
+    /// Omit to disable WebSocket forwarding (HTTP-only EL mode). Requires `--listen`.
     #[arg(long, env = "ETHONYX_EL_WS_URL")]
     pub el_ws_url: Option<UrlArg>,
 
@@ -119,7 +119,7 @@ pub struct Config {
 
     /// Optional Consensus-layer MEV Relay / MEV-Boost upstream URL (REST, /eth/v1/builder/validators).
     /// When specified, POST /eth/v1/validator/register_validator requests are rewritten to
-    /// /eth/v1/builder/validators and routed to this URL. Requires `--cl-beacon-url`.
+    /// /eth/v1/builder/validators and routed to this URL. Requires `--listen` and `--cl-beacon-url`.
     #[arg(long, env = "ETHONYX_CL_MEV_RELAY_URL")]
     pub cl_mev_relay_url: Option<UrlArg>,
 
@@ -202,6 +202,7 @@ pub struct Config {
     /// Off by default — the main log stays quiet at `info` (lifecycle and state
     /// changes only); health-probe paths are excluded even when this is on.
     /// `RUST_LOG` can target it directly, e.g. `RUST_LOG=access_log=info`.
+    /// Requires `--listen`.
     #[arg(
         long,
         env = "ETHONYX_ACCESS_LOG",
@@ -212,7 +213,8 @@ pub struct Config {
     )]
     pub access_log: bool,
 
-    /// Trust the upstream node: disable background health polling (0 RPC cost for paid endpoints) and always report healthy/ready.
+    /// Trust the upstream node: disable background health polling (0 RPC cost for paid endpoints)
+    /// and always report healthy/ready. Requires `--listen` (probe-only mode always polls upstreams).
     #[arg(
         long,
         env = "ETHONYX_TRUST_UPSTREAM",
@@ -224,6 +226,7 @@ pub struct Config {
     pub trust_upstream: bool,
 
     /// Statically mock eth_syncing JSON-RPC requests (HTTP & WebSocket) locally with result: false.
+    /// Requires `--listen`.
     #[arg(
         long,
         env = "ETHONYX_MOCK_ETH_SYNCING",
@@ -235,6 +238,7 @@ pub struct Config {
     pub mock_eth_syncing: bool,
 
     /// Statically mock CL validator subscription & prepare proposer requests locally with 200 OK.
+    /// Requires `--listen` and `--cl-beacon-url`.
     #[arg(
         long,
         env = "ETHONYX_MOCK_CL_SUBSCRIPTIONS",
@@ -245,7 +249,8 @@ pub struct Config {
     )]
     pub mock_cl_subscriptions: bool,
 
-    /// Serve GET/HEAD /eth/v1/node/health locally from ethonyx health state (200/206/503; 200 under --trust-upstream).
+    /// Serve GET/HEAD /eth/v1/node/health locally from ethonyx health state (200/206/503; 200 under
+    /// --trust-upstream). Requires `--listen` and `--cl-beacon-url`.
     #[arg(
         long,
         env = "ETHONYX_MOCK_CL_NODE_HEALTH",
@@ -273,12 +278,13 @@ pub struct Config {
     #[arg(long, env = "ETHONYX_MAX_CONNECTIONS")]
     pub max_connections: Option<usize>,
 
-    /// Shutdown grace period (seconds) for draining in-flight connections.
+    /// Shutdown grace period (seconds) for draining in-flight connections
+    /// (effective drain cap is 1s in probe-only mode).
     #[arg(long, env = "ETHONYX_SHUTDOWN_GRACE", default_value = "10", value_parser = parse_secs)]
     pub shutdown_grace: Duration,
 
     /// OpenTelemetry collector endpoint (HTTP) for exporting traces/metrics
-    /// (requires building with the `otel` feature).
+    /// (requires building with the `otel` feature; metrics-only when `--listen` is omitted).
     #[arg(long, env = "ETHONYX_OTEL_ENDPOINT")]
     pub otel_endpoint: Option<UrlArg>,
 }
@@ -413,15 +419,11 @@ pub(crate) struct ProxyConfig {
 
 /// Validated server mode selecting which runtime planes and listeners are instantiated.
 pub(crate) enum RuntimePlan {
-    /// Data-plane listeners only (`--listen`); probes are served alongside proxy routes.
+    /// Data-plane listeners (`--listen`), optionally paired with an isolated `--admin-listen`
+    /// listener (probes stay on `--listen` when `admin` is `None`).
     Proxy {
         listeners: Vec<ListenAddr>,
-        proxy: Box<ProxyConfig>,
-    },
-    /// Data-plane listeners (`--listen`) paired with an isolated `--admin-listen` listener.
-    ProxyWithAdmin {
-        listeners: Vec<ListenAddr>,
-        admin: ListenAddr,
+        admin: Option<ListenAddr>,
         proxy: Box<ProxyConfig>,
     },
     /// Control/probe plane only (`--admin-listen` without `--listen`); zero data-plane state.
@@ -435,8 +437,8 @@ impl RuntimePlan {
 
     pub(crate) const fn mode_label(&self) -> &'static str {
         match self {
-            Self::Proxy { .. } => "proxy",
-            Self::ProxyWithAdmin { .. } => "proxy+admin",
+            Self::Proxy { admin: None, .. } => "proxy",
+            Self::Proxy { admin: Some(_), .. } => "proxy+admin",
             Self::ProbeOnly { .. } => "probe-only",
         }
     }
@@ -444,7 +446,7 @@ impl RuntimePlan {
     #[cfg(test)]
     pub(crate) fn listeners(&self) -> &[ListenAddr] {
         match self {
-            Self::Proxy { listeners, .. } | Self::ProxyWithAdmin { listeners, .. } => listeners,
+            Self::Proxy { listeners, .. } => listeners,
             Self::ProbeOnly { .. } => &[],
         }
     }
@@ -452,7 +454,7 @@ impl RuntimePlan {
     #[cfg(test)]
     pub(crate) fn proxy(&self) -> Option<&ProxyConfig> {
         match self {
-            Self::Proxy { proxy, .. } | Self::ProxyWithAdmin { proxy, .. } => Some(proxy),
+            Self::Proxy { proxy, .. } => Some(proxy),
             Self::ProbeOnly { .. } => None,
         }
     }
@@ -460,7 +462,7 @@ impl RuntimePlan {
     #[cfg(test)]
     pub(crate) fn into_proxy(self) -> Option<ProxyConfig> {
         match self {
-            Self::Proxy { proxy, .. } | Self::ProxyWithAdmin { proxy, .. } => Some(*proxy),
+            Self::Proxy { proxy, .. } => Some(*proxy),
             Self::ProbeOnly { .. } => None,
         }
     }
@@ -468,8 +470,11 @@ impl RuntimePlan {
     #[cfg(test)]
     pub(crate) const fn admin(&self) -> Option<&ListenAddr> {
         match self {
-            Self::Proxy { .. } => None,
-            Self::ProxyWithAdmin { admin, .. } | Self::ProbeOnly { admin } => Some(admin),
+            Self::Proxy {
+                admin: Some(admin), ..
+            }
+            | Self::ProbeOnly { admin } => Some(admin),
+            Self::Proxy { admin: None, .. } => None,
         }
     }
 }
@@ -565,7 +570,26 @@ impl Config {
         Ok(())
     }
 
-    fn validate_flag_combinations(&self) -> Result<(), BoxError> {
+    fn validate_flag_combinations(&self, is_probe_only: bool) -> Result<(), BoxError> {
+        // Check `--listen` prerequisites first so flags requiring both `--listen` and
+        // `--cl-beacon-url` (e.g. `--cl-mev-relay-url`, `--mock-cl-*`) report `requires --listen`
+        // directly in probe-only mode instead of steering operators into a dead-end `--cl-beacon-url` hint.
+        reject_flags_when(
+            is_probe_only,
+            &[
+                ("--el-ws-url", self.el_ws_url.is_some()),
+                ("--cl-mev-relay-url", self.cl_mev_relay_url.is_some()),
+                ("--mock-eth-syncing", self.mock_eth_syncing),
+                ("--mock-cl-subscriptions", self.mock_cl_subscriptions),
+                ("--mock-cl-node-health", self.mock_cl_node_health),
+                ("--proxy-timeout", self.proxy_timeout.is_some()),
+                ("--sse-idle-timeout", self.sse_idle_timeout.is_some()),
+                ("--max-connections", self.max_connections.is_some()),
+                ("--access-log", self.access_log),
+                ("--trust-upstream", self.trust_upstream),
+            ],
+            "requires --listen",
+        )?;
         reject_flags_when(
             self.cl_beacon_url.is_none(),
             &[
@@ -595,22 +619,6 @@ impl Config {
                 ),
             ],
             "requires --el-reference-url",
-        )?;
-        reject_flags_when(
-            self.listen.is_empty(),
-            &[
-                ("--el-ws-url", self.el_ws_url.is_some()),
-                ("--cl-mev-relay-url", self.cl_mev_relay_url.is_some()),
-                ("--mock-eth-syncing", self.mock_eth_syncing),
-                ("--mock-cl-subscriptions", self.mock_cl_subscriptions),
-                ("--mock-cl-node-health", self.mock_cl_node_health),
-                ("--proxy-timeout", self.proxy_timeout.is_some()),
-                ("--sse-idle-timeout", self.sse_idle_timeout.is_some()),
-                ("--max-connections", self.max_connections.is_some()),
-                ("--access-log", self.access_log),
-                ("--trust-upstream", self.trust_upstream),
-            ],
-            "requires --listen",
         )?;
         reject_flags_when(
             self.trust_upstream,
@@ -739,23 +747,19 @@ impl Config {
     ) -> Result<(ParsedConfig, Option<crate::otel::OtelEndpoints>), BoxError> {
         self.validate_scalars_and_durations()?;
         let listen = ListenPlan::parse(&self.listen, self.admin_listen.as_deref())?;
-        self.validate_flag_combinations()?;
+        self.validate_flag_combinations(matches!(listen, ListenPlan::ProbeOnly { .. }))?;
         let el_http = HttpUpstream::parse("--el-http-url", &self.el_http_url)?;
         let cl = self.parse_cl_probe()?;
         let health = self.parse_health_mode(&el_http, cl.is_some())?;
         let otel_endpoint = crate::otel::parse_config_endpoint(self.otel_endpoint.as_deref())?;
         let otel_enabled = otel_endpoint.is_some();
         let mode = match listen {
-            ListenPlan::DataOnly(listeners) => RuntimePlan::Proxy {
+            ListenPlan::Proxy { listeners, admin } => RuntimePlan::Proxy {
                 listeners,
-                proxy: self.parse_proxy(otel_enabled)?,
-            },
-            ListenPlan::DataAndAdmin { data, admin } => RuntimePlan::ProxyWithAdmin {
-                listeners: data,
                 admin,
                 proxy: self.parse_proxy(otel_enabled)?,
             },
-            ListenPlan::ProbeOnly(admin) => RuntimePlan::ProbeOnly { admin },
+            ListenPlan::ProbeOnly { admin } => RuntimePlan::ProbeOnly { admin },
         };
         Ok((
             ParsedConfig {
@@ -1443,6 +1447,201 @@ mod tests {
     }
 
     #[test]
+    fn every_cli_flag_is_classified_for_probe_only_mode() {
+        use clap::CommandFactory;
+        use std::collections::BTreeSet;
+
+        // Every CLI flag added to `Config` must be classified into one of these three sets so
+        // future data-plane flags cannot silently slip past the `requires --listen` guard.
+        let mode_selectors: BTreeSet<&str> = ["listen", "admin-listen"].into_iter().collect();
+        let requires_listen: &[(&str, &[&str])] = &[
+            ("el-ws-url", &["--el-ws-url", "ws://127.0.0.1:8546"]),
+            (
+                "cl-mev-relay-url",
+                &["--cl-mev-relay-url", "http://127.0.0.1:18550"],
+            ),
+            ("mock-eth-syncing", &["--mock-eth-syncing"]),
+            ("mock-cl-subscriptions", &["--mock-cl-subscriptions"]),
+            ("mock-cl-node-health", &["--mock-cl-node-health"]),
+            ("proxy-timeout", &["--proxy-timeout", "30"]),
+            ("sse-idle-timeout", &["--sse-idle-timeout", "0"]),
+            ("max-connections", &["--max-connections", "64"]),
+            ("access-log", &["--access-log"]),
+            ("trust-upstream", &["--trust-upstream"]),
+        ];
+        let allowed_without_listen: &[(&str, &[&str])] = &[
+            ("el-http-url", &[]),
+            (
+                "cl-beacon-url",
+                &["--cl-beacon-url", "http://127.0.0.1:5052"],
+            ),
+            (
+                "network",
+                &[
+                    "--cl-beacon-url",
+                    "http://127.0.0.1:5052",
+                    "--network",
+                    "hoodi",
+                ],
+            ),
+            (
+                "el-reference-url",
+                &["--el-reference-url", "http://127.0.0.1:9545"],
+            ),
+            (
+                "el-max-reference-lag",
+                &[
+                    "--el-reference-url",
+                    "http://127.0.0.1:9545",
+                    "--el-max-reference-lag",
+                    "2",
+                ],
+            ),
+            (
+                "el-reference-poll-interval",
+                &[
+                    "--el-reference-url",
+                    "http://127.0.0.1:9545",
+                    "--el-reference-poll-interval",
+                    "5",
+                ],
+            ),
+            ("el-max-block-age-secs", &["--el-max-block-age-secs", "120"]),
+            (
+                "cl-max-slot-age-secs",
+                &[
+                    "--cl-beacon-url",
+                    "http://127.0.0.1:5052",
+                    "--cl-max-slot-age-secs",
+                    "120",
+                ],
+            ),
+            ("readyz-strict", &["--readyz-strict"]),
+            (
+                "cl-genesis-time",
+                &[
+                    "--cl-beacon-url",
+                    "http://127.0.0.1:5052",
+                    "--cl-genesis-time",
+                    "0",
+                ],
+            ),
+            (
+                "cl-seconds-per-slot",
+                &[
+                    "--cl-beacon-url",
+                    "http://127.0.0.1:5052",
+                    "--cl-seconds-per-slot",
+                    "12",
+                ],
+            ),
+            ("health-timeout", &["--health-timeout", "3"]),
+            ("health-poll-interval", &["--health-poll-interval", "2"]),
+            ("log-level", &["--log-level", "debug"]),
+            ("shutdown-grace", &["--shutdown-grace", "0"]),
+            (
+                "otel-endpoint",
+                &["--otel-endpoint", "http://127.0.0.1:4318"],
+            ),
+        ];
+
+        let mut classified = mode_selectors;
+        for &(name, _) in requires_listen.iter().chain(allowed_without_listen) {
+            assert!(classified.insert(name), "duplicate flag in test: --{name}");
+        }
+        let cmd = Config::command();
+        let actual: BTreeSet<&str> = cmd
+            .get_arguments()
+            .filter_map(|arg| arg.get_long())
+            .filter(|&name| name != "help" && name != "version")
+            .collect();
+        assert_eq!(
+            actual, classified,
+            "every Config CLI flag must be classified for probe-only mode"
+        );
+
+        let probe_only = |extra: &[&str]| {
+            let mut argv = vec![
+                "ethonyx",
+                "--admin-listen",
+                "127.0.0.1:9099",
+                "--el-http-url",
+                "http://127.0.0.1:8545",
+            ];
+            argv.extend_from_slice(extra);
+            Config::try_parse_from(argv).expect("clap parse")
+        };
+
+        // Note: dual-prerequisite CL flags (`--cl-mev-relay-url`, `--mock-cl-*`) are intentionally
+        // invoked WITHOUT `--cl-beacon-url` to verify `requires --listen` takes precedence.
+        for &(name, extra) in requires_listen {
+            let err = probe_only(extra).validate().unwrap_err().to_string();
+            assert!(
+                err.contains("requires --listen"),
+                "--{name} ({extra:?}) -> {err}"
+            );
+        }
+
+        for &(name, extra) in allowed_without_listen {
+            let res = probe_only(extra).validate();
+            if name == "otel-endpoint" && !cfg!(feature = "otel") {
+                let err = res.expect_err("otel is disabled").to_string();
+                assert!(
+                    err.contains("otel") && !err.contains("requires --listen"),
+                    "--{name} ({extra:?}) -> {err}"
+                );
+            } else {
+                res.unwrap_or_else(|e| {
+                    panic!("--{name} ({extra:?}) must validate without --listen: {e}")
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_range_errors_take_precedence_over_listener_and_requires_listen_errors() {
+        let err = parse(&["--admin-listen", "127.0.0.1:9099", "--proxy-timeout", "0"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("proxy-timeout must be greater than zero"),
+            "got: {err}"
+        );
+
+        let err = Config::try_parse_from([
+            "ethonyx",
+            "--el-http-url",
+            "http://127.0.0.1:8545",
+            "--health-timeout",
+            "0",
+        ])
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("health-timeout must be greater than zero"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn proxy_with_admin_listen_is_not_probe_only() {
+        let parsed = parse(&[
+            "--listen",
+            "127.0.0.1:8547",
+            "--admin-listen",
+            "127.0.0.1:9099",
+        ])
+        .parse_validated()
+        .unwrap();
+        assert_eq!(parsed.mode.mode_label(), "proxy+admin");
+        assert!(!parsed.mode.is_probe_only());
+        assert!(parsed.mode.admin().is_some());
+    }
+
+    #[test]
     fn admin_listen_validation_and_conflict_detection() {
         // Default: unset -> probes stay on `--listen`.
         let default_parsed = parse(&[]).parse_validated().unwrap();
@@ -1474,24 +1673,29 @@ mod tests {
             .validate()
             .expect("same-plane dual-stack --listen must remain valid");
 
-        // Reject invalid syntax, empty value (`ETHONYX_ADMIN_LISTEN=""`), non-link-local `%zone`, and duplicate `%`.
-        for bad in [
-            "",
-            "   ",
-            "9090",
-            "[::1:9090",
-            "127.0.0.1:99999",
-            "[::1%lo0]:8547",
-            "[::%lo0]:8547",
-            "[::ffff:127.0.0.1%lo0]:8547",
-            "[2001:db8::1%eth0]:8547",
-            "[fe80::1%eth0%extra]:8547",
+        // Reject invalid syntax, empty value (`ETHONYX_ADMIN_LISTEN=""`), non-link-local `%zone`,
+        // and duplicate `%`. Each case must fail on its own address syntax, not missing `--listen`.
+        let zone_not_link_local = "IPv6 zone ID is only valid for link-local addresses";
+        for (bad, reason) in [
+            ("", "entry must not be empty"),
+            ("   ", "entry must not be empty"),
+            ("9090", "expected host:port"),
+            ("[::1:9090", "unclosed IPv6 bracket"),
+            ("127.0.0.1:99999", "invalid port"),
+            ("[::1%lo0]:8547", zone_not_link_local),
+            ("[::%lo0]:8547", zone_not_link_local),
+            ("[::ffff:127.0.0.1%lo0]:8547", zone_not_link_local),
+            ("[2001:db8::1%eth0]:8547", zone_not_link_local),
+            ("[fe80::1%eth0%extra]:8547", "invalid IPv6 host"),
         ] {
             let err = parse(&["--admin-listen", bad])
                 .validate()
                 .expect_err(bad)
                 .to_string();
-            assert!(err.contains("--admin-listen"), "missing flag in {err}");
+            assert!(
+                err.starts_with("invalid --admin-listen address") && err.ends_with(reason),
+                "{bad:?} -> {err}"
+            );
         }
 
         // Clap rejects repeated `--admin-listen` flags.

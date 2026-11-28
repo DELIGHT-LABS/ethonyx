@@ -30,7 +30,7 @@ const ADMIN_MAX_CONNECTIONS: NonZeroUsize = match NonZeroUsize::new(64) {
 const ADMIN_INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const ADMIN_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const ADMIN_MAX_CONN_LIFETIME: Duration = Duration::from_secs(10);
-const ADMIN_CLOSE_GRACE: Duration = Duration::from_secs(1);
+pub(crate) const ADMIN_CLOSE_GRACE: Duration = Duration::from_secs(1);
 const _: () = assert!(ADMIN_CLOSE_GRACE.as_nanos() < ADMIN_MAX_CONN_LIFETIME.as_nanos());
 
 async fn accept_round_robin(
@@ -1132,6 +1132,26 @@ mod tests {
         );
         drop(z_builders);
         z_drain.wait().await;
+    }
+
+    #[tokio::test]
+    async fn admin_accept_target_caps_permits_at_admin_max_connections() {
+        let target = AcceptTarget::Admin {
+            state: admin_test_state().await,
+            limit: ConnLimit::new(Some(ADMIN_MAX_CONNECTIONS)),
+        };
+        let mut held: Vec<_> = (0..ADMIN_MAX_CONNECTIONS.get())
+            .map(|_| target.try_acquire().expect("permit within the admin cap"))
+            .collect();
+        assert!(
+            target.try_acquire().is_none(),
+            "admin pool must cap at ADMIN_MAX_CONNECTIONS"
+        );
+        drop(held.pop());
+        assert!(
+            target.try_acquire().is_some(),
+            "a released admin permit must be reusable"
+        );
     }
 
     #[test]
